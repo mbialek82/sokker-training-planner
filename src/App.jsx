@@ -1,7 +1,7 @@
-import React, { useState, useMemo, useCallback } from "react";
+import React, { useState, useMemo, useCallback, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOKKER TRAINING PLANNER v3
+// SOKKER TRAINING PLANNER v4 — subskill editor
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ─── Engine ────────────────────────────────────────────────────────────────
@@ -12,16 +12,12 @@ const SN={pace:"PAC",technique:"TEC",passing:"PAS",defending:"DEF",playmaking:"P
 const _XD=Math.round(_K2*_K1/100);
 const _XG=Math.round(_K2*_K1/700);
 
-// YS community scale → internal (YS_CS = 300 / (10 + 90×DB/100))
 function _fromYS(ys){const db=(300/ys-10)*100/90;return Math.max(0,Math.min(100,db));}
-function _toYS(db){const eff=10+90*db/100;return eff>0?300/eff:30;}
-
 function _te(td){return(40+60*td/100)/100;}
 function _lf(d){return d<=50?100+0.5*d:100+1.7*d;}
 function _af(a){const n=Math.max(0,a-16);return a<=23?100+10*n:100+13.5*n;}
 function _dt(sk,lv,a,te){return(_B[sk]/75)*_lf((lv+0.5)*_R)*_af(a)/(100*te);}
 function _duc(sk,lv,a,te){return _dt(sk,lv,a,te)/_U;}
-
 function _mk(lv,du=0,xp=0){return{lv,du,xp};}
 function _mkSub(lv,sub,sk,a,te){
   const tot=sub*_dt(sk,lv,a,te),c=_duc(sk,lv,a,te);
@@ -88,15 +84,15 @@ function _pf(tgt){return(st,a,p,ctx,te)=>{
   if(st.pace.lv<_MX)return"pace";return _anyRem(st,p,a,te);};}
 
 const STRATS={
-  round_robin:{name:"Round-Robin",fn:_rr,desc:"Rotate through critical skills evenly"},
-  cheapest_first:{name:"Cheapest First",fn:_ch,desc:"Train the easiest skill to pop next"},
+  round_robin:{name:"Round-Robin",fn:_rr,desc:"Rotate critical skills evenly"},
+  cheapest_first:{name:"Cheapest First",fn:_ch,desc:"Train easiest skill to pop next"},
   most_expensive:{name:"Most Expensive",fn:_ex,desc:"Front-load the hardest skill"},
   closest_to_pop:{name:"Closest to Pop",fn:_ctp,desc:"Train skill nearest to next level-up"},
-  pace_16_rr:{name:"Pace→16 + RR",fn:_pf(16),desc:"Rush pace to 16, then round-robin others"},
-  pace_15_rr:{name:"Pace→15 + RR",fn:_pf(15),desc:"Rush pace to 15, then round-robin others"},
+  pace_16_rr:{name:"Pace→16 + RR",fn:_pf(16),desc:"Rush pace to 16, then round-robin"},
+  pace_15_rr:{name:"Pace→15 + RR",fn:_pf(15),desc:"Rush pace to 15, then round-robin"},
 };
 
-// ─── Core Simulation (for non-sale strategies) ────────────────────────────
+// ─── Core Simulation ───────────────────────────────────────────────────────
 function runPlan(skills,td,age,ssw,pos,strat,weeks,subs){
   const prof=POS[pos],fn=STRATS[strat].fn,te=_te(td);
   const st=_initSt(skills,age,te,subs);
@@ -153,7 +149,6 @@ function runSaleOpt(skills,td,age,deadWeeks,pos,subs,ssw,maxExt=3){
   const prof=POS[pos],te=_te(td);
   const wsk=OS.filter(sk=>(prof.w[sk]||0)>0);
   let best=_buildRR(deadWeeks,prof),extUsed=0,totSwaps=0;
-
   for(let er=0;er<=maxExt;er++){
     const curLen=deadWeeks+extUsed;let sched=[...best];const pre=[...sched];
     for(let it=0;it<curLen;it++){
@@ -189,7 +184,6 @@ function runSaleOpt(skills,td,age,deadWeeks,pos,subs,ssw,maxExt=3){
       if(_tci(ts,prof,na,te)<oldCI-0.01){best=trial;extUsed++;}else break;
     }else break;
   }
-
   const{states:fs,log}=_simSched(best,skills,td,age,ssw,subs,prof);
   const fAge=_ageAfter(age,ssw,best.length);
   const fsk={},fdb={};
@@ -238,6 +232,113 @@ const YS_PRESETS=[
   {ys:4.50,l:"4.50"},{ys:5.00,l:"5.00"},{ys:6.00,l:"6.00"},
 ];
 
+const DEF_SUBS=Object.fromEntries(OS.map(sk=>[sk,25]));
+
+// ─── SubBar: draggable sub-level bar ───────────────────────────────────────
+function SubBar({value,onChange,color}){
+  const ref=useRef(null);
+  const dragging=useRef(false);
+  const update=useCallback((e)=>{
+    const rect=ref.current.getBoundingClientRect();
+    const x=Math.max(0,Math.min(e.clientX-rect.left,rect.width));
+    onChange(Math.round(x/rect.width*99));
+  },[onChange]);
+  const onDown=useCallback((e)=>{
+    dragging.current=true;update(e);
+    const onMove=(ev)=>{if(dragging.current)update(ev);};
+    const onUp=()=>{dragging.current=false;window.removeEventListener("mousemove",onMove);window.removeEventListener("mouseup",onUp);};
+    window.addEventListener("mousemove",onMove);
+    window.addEventListener("mouseup",onUp);
+  },[update]);
+  // Touch support
+  const onTouch=useCallback((e)=>{
+    const t=e.touches[0];if(!t||!ref.current)return;
+    const rect=ref.current.getBoundingClientRect();
+    const x=Math.max(0,Math.min(t.clientX-rect.left,rect.width));
+    onChange(Math.round(x/rect.width*99));
+  },[onChange]);
+
+  return(
+    <div ref={ref} onMouseDown={onDown} onTouchStart={onTouch} onTouchMove={onTouch}
+      style={{position:"relative",height:20,background:C.bg,borderRadius:4,cursor:"pointer",overflow:"hidden",userSelect:"none",touchAction:"none"}}>
+      <div style={{position:"absolute",left:0,top:0,bottom:0,width:`${value/99*100}%`,background:color,borderRadius:4,transition:dragging.current?"none":"width 0.1s"}}/>
+      <div style={{position:"absolute",right:6,top:"50%",transform:"translateY(-50%)",fontSize:10,fontFamily:_ft,fontWeight:600,
+        color:value>60?C.bg:C.txD,zIndex:1}}>.{value.toString().padStart(2,"0")}</div>
+    </div>
+  );
+}
+
+// ─── SkillEditor: unified skill + subskill input ──────────────────────────
+function SkillEditor({skills,setSkills,subs,setSubs,age,setAge,pos,name,warnings,editable=true}){
+  const prof=POS[pos];
+  return(
+    <div style={{background:C.bg,borderRadius:6,border:`1px solid ${C.bdr}`,padding:12}}>
+      {name&&(
+        <div style={{fontWeight:600,marginBottom:8,color:warnings?.length?C.warn:C.pop,fontSize:14}}>
+          {name} {age?`· age ${age}`:""}
+        </div>
+      )}
+      {warnings?.length>0&&<div style={{fontSize:11,color:C.warn,marginBottom:8}}>⚠ {warnings.join("; ")}</div>}
+
+      {/* Age row (manual mode) */}
+      {editable&&!name&&(
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+          <span style={{fontSize:11,color:C.txD,fontFamily:_fs,textTransform:"uppercase",letterSpacing:"0.06em"}}>Age</span>
+          <input type="number" min={16} max={40} value={age}
+            onChange={e=>setAge(Math.max(16,Math.min(40,parseInt(e.target.value)||16)))}
+            style={{background:C.card,border:`1px solid ${C.bdr}`,borderRadius:4,color:C.tx,fontFamily:_ft,fontSize:14,fontWeight:600,
+              padding:"4px 8px",width:52,textAlign:"center",outline:"none"}}/>
+        </div>
+      )}
+
+      <div style={{display:"flex",gap:6,marginBottom:6,fontSize:10,color:C.txM,fontFamily:_ft}}>
+        <span style={{width:42}}>Skill</span>
+        <span style={{width:40,textAlign:"center"}}>Level</span>
+        <span style={{flex:1}}>Sub-level (drag or type — % toward next pop)</span>
+        <span style={{width:36,textAlign:"right"}}>%</span>
+      </div>
+
+      {OS.map(sk=>{
+        const w=prof.w[sk]||0;
+        const isCrit=w===1;
+        const isHelp=w>0&&w<1;
+        const color=w===0?C.txM:isCrit?C.acc:C.txD;
+        const barColor=isCrit?"#4a90d9":isHelp?"#6b7a8d":"#3a3f4a";
+        return(
+          <div key={sk} style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+            {/* Skill label */}
+            <div style={{width:42,fontFamily:_ft,fontSize:12,fontWeight:600,color,display:"flex",alignItems:"center",gap:2}}>
+              {SN[sk]}
+              {isCrit&&<span style={{fontSize:8,color:C.acc}}>★</span>}
+              {isHelp&&<span style={{fontSize:8,color:C.txM}}>{w}</span>}
+            </div>
+            {/* Level input */}
+            <input type="number" min={0} max={18} value={skills[sk]??0}
+              onChange={e=>setSkills(p=>({...p,[sk]:Math.max(0,Math.min(18,parseInt(e.target.value)||0))}))}
+              style={{width:40,background:C.card,border:`1px solid ${C.bdr}`,borderRadius:4,color:C.tx,fontFamily:_ft,
+                fontSize:14,fontWeight:700,padding:"3px 4px",textAlign:"center",outline:"none"}}/>
+            {/* Sub bar */}
+            <div style={{flex:1}}>
+              <SubBar value={subs[sk]??25} onChange={v=>setSubs(p=>({...p,[sk]:v}))} color={barColor}/>
+            </div>
+            {/* Pct input */}
+            <input type="number" min={0} max={99} value={subs[sk]??25}
+              onChange={e=>setSubs(p=>({...p,[sk]:Math.max(0,Math.min(99,parseInt(e.target.value)||0))}))}
+              style={{width:36,background:C.card,border:`1px solid ${C.bdr}`,borderRadius:4,color:C.txD,fontFamily:_ft,
+                fontSize:11,padding:"3px 4px",textAlign:"right",outline:"none"}}/>
+          </div>
+        );
+      })}
+      <div style={{fontSize:10,color:C.txM,marginTop:6,lineHeight:1.4}}>
+        Sub-level = progress within current level toward next pop. 0% = just popped, 99% = about to pop. Default 25% if unknown.
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════════════════════════
 export default function App(){
   const[paste,setPaste]=useState("");
   const[parsed,setParsed]=useState(null);
@@ -247,39 +348,40 @@ export default function App(){
   const[ssw,setSsw]=useState(1);
   const[selStrats,setSelStrats]=useState(["round_robin","closest_to_pop","sale_optimizer"]);
   const[results,setResults]=useState(null);
-  const[manSk,setManSk]=useState({pace:10,technique:8,passing:6,defending:7,playmaking:9,striker:10});
-  const[manAge,setManAge]=useState(20);
+  const[skills,setSkills]=useState({pace:10,technique:8,passing:6,defending:7,playmaking:9,striker:10});
+  const[subs,setSubs]=useState({...DEF_SUBS});
+  const[age,setAge]=useState(20);
   const[mode,setMode]=useState("paste");
   const[showLog,setShowLog]=useState(null);
+  const[playerName,setPlayerName]=useState("");
+  const[playerWarnings,setPlayerWarnings]=useState([]);
 
   const handleParse=useCallback(()=>{
-    if(!paste.trim())return;const p=parsePaste(paste);setParsed(p);
-    if(p.age)setManAge(p.age);const sk={};
-    for(const s of OS)sk[s]=p.skills[s]??0;setManSk(sk);
+    if(!paste.trim())return;
+    const p=parsePaste(paste);setParsed(p);
+    if(p.age)setAge(p.age);
+    const sk={};for(const s of OS)sk[s]=p.skills[s]??0;
+    setSkills(sk);
+    setSubs({...DEF_SUBS});
+    setPlayerName(p.name||"");
+    setPlayerWarnings(p.warnings||[]);
   },[paste]);
-
-  const skills=useMemo(()=>{
-    if(mode==="paste"&&parsed){const sk={};for(const s of OS)sk[s]=parsed.skills[s]??0;return sk;}
-    return manSk;
-  },[mode,parsed,manSk]);
-  const age=mode==="paste"&&parsed?.age?parsed.age:manAge;
 
   const ysNum=parseFloat(ysTalent)||3.5;
   const td=_fromYS(Math.max(3.0,ysNum));
+  const subsFloat=useMemo(()=>{
+    const o={};for(const sk of OS)o[sk]=(subs[sk]??25)/100;return o;
+  },[subs]);
 
   const runSim=useCallback(()=>{
     const res={};
     for(const k of selStrats){
-      if(k==="sale_optimizer"){
-        res[k]=runSaleOpt(skills,td,age,weeks,pos,null,ssw);
-      }else{
-        res[k]=runPlan(skills,td,age,ssw,pos,k,weeks,null);
-      }
+      if(k==="sale_optimizer") res[k]=runSaleOpt(skills,td,age,weeks,pos,subsFloat,ssw);
+      else res[k]=runPlan(skills,td,age,ssw,pos,k,weeks,subsFloat);
     }
     setResults(res);setShowLog(null);
-  },[skills,td,age,ssw,pos,weeks,selStrats]);
+  },[skills,td,age,ssw,pos,weeks,selStrats,subsFloat]);
 
-  // Weighted score — levels + sub progress, weighted
   const prof=POS[pos];
   function wScore(r){
     return OS.reduce((s,sk)=>{
@@ -296,7 +398,6 @@ export default function App(){
   const sSel={...sI,cursor:"pointer",appearance:"none",paddingRight:28,backgroundImage:`url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%238a96a8' stroke-width='1.5'/%3E%3C/svg%3E")`,backgroundRepeat:"no-repeat",backgroundPosition:"right 10px center"};
   const sB={background:C.acc,color:"#fff",border:"none",borderRadius:6,padding:"10px 20px",fontFamily:_fs,fontWeight:600,fontSize:14,cursor:"pointer"};
   const sBs={...sB,padding:"6px 14px",fontSize:12,background:C.hi,color:C.txD,border:`1px solid ${C.bdr}`};
-
   const allStrats={...STRATS,sale_optimizer:{name:"Sale Optimizer",desc:"Minimize carry-in — best for selling"}};
 
   return(
@@ -305,10 +406,10 @@ export default function App(){
         <span style={{fontSize:22,fontWeight:700,color:C.acc,fontFamily:_ft}}>⚽ Sokker Training Planner</span>
       </div>
       <div style={{fontSize:12,color:C.txM,marginBottom:20}}>
-        Paste your player, set YS talent, compare training strategies side by side.
+        Paste your player, set YS talent and sub-levels, compare training strategies.
       </div>
 
-      <div style={{display:"grid",gridTemplateColumns:"380px 1fr",gap:16,maxWidth:1300}}>
+      <div style={{display:"grid",gridTemplateColumns:"400px 1fr",gap:16,maxWidth:1300}}>
         {/* ─── LEFT: INPUT ─── */}
         <div>
           {/* Mode toggle */}
@@ -326,45 +427,24 @@ export default function App(){
               <div style={sL}>Paste player card (sokker.org)</div>
               <textarea value={paste} onChange={e=>setPaste(e.target.value)}
                 placeholder={"Roman Rysio, wiek: 20\nklub: Zabójcze Strzały, kraj: Polska\nwartość : 788 000 zł\nwynagrodzenie: 13 800 zł\ntragiczna [0] forma\nbardzo dobra [9] dyscyplina taktyczna\ndobra [7] kondycja        słaby [4] bramkarz\nświetna [11] szybkość     bardzo dobry [9] obrońca\ndobra [7] technika        celujący [10] rozgrywający\nprzeciętne [5] podania    świetny [11] strzelec"}
-                style={{...sI,height:150,resize:"vertical",fontFamily:_ft,fontSize:11,lineHeight:1.5}}/>
+                style={{...sI,height:140,resize:"vertical",fontFamily:_ft,fontSize:11,lineHeight:1.5}}/>
               <button onClick={handleParse} style={{...sB,marginTop:8,width:"100%"}}>Parse Player</button>
-              {parsed&&(
-                <div style={{marginTop:12,padding:12,background:C.bg,borderRadius:6,border:`1px solid ${C.bdr}`}}>
-                  <div style={{fontWeight:600,marginBottom:6,color:parsed.warnings.length?C.warn:C.pop}}>
-                    {parsed.name||"?"} {parsed.age?`· age ${parsed.age}`:""}
-                  </div>
-                  <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"4px 12px",fontSize:13,fontFamily:_ft}}>
-                    {OS.map(sk=>(
-                      <div key={sk} style={{display:"flex",justifyContent:"space-between"}}>
-                        <span style={{color:C.txD}}>{SN[sk]}</span>
-                        <span style={{color:parsed.skills[sk]!=null?C.tx:C.red,fontWeight:600}}>{parsed.skills[sk]??"—"}</span>
-                      </div>
-                    ))}
-                  </div>
-                  {parsed.warnings.length>0&&<div style={{marginTop:6,fontSize:11,color:C.warn}}>⚠ {parsed.warnings.join("; ")}</div>}
-                </div>
-              )}
             </div>
           )}
 
-          {/* Manual mode */}
-          {mode==="manual"&&(
+          {/* Skill editor — always visible after parse or in manual mode */}
+          {(mode==="manual"||(mode==="paste"&&parsed))&&(
             <div style={sC}>
-              <div style={sL}>Skills (0–18)</div>
-              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"8px 12px",marginBottom:12}}>
-                {OS.map(sk=>(
-                  <div key={sk}>
-                    <div style={{fontSize:11,color:C.txD,marginBottom:2}}>{SN[sk]}</div>
-                    <input type="number" min={0} max={18} value={manSk[sk]}
-                      onChange={e=>setManSk(p=>({...p,[sk]:Math.max(0,Math.min(18,parseInt(e.target.value)||0))}))}
-                      style={{...sI,width:"100%"}}/>
-                  </div>
-                ))}
-              </div>
-              <div style={sL}>Age</div>
-              <input type="number" min={16} max={40} value={manAge}
-                onChange={e=>setManAge(Math.max(16,Math.min(40,parseInt(e.target.value)||16)))}
-                style={{...sI,width:80}}/>
+              <div style={sL}>{mode==="paste"?"Parsed skills — adjust levels & sub-levels":"Player skills & sub-levels"}</div>
+              <SkillEditor
+                skills={skills} setSkills={setSkills}
+                subs={subs} setSubs={setSubs}
+                age={age} setAge={setAge}
+                pos={pos}
+                name={mode==="paste"?playerName:null}
+                warnings={mode==="paste"?playerWarnings:null}
+                editable={true}
+              />
             </div>
           )}
 
@@ -375,7 +455,7 @@ export default function App(){
               <input type="text" value={ysTalent}
                 onChange={e=>{const v=e.target.value;if(/^\d*\.?\d*$/.test(v))setYsTalent(v);}}
                 style={{...sI,width:80,textAlign:"center",fontSize:16,fontWeight:700}}/>
-              <span style={{fontSize:12,color:C.txM}}>Lower = better talent (3.00 = max)</span>
+              <span style={{fontSize:12,color:C.txM}}>Lower = better (3.00 = max)</span>
             </div>
             <div style={{display:"flex",flexWrap:"wrap",gap:3,marginBottom:12}}>
               {YS_PRESETS.map(p=>(
@@ -385,7 +465,6 @@ export default function App(){
                 }}>{p.l}</button>
               ))}
             </div>
-
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
               <div>
                 <div style={sL}>Position</div>
@@ -421,8 +500,7 @@ export default function App(){
             <div style={sL}>Compare Strategies</div>
             <div style={{display:"flex",flexDirection:"column",gap:4,marginTop:4}}>
               {Object.entries(allStrats).map(([k,v])=>{
-                const sel=selStrats.includes(k);
-                const isSale=k==="sale_optimizer";
+                const sel=selStrats.includes(k);const isSale=k==="sale_optimizer";
                 return(
                   <button key={k} onClick={()=>setSelStrats(p=>sel?p.filter(s=>s!==k):[...p,k])} style={{
                     ...sBs,textAlign:"left",fontSize:12,display:"flex",justifyContent:"space-between",alignItems:"center",
@@ -447,22 +525,22 @@ export default function App(){
           {!results&&(
             <div style={{...sC,textAlign:"center",padding:60,color:C.txM}}>
               <div style={{fontSize:40,marginBottom:8}}>📊</div>
-              <div>Configure parameters and run the simulation to compare strategies.</div>
+              <div>Configure parameters and run the simulation.</div>
             </div>
           )}
 
           {results&&(()=>{
             const keys=Object.keys(results);const first=results[keys[0]];
             return(<div>
-              {/* Header */}
               <div style={{...sC,borderLeft:`3px solid ${C.acc}`}}>
                 <div style={{fontSize:13,color:C.txD,marginBottom:4}}>
-                  {prof.d} · YS talent {ysNum.toFixed(2)} · Age {first.startAge} · {weeks} weeks ({(weeks/13).toFixed(1)}s)
+                  {prof.d} · YS {ysNum.toFixed(2)} · Age {first.startAge} · {weeks} weeks ({(weeks/13).toFixed(1)}s)
                 </div>
                 <div style={{display:"flex",gap:14,fontSize:12,fontFamily:_ft,flexWrap:"wrap"}}>
                   {OS.map(sk=>(
                     <span key={sk} style={{color:prof.w[sk]===1?C.acc:prof.w[sk]>0?C.txD:C.txM}}>
-                      {SN[sk]}:{first.startSkills[sk]} {prof.w[sk]===1&&"★"}
+                      {SN[sk]}:{first.startSkills[sk]}.{(subs[sk]??25).toString().padStart(2,"0")}
+                      {prof.w[sk]===1&&" ★"}
                     </span>
                   ))}
                 </div>
@@ -474,7 +552,7 @@ export default function App(){
                   <thead>
                     <tr style={{borderBottom:`2px solid ${C.bdr}`}}>
                       <th style={{textAlign:"left",padding:"6px 8px",color:C.txD}}>Skill</th>
-                      <th style={{textAlign:"center",padding:"6px 4px",color:C.txD,width:36}}>Start</th>
+                      <th style={{textAlign:"center",padding:"6px 4px",color:C.txD,width:50}}>Start</th>
                       {keys.map(k=>(
                         <th key={k} style={{textAlign:"center",padding:"6px 8px",fontWeight:600,borderLeft:`1px solid ${C.bdr}`,
                           color:results[k].isSale?C.warn:C.acc}}>
@@ -491,7 +569,9 @@ export default function App(){
                           <td style={{padding:"5px 8px",color:w===1?C.tx:C.txD}}>
                             {sk} {w===1?<span style={{fontSize:9,color:C.acc}}>★</span>:<span style={{fontSize:9,color:C.txM}}>({w})</span>}
                           </td>
-                          <td style={{textAlign:"center",padding:"5px 4px",fontWeight:600}}>{first.startSkills[sk]}</td>
+                          <td style={{textAlign:"center",padding:"5px 4px",fontWeight:600}}>
+                            {first.startSkills[sk]}<span style={{fontSize:9,color:C.txM}}>.{(subs[sk]??25).toString().padStart(2,"0")}</span>
+                          </td>
                           {keys.map(kk=>{
                             const r=results[kk];const lv=r.finalSkills[sk];const gained=lv-first.startSkills[sk];
                             const lastSub=r.log.length?r.log[r.log.length-1].subs[sk]:0;
@@ -506,7 +586,6 @@ export default function App(){
                         </tr>
                       );
                     })}
-                    {/* Weighted score */}
                     <tr style={{borderTop:`2px solid ${C.bdr}`}}>
                       <td colSpan={2} style={{padding:"6px 8px",fontWeight:700,color:C.acc}}>Weighted Score</td>
                       {keys.map(k=>{
@@ -519,7 +598,6 @@ export default function App(){
                 </table>
               </div>
 
-              {/* Best callout */}
               {(()=>{
                 const best=keys.reduce((a,b)=>wScore(results[a])>wScore(results[b])?a:b);
                 return(
@@ -540,7 +618,6 @@ export default function App(){
                       {r.totalWeeks} weeks{r.extensions>0&&<span style={{color:C.pop}}> (+{r.extensions} extended)</span>}
                       {r.swaps>0&&<span> · {r.swaps} swaps</span>}
                     </div>
-                    {/* Schedule strip */}
                     <div style={{...sL,marginTop:4}}>Schedule</div>
                     <div style={{display:"flex",flexWrap:"wrap",gap:2,marginBottom:12}}>
                       {r.schedule.map((sk,i)=>(
@@ -550,8 +627,7 @@ export default function App(){
                         </div>
                       ))}
                     </div>
-                    {/* Carry-in bars */}
-                    <div style={sL}>Carry-in at sale (% of next level — lower = better)</div>
+                    <div style={sL}>Carry-in at sale (lower = better)</div>
                     {OS.filter(sk=>prof.w[sk]>0).map(sk=>{
                       const ci=(r.carryPct?.[sk]||0)*100;
                       return(
@@ -559,7 +635,7 @@ export default function App(){
                           <span style={{width:40,color:C.txD}}>{SN[sk]}</span>
                           <div style={{flex:1,height:10,background:C.bg,borderRadius:5,overflow:"hidden"}}>
                             <div style={{width:`${Math.min(ci,100)}%`,height:"100%",borderRadius:5,
-                              background:ci>70?C.red:ci>40?C.warn:C.pop,transition:"width 0.3s"}}/>
+                              background:ci>70?C.red:ci>40?C.warn:C.pop}}/>
                           </div>
                           <span style={{width:40,textAlign:"right",color:ci>70?C.red:ci>40?C.warn:C.pop,fontWeight:600}}>
                             {ci.toFixed(0)}%
@@ -630,7 +706,7 @@ export default function App(){
       </div>
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v3 · Based on community empirical data
+        Sokker Training Planner v4 · Based on community empirical data
       </div>
     </div>
   );
