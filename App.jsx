@@ -1,20 +1,22 @@
 import React, { useState, useMemo, useCallback, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOKKER TRAINING PLANNER v5 — v24 model + subskill editor
+// SOKKER TRAINING PLANNER v4 — subskill editor
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ─── Engine (v24 model, April 2026) ───────────────────────────────────────
-const _K1=93,_K2=96,_SL=13,_R=100/18,_U=18,_MX=18;
+// ─── Engine ────────────────────────────────────────────────────────────────
+const _K1=90,_K2=96,_SL=13,_R=100/18,_U=18,_MX=18;
 const _B={pace:99,striker:90,technique:82,defending:82,playmaking:75,passing:75};
 const OS=["pace","technique","passing","defending","playmaking","striker"];
 const SN={pace:"PAC",technique:"TEC",passing:"PAS",defending:"DEF",playmaking:"PLM",striker:"STR"};
 const _XD=Math.round(_K2*_K1/100);
-const _XG=Math.round(_K2*_K1*15/10000);
+const _XG=Math.round(_K2*_K1/700);
 
 function _fromYS(ys){const db=(300/ys-10)*100/90;return Math.max(0,Math.min(100,db));}
 function _te(td){return(40+60*td/100)/100;}
-function _dt(sk,lv,a,te){const db=(lv+0.5)*_R;return(_B[sk]/75)*(100+0.5*db*(a-15))/te;}
+function _lf(d){return d<=50?100+0.5*d:100+1.7*d;}
+function _af(a){const n=Math.max(0,a-16);return a<=23?100+10*n:100+13.5*n;}
+function _dt(sk,lv,a,te){return(_B[sk]/75)*_lf((lv+0.5)*_R)*_af(a)/(100*te);}
 function _duc(sk,lv,a,te){return _dt(sk,lv,a,te)/_U;}
 function _mk(lv,du=0,xp=0){return{lv,du,xp};}
 function _mkSub(lv,sub,sk,a,te){
@@ -773,7 +775,7 @@ export default function App(){
       </div>
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v5 · Based on community empirical data
+        Sokker Training Planner v4 · Based on community empirical data
       </div>
     </div>
   );
