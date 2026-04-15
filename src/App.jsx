@@ -83,6 +83,46 @@ function _pf(tgt){return(st,a,p,ctx,te)=>{
     const sk=cr[ctx.p2%cr.length];ctx.p2++;if(st[sk].lv<_MX)return sk;}
   if(st.pace.lv<_MX)return"pace";return _anyRem(st,p,a,te);};}
 
+
+function _ll(st,a,p,ctx,te){
+  // pick_lowest: pure maximin across all weighted skills
+  let b=null,bl=99;for(const sk of OS){const w=p.w[sk]||0;
+    if(w>0&&st[sk].lv<_MX&&st[sk].lv<bl){bl=st[sk].lv;b=sk;}}return b;
+}
+function _bal(st,a,p,ctx,te){
+  // balanced 2:1: primaries get 2x slots vs secondaries; maximin within tier
+  const prim=_crit(p);const sec=OS.filter(s=>p.w[s]>0&&p.w[s]<1);
+  const nPri=prim.length,nSec=sec.length;
+  const cycLen=2*nPri+nSec;if(cycLen===0)return null;
+  if(ctx.bs==null)ctx.bs=0;
+  const slot=ctx.bs%cycLen;ctx.bs++;
+  const priAct=prim.filter(s=>st[s].lv<_MX);
+  const secAct=sec.filter(s=>st[s].lv<_MX);
+  if(slot<2*nPri){
+    if(priAct.length)return priAct.reduce((a,b)=>st[a].lv<=st[b].lv?a:b);
+    if(secAct.length)return secAct.reduce((a,b)=>st[a].lv<=st[b].lv?a:b);
+  }else{
+    if(secAct.length)return secAct.reduce((a,b)=>st[a].lv<=st[b].lv?a:b);
+    if(priAct.length)return priAct.reduce((a,b)=>st[a].lv<=st[b].lv?a:b);
+  }
+  return null;
+}
+function _pb(st,a,p,ctx,te,rem){
+  // positional_balanced: primaries via gt-will-max, then secondaries self-level
+  const prim=_crit(p);const sec=OS.filter(s=>p.w[s]>0&&p.w[s]<1);
+  if(ctx.pbPhase==null)ctx.pbPhase=1;
+  if(ctx.pbPhase===1){
+    const needs=prim.filter(s=>st[s].lv<_MX&&!_gwm(st[s],s,a,te,rem||0));
+    if(!needs.length){ctx.pbPhase=2;}
+    else return needs.reduce((a,b)=>st[a].lv<=st[b].lv?a:b);
+  }
+  const secAct=sec.filter(s=>st[s].lv<_MX);
+  if(secAct.length)return secAct.reduce((a,b)=>st[a].lv<=st[b].lv?a:b);
+  const priAct=prim.filter(s=>st[s].lv<_MX);
+  if(priAct.length)return priAct.reduce((a,b)=>st[a].lv<=st[b].lv?a:b);
+  return null;
+}
+
 const STRATS={
   round_robin:{name:"Round-Robin",fn:_rr,desc:"Rotate critical skills evenly"},
   cheapest_first:{name:"Cheapest First",fn:_ch,desc:"Train easiest skill to pop next"},
@@ -90,6 +130,9 @@ const STRATS={
   closest_to_pop:{name:"Closest to Pop",fn:_ctp,desc:"Train skill nearest to next level-up"},
   pace_16_rr:{name:"Pace→16 + RR",fn:_pf(16),desc:"Rush pace to 16, then round-robin"},
   pace_15_rr:{name:"Pace→15 + RR",fn:_pf(15),desc:"Rush pace to 15, then round-robin"},
+  pick_lowest:{name:"Pick Lowest",fn:_ll,desc:"Always train lowest-level weighted skill (pure maximin)",validPos:null},
+  balanced:{name:"Balanced (2:1)",fn:_bal,desc:"Primaries 2× slots vs secondaries; maximin within each tier",validPos:["DEF","ATT","WING"]},
+  positional_balanced:{name:"Positional→Balanced",fn:_pb,desc:"Primaries via GT-will-max (lowest-first), then secondaries self-level",validPos:["DEF","ATT","WING"]},
 };
 
 // ─── Core Simulation ───────────────────────────────────────────────────────
@@ -99,7 +142,7 @@ function runPlan(skills,td,age,ssw,pos,strat,weeks,subs){
   const startSk={};for(const sk of OS)startSk[sk]=st[sk].lv;
   let sw=ssw,ca=age,wk=0;const ctx={},log=[],mx={};
   while(wk<weeks){
-    const rem=weeks-wk;let tr=fn(st,ca,prof,ctx,te);if(!tr)break;
+    const rem=weeks-wk;let tr=fn(st,ca,prof,ctx,te,rem);if(!tr)break;
     if(tr&&_gwm(st[tr],tr,ca,te,rem)){let alt=null,ac=-1;
       for(const sk of OS){const w=prof.w[sk]||0;
         if(w>0&&st[sk].lv<_MX&&!_gwm(st[sk],sk,ca,te,rem)){
@@ -399,6 +442,7 @@ export default function App(){
   const sB={background:C.acc,color:"#fff",border:"none",borderRadius:6,padding:"10px 20px",fontFamily:_fs,fontWeight:600,fontSize:14,cursor:"pointer"};
   const sBs={...sB,padding:"6px 14px",fontSize:12,background:C.hi,color:C.txD,border:`1px solid ${C.bdr}`};
   const allStrats={...STRATS,sale_optimizer:{name:"Sale Optimizer",desc:"Minimize carry-in — best for selling"}};
+  const validStrats=Object.fromEntries(Object.entries(allStrats).filter(([k,v])=>!v.validPos||v.validPos.includes(pos)));
 
   return(
     <div style={{background:C.bg,minHeight:"100vh",color:C.tx,fontFamily:_fs,padding:"20px 16px"}}>
@@ -499,7 +543,7 @@ export default function App(){
           <div style={sC}>
             <div style={sL}>Compare Strategies</div>
             <div style={{display:"flex",flexDirection:"column",gap:4,marginTop:4}}>
-              {Object.entries(allStrats).map(([k,v])=>{
+              {Object.entries(validStrats).map(([k,v])=>{
                 const sel=selStrats.includes(k);const isSale=k==="sale_optimizer";
                 return(
                   <button key={k} onClick={()=>setSelStrats(p=>sel?p.filter(s=>s!==k):[...p,k])} style={{
@@ -605,6 +649,31 @@ export default function App(){
                     <span style={{fontWeight:700,color:C.pop}}>★ Best: {allStrats[best]?.name||best}</span>
                     <span style={{color:C.txD,marginLeft:8}}>(score {wScore(results[best]).toFixed(1)})</span>
                   </div>
+                );
+              })()}
+
+              {/* CSV Download */}
+              {(()=>{
+                const logKey=showLog||keys[0];
+                const logData=results[logKey]?.log||[];
+                const relCols=OS.filter(sk=>prof.w[sk]>0);
+                const header=["Wk","Age","SW","Trains","Pops",...relCols.map(sk=>SN[sk]),...relCols.map(sk=>SN[sk]+"_sub")].join(",");
+                const rows=logData.map(w=>{
+                  const pops=w.pops.map(p=>`${SN[p[0]]}→${p[1]}`).join(" ");
+                  const lvls=relCols.map(sk=>w.levels[sk]);
+                  const sbs=relCols.map(sk=>Math.floor(w.subs[sk]*100));
+                  return[w.week,w.age,w.sw,SN[w.trained],pops,...lvls,...sbs].join(",");
+                });
+                const csv=[header,...rows].join("\n");
+                const blob=new Blob([csv],{type:"text/csv"});
+                const url=URL.createObjectURL(blob);
+                return(
+                  <a href={url} download={`schedule_${pos}_${logKey}.csv`}
+                    style={{display:"block",background:C.acc,color:"#fff",border:"none",borderRadius:6,
+                      padding:"12px 20px",fontFamily:_fs,fontWeight:600,fontSize:15,cursor:"pointer",
+                      textAlign:"center",marginBottom:12,textDecoration:"none",width:"100%",boxSizing:"border-box"}}>
+                    ⬇️ Download Schedule CSV
+                  </a>
                 );
               })()}
 
