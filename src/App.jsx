@@ -657,7 +657,7 @@ export default function App(){
               {(()=>{
                 const logKey=showLog||keys[0];
                 const logData=results[logKey]?.log||[];
-                const relCols=OS.filter(sk=>prof.w[sk]>0);
+                const relCols=OS;
                 const header=["Wk","Age","SW","Trains","Pops",...relCols.map(sk=>SN[sk]),...relCols.map(sk=>SN[sk]+"_sub")].join(",");
                 const rows=logData.map(w=>{
                   const pops=w.pops.map(p=>`${SN[p[0]]}→${p[1]}`).join(" ");
@@ -737,8 +737,8 @@ export default function App(){
                           <th style={{padding:"4px 6px",textAlign:"center",color:C.txD}}>Age</th>
                           <th style={{padding:"4px 6px",textAlign:"center",color:C.txD}}>SW</th>
                           <th style={{padding:"4px 6px",textAlign:"left",color:C.txD}}>Train</th>
-                          {OS.filter(sk=>prof.w[sk]>0).map(sk=>(
-                            <th key={sk} style={{padding:"4px 6px",textAlign:"center",color:C.txD}}>{SN[sk]}</th>
+                          {OS.map(sk=>(
+                            <th key={sk} style={{padding:"4px 6px",textAlign:"center",color:prof.w[sk]>0?C.txD:C.txM}}>{SN[sk]}</th>
                           ))}
                           <th style={{padding:"4px 6px",textAlign:"left",color:C.txD}}>Pops</th>
                         </tr>
@@ -751,11 +751,12 @@ export default function App(){
                             <td style={{padding:"3px 6px",textAlign:"center",color:C.txD}}>{w.age}</td>
                             <td style={{padding:"3px 6px",textAlign:"center",color:C.txM}}>{w.sw}</td>
                             <td style={{padding:"3px 6px",color:C.acc,fontWeight:600}}>{SN[w.trained]}</td>
-                            {OS.filter(sk=>prof.w[sk]>0).map(sk=>{
+                            {OS.map(sk=>{
                               const hasPop=w.pops.some(p=>p[0]===sk);
+                              const dim=prof.w[sk]===0;
                               return(
                                 <td key={sk} style={{padding:"3px 6px",textAlign:"center",
-                                  color:hasPop?C.pop:C.tx,fontWeight:hasPop?700:400}}>
+                                  color:hasPop?C.pop:dim?C.txM:C.tx,fontWeight:hasPop?700:400,opacity:dim?0.5:1}}>
                                   {w.levels[sk]}<span style={{color:C.txM,fontSize:9}}>.{Math.floor(w.subs[sk]*100).toString().padStart(2,"0")}</span>
                                 </td>
                               );
