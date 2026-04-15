@@ -83,12 +83,9 @@ function _pf(tgt){return(st,a,p,ctx,te)=>{
 
 
 function _ll(st,a,p,ctx,te){
-  // pick_lowest: two-tier maximin — lowest primary first, secondaries only when all primaries maxed
-  const prim=_crit(p).filter(s=>st[s].lv<_MX);
-  const sec=OS.filter(s=>p.w[s]>0&&p.w[s]<1&&st[s].lv<_MX);
-  const pool=prim.length?prim:sec;
-  if(!pool.length)return null;
-  return pool.reduce((a,b)=>st[a].lv<=st[b].lv?a:b);
+  // pick_lowest: pure maximin across all weighted skills
+  let b=null,bl=99;for(const sk of OS){const w=p.w[sk]||0;
+    if(w>0&&st[sk].lv<_MX&&st[sk].lv<bl){bl=st[sk].lv;b=sk;}}return b;
 }
 function _bal(st,a,p,ctx,te){
   // balanced 2:1: primaries get 2x slots vs secondaries; maximin within tier
@@ -131,7 +128,7 @@ const STRATS={
   closest_to_pop:{name:"Closest to Pop",fn:_ctp,desc:"Train skill nearest to next level-up"},
   pace_16_rr:{name:"Pace→16 + RR",fn:_pf(16),desc:"Rush pace to 16, then round-robin"},
   pace_15_rr:{name:"Pace→15 + RR",fn:_pf(15),desc:"Rush pace to 15, then round-robin"},
-  pick_lowest:{name:"Pick Lowest",fn:_ll,desc:"Lowest primary first, secondaries only when primaries maxed",validPos:null},
+  pick_lowest:{name:"Pick Lowest",fn:_ll,desc:"Always train lowest-level weighted skill (pure maximin)",validPos:null},
   balanced:{name:"Balanced (2:1)",fn:_bal,desc:"Primaries 2× slots vs secondaries; maximin within each tier",validPos:["DEF","ATT","WING"]},
   positional_balanced:{name:"Positional→Balanced",fn:_pb,desc:"Primaries via GT-will-max (lowest-first), then secondaries self-level",validPos:["DEF","ATT","WING"]},
 };
