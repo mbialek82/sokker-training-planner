@@ -1,7 +1,12 @@
-import React, { useState, useMemo, useCallback, useRef } from "react";
+import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOKKER TRAINING PLANNER v5 — v24 model + subskill editor
+// SOKKER TRAINING PLANNER v6 — adds Manual Schedule Builder
+// v6: Manual Schedule as a selectable "strategy". Editor panel appears in
+//     the left column when Manual Schedule is checked (quick-add buttons,
+//     chip strip, seed-from-strategy). Auto-resimulates only the manual
+//     result on schedule edits, leaving other strategy results intact.
+// v5: v24 model + subskill editor
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ─── Engine (v24 model, April 2026) ───────────────────────────────────────
@@ -83,12 +88,9 @@ function _pf(tgt){return(st,a,p,ctx,te)=>{
 
 
 function _ll(st,a,p,ctx,te){
-  // pick_lowest: two-tier maximin — lowest primary first, secondaries only when all primaries maxed
-  const prim=_crit(p).filter(s=>st[s].lv<_MX);
-  const sec=OS.filter(s=>p.w[s]>0&&p.w[s]<1&&st[s].lv<_MX);
-  const pool=prim.length?prim:sec;
-  if(!pool.length)return null;
-  return pool.reduce((a,b)=>st[a].lv<=st[b].lv?a:b);
+  // pick_lowest: pure maximin across all weighted skills
+  let b=null,bl=99;for(const sk of OS){const w=p.w[sk]||0;
+    if(w>0&&st[sk].lv<_MX&&st[sk].lv<bl){bl=st[sk].lv;b=sk;}}return b;
 }
 function _bal(st,a,p,ctx,te){
   // balanced 2:1: primaries get 2x slots vs secondaries; maximin within tier
@@ -131,7 +133,7 @@ const STRATS={
   closest_to_pop:{name:"Closest to Pop",fn:_ctp,desc:"Train skill nearest to next level-up"},
   pace_16_rr:{name:"Pace→16 + RR",fn:_pf(16),desc:"Rush pace to 16, then round-robin"},
   pace_15_rr:{name:"Pace→15 + RR",fn:_pf(15),desc:"Rush pace to 15, then round-robin"},
-  pick_lowest:{name:"Pick Lowest",fn:_ll,desc:"Lowest primary first, secondaries only when primaries maxed",validPos:null},
+  pick_lowest:{name:"Pick Lowest",fn:_ll,desc:"Always train lowest-level weighted skill (pure maximin)",validPos:null},
   balanced:{name:"Balanced (2:1)",fn:_bal,desc:"Primaries 2× slots vs secondaries; maximin within each tier",validPos:["DEF","ATT","WING"]},
   positional_balanced:{name:"Positional→Balanced",fn:_pb,desc:"Primaries via GT-will-max (lowest-first), then secondaries self-level",validPos:["DEF","ATT","WING"]},
 };
@@ -241,6 +243,31 @@ function runSaleOpt(skills,td,age,deadWeeks,pos,subs,ssw,maxExt=3){
     isSale:true,schedule:best,carryPct,extensions:extUsed,swaps:totSwaps};
 }
 
+// ─── Manual Schedule runner ────────────────────────────────────────────────
+// Thin wrapper around _simSched that returns a result shaped like runPlan's
+// so the same comparison table / CSV / log renderer works unchanged.
+// An empty schedule is valid: returns a zero-week result with finalSkills
+// equal to startSkills (initial state, no training applied).
+function runManualSched(sched,skills,td,age,ssw,pos,subs){
+  const prof=POS[pos],te=_te(td);
+  const startSk={};for(const sk of OS)startSk[sk]=skills[sk]||0;
+  if(!sched||!sched.length){
+    const st=_initSt(skills,age,te,subs);
+    const fsk={},fdb={};
+    for(const sk of OS){fsk[sk]=st[sk].lv;fdb[sk]=_tdb(st[sk],sk,age,te);}
+    return{log:[],finalSkills:fsk,finalDb:fdb,totalWeeks:0,maxedAt:{},
+      startSkills:startSk,startAge:age,isSale:false,isManual:true,schedule:[]};
+  }
+  const{states:fs,log}=_simSched(sched,skills,td,age,ssw,subs,prof);
+  const fAge=_ageAfter(age,ssw,sched.length);
+  const fsk={},fdb={},mx={};
+  for(const sk of OS){fsk[sk]=fs[sk].lv;fdb[sk]=_tdb(fs[sk],sk,fAge,te);}
+  for(const w of log)for(const p of w.pops)
+    if(p[1]>=_MX&&!(p[0] in mx))mx[p[0]]=[w.week,w.age];
+  return{log,finalSkills:fsk,finalDb:fdb,totalWeeks:sched.length,maxedAt:mx,
+    startSkills:startSk,startAge:age,isSale:false,isManual:true,schedule:[...sched]};
+}
+
 // ─── Paste Parser ──────────────────────────────────────────────────────────
 const PL={forma:"form",formę:"form",formy:"form",kondycja:"stamina",kondycję:"stamina",
   kondycji:"stamina",szybkość:"pace",szybkości:"pace",technika:"technique",technikę:"technique",
@@ -269,6 +296,16 @@ const C={bg:"#0c0e14",card:"#14171f",hi:"#1a1e29",bdr:"#252a38",
   acc:"#4a90d9",pop:"#48c774",warn:"#f5a623",tx:"#dfe3ed",txD:"#8a96a8",txM:"#4e5a6e",red:"#ef4444"};
 const _ft="'JetBrains Mono','Fira Code',monospace";
 const _fs="'DM Sans','Segoe UI',system-ui,sans-serif";
+
+// Per-skill palette for Manual Schedule chips and quick-add buttons
+const SKILL_COLORS={
+  pace:       "#c0392b",
+  technique:  "#2980b9",
+  passing:    "#27ae60",
+  defending:  "#8e44ad",
+  playmaking: "#d68910",
+  striker:    "#16a085",
+};
 
 const YS_PRESETS=[
   {ys:3.00,l:"3.00 (max)"},{ys:3.11,l:"3.11"},{ys:3.30,l:"3.30"},
@@ -400,6 +437,12 @@ export default function App(){
   const[playerName,setPlayerName]=useState("");
   const[playerWarnings,setPlayerWarnings]=useState([]);
 
+  // Manual Schedule Builder state
+  const[manualSched,setManualSched]=useState([]);
+  const[bulkN,setBulkN]=useState(1);
+  const[seedStrat,setSeedStrat]=useState("round_robin");
+  const[seedWeeks,setSeedWeeks]=useState(52);
+
   const handleParse=useCallback(()=>{
     if(!paste.trim())return;
     const p=parsePaste(paste);setParsed(p);
@@ -421,10 +464,11 @@ export default function App(){
     const res={};
     for(const k of selStrats){
       if(k==="sale_optimizer") res[k]=runSaleOpt(skills,td,age,weeks,pos,subsFloat,ssw);
+      else if(k==="manual_schedule") res[k]=runManualSched(manualSched,skills,td,age,ssw,pos,subsFloat);
       else res[k]=runPlan(skills,td,age,ssw,pos,k,weeks,subsFloat);
     }
     setResults(res);setShowLog(null);
-  },[skills,td,age,ssw,pos,weeks,selStrats,subsFloat]);
+  },[skills,td,age,ssw,pos,weeks,selStrats,subsFloat,manualSched]);
 
   const prof=POS[pos];
   function wScore(r){
@@ -442,8 +486,27 @@ export default function App(){
   const sSel={...sI,cursor:"pointer",appearance:"none",paddingRight:28,backgroundImage:`url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%238a96a8' stroke-width='1.5'/%3E%3C/svg%3E")`,backgroundRepeat:"no-repeat",backgroundPosition:"right 10px center"};
   const sB={background:C.acc,color:"#fff",border:"none",borderRadius:6,padding:"10px 20px",fontFamily:_fs,fontWeight:600,fontSize:14,cursor:"pointer"};
   const sBs={...sB,padding:"6px 14px",fontSize:12,background:C.hi,color:C.txD,border:`1px solid ${C.bdr}`};
-  const allStrats={...STRATS,sale_optimizer:{name:"Sale Optimizer",desc:"Minimize carry-in — best for selling"}};
+  const allStrats={...STRATS,
+    sale_optimizer:{name:"Sale Optimizer",desc:"Minimize carry-in — best for selling"},
+    manual_schedule:{name:"Manual Schedule",desc:"Build your own week-by-week plan"},
+  };
   const validStrats=Object.fromEntries(Object.entries(allStrats).filter(([k,v])=>!v.validPos||v.validPos.includes(pos)));
+
+  // Seed manual schedule from a chosen strategy's weekly picks
+  const handleSeed=useCallback(()=>{
+    const r=runPlan(skills,td,age,ssw,pos,seedStrat,seedWeeks,subsFloat);
+    setManualSched(r.log.map(w=>w.trained));
+  },[skills,td,age,ssw,pos,seedStrat,seedWeeks,subsFloat]);
+
+  // Auto-resimulate manual only (on schedule edits or input changes),
+  // leaving other strategies' results untouched. Fires only when Manual
+  // Schedule is in the selected list, so it stays opt-in.
+  useEffect(()=>{
+    if(!selStrats.includes("manual_schedule"))return;
+    const r=runManualSched(manualSched,skills,td,age,ssw,pos,subsFloat);
+    setResults(prev=>({...(prev||{}),manual_schedule:r}));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[manualSched,skills,td,age,ssw,pos,subsFloat,selStrats]);
 
   return(
     <div style={{background:C.bg,minHeight:"100vh",color:C.tx,fontFamily:_fs,padding:"20px 16px"}}>
@@ -559,6 +622,102 @@ export default function App(){
             </div>
           </div>
 
+          {/* ─── Manual Schedule Builder ─── */}
+          {selStrats.includes("manual_schedule")&&(()=>{
+            const schedStrats=Object.entries(STRATS).filter(([k,v])=>!v.validPos||v.validPos.includes(pos));
+            const totalWeeks=manualSched.length;
+            return(
+              <div style={{...sC,borderLeft:`3px solid ${C.warn}`}}>
+                <div style={{...sL,color:C.warn,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <span>🔧 Manual Schedule Builder</span>
+                  <span style={{fontWeight:400,color:C.txM,textTransform:"none",letterSpacing:0,fontSize:10}}>
+                    {totalWeeks} wk · {(totalWeeks/13).toFixed(1)}s
+                  </span>
+                </div>
+
+                {/* Seed from strategy */}
+                <div style={{display:"flex",gap:4,alignItems:"center",marginBottom:10}}>
+                  <span style={{fontSize:10,color:C.txD,width:42,fontFamily:_fs,textTransform:"uppercase",letterSpacing:"0.04em"}}>Seed</span>
+                  <select value={seedStrat} onChange={e=>setSeedStrat(e.target.value)}
+                    style={{...sSel,flex:1,fontSize:11,padding:"5px 22px 5px 8px"}}>
+                    {schedStrats.map(([k,v])=><option key={k} value={k}>{v.name}</option>)}
+                  </select>
+                  <input type="number" min={1} max={500} value={seedWeeks}
+                    onChange={e=>setSeedWeeks(Math.max(1,Math.min(500,parseInt(e.target.value)||1)))}
+                    title="Weeks to generate"
+                    style={{...sI,width:52,padding:"5px 4px",textAlign:"center",fontSize:11}}/>
+                  <button onClick={handleSeed} title="Run the strategy and copy its weekly picks into the schedule (overwrites current)."
+                    style={{...sBs,padding:"5px 10px",fontSize:11,fontWeight:600}}>🌱</button>
+                </div>
+
+                {/* Quick-add row: bulk count + 6 color-coded skill buttons */}
+                <div style={{display:"flex",gap:3,alignItems:"center",marginBottom:6}}>
+                  <input type="number" min={1} max={52} value={bulkN}
+                    onChange={e=>setBulkN(Math.max(1,Math.min(52,parseInt(e.target.value)||1)))}
+                    title="How many weeks each skill button adds"
+                    style={{...sI,width:42,padding:"4px 4px",textAlign:"center",fontSize:11,fontWeight:700}}/>
+                  {OS.map(sk=>{
+                    const col=SKILL_COLORS[sk];
+                    const wght=POS[pos].w[sk]||0;
+                    return(
+                      <button key={sk}
+                        onClick={()=>setManualSched(s=>[...s,...Array(bulkN).fill(sk)])}
+                        title={`Add ${bulkN}× ${sk} · ${wght.toFixed(2)} wt for ${POS[pos].name}`}
+                        style={{flex:1,padding:"5px 0",fontSize:11,fontWeight:700,
+                          background:col,color:"#fff",border:`1px solid ${col}`,borderRadius:4,
+                          cursor:"pointer",fontFamily:_ft,opacity:wght===0?0.55:1}}>
+                        {SN[sk]}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Ops row */}
+                <div style={{display:"flex",gap:6,marginBottom:10,alignItems:"center"}}>
+                  <button onClick={()=>setManualSched(s=>s.slice(0,-1))} disabled={!totalWeeks}
+                    style={{...sBs,padding:"4px 10px",fontSize:11,opacity:totalWeeks?1:0.4,cursor:totalWeeks?"pointer":"not-allowed"}}>
+                    ↶ Undo
+                  </button>
+                  <button onClick={()=>{if(totalWeeks&&window.confirm(`Clear all ${totalWeeks} scheduled weeks?`))setManualSched([]);}} disabled={!totalWeeks}
+                    style={{...sBs,padding:"4px 10px",fontSize:11,opacity:totalWeeks?1:0.4,cursor:totalWeeks?"pointer":"not-allowed"}}>
+                    🗑 Clear
+                  </button>
+                  <span style={{fontSize:10,color:C.txM,marginLeft:"auto",fontFamily:_ft}}>
+                    click chip to delete
+                  </span>
+                </div>
+
+                {/* Chip strip — click any chip to delete that week */}
+                <div style={{background:C.bg,borderRadius:6,padding:8,minHeight:40,
+                  maxHeight:180,overflowY:"auto",border:`1px solid ${C.bdr}`}}>
+                  {totalWeeks===0?(
+                    <div style={{textAlign:"center",color:C.txM,fontSize:11,fontStyle:"italic",padding:"8px 0"}}>
+                      No weeks yet — click a skill button above to add one.
+                    </div>
+                  ):(
+                    <div style={{display:"flex",flexWrap:"wrap",gap:3,lineHeight:1.4}}>
+                      {manualSched.map((sk,i)=>{
+                        const col=SKILL_COLORS[sk];
+                        return(
+                          <span key={i} title={`Week ${i+1}: ${sk} — click to delete`}
+                            onClick={()=>setManualSched(s=>s.filter((_,j)=>j!==i))}
+                            style={{display:"inline-flex",alignItems:"center",padding:"2px 6px",
+                              background:col,color:"#fff",borderRadius:3,fontSize:10,fontFamily:_ft,
+                              fontWeight:600,cursor:"pointer",userSelect:"none",
+                              transition:"transform 0.1s"}}
+                            onMouseEnter={e=>{e.currentTarget.style.transform="scale(1.08)";e.currentTarget.style.outline=`1px solid ${C.red}`;}}
+                            onMouseLeave={e=>{e.currentTarget.style.transform="scale(1)";e.currentTarget.style.outline="none";}}>
+                            <span style={{opacity:0.7,marginRight:3,fontSize:9}}>{i+1}</span>{SN[sk]}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
+
           <button onClick={runSim} disabled={selStrats.length===0}
             style={{...sB,width:"100%",fontSize:16,padding:"14px 20px",opacity:selStrats.length===0?.4:1}}>
             ▶ Run Simulation
@@ -657,7 +816,7 @@ export default function App(){
               {(()=>{
                 const logKey=showLog||keys[0];
                 const logData=results[logKey]?.log||[];
-                const relCols=OS;
+                const relCols=OS.filter(sk=>prof.w[sk]>0);
                 const header=["Wk","Age","SW","Trains","Pops",...relCols.map(sk=>SN[sk]),...relCols.map(sk=>SN[sk]+"_sub")].join(",");
                 const rows=logData.map(w=>{
                   const pops=w.pops.map(p=>`${SN[p[0]]}→${p[1]}`).join(" ");
@@ -737,8 +896,8 @@ export default function App(){
                           <th style={{padding:"4px 6px",textAlign:"center",color:C.txD}}>Age</th>
                           <th style={{padding:"4px 6px",textAlign:"center",color:C.txD}}>SW</th>
                           <th style={{padding:"4px 6px",textAlign:"left",color:C.txD}}>Train</th>
-                          {OS.map(sk=>(
-                            <th key={sk} style={{padding:"4px 6px",textAlign:"center",color:prof.w[sk]>0?C.txD:C.txM}}>{SN[sk]}</th>
+                          {OS.filter(sk=>prof.w[sk]>0).map(sk=>(
+                            <th key={sk} style={{padding:"4px 6px",textAlign:"center",color:C.txD}}>{SN[sk]}</th>
                           ))}
                           <th style={{padding:"4px 6px",textAlign:"left",color:C.txD}}>Pops</th>
                         </tr>
@@ -751,12 +910,11 @@ export default function App(){
                             <td style={{padding:"3px 6px",textAlign:"center",color:C.txD}}>{w.age}</td>
                             <td style={{padding:"3px 6px",textAlign:"center",color:C.txM}}>{w.sw}</td>
                             <td style={{padding:"3px 6px",color:C.acc,fontWeight:600}}>{SN[w.trained]}</td>
-                            {OS.map(sk=>{
+                            {OS.filter(sk=>prof.w[sk]>0).map(sk=>{
                               const hasPop=w.pops.some(p=>p[0]===sk);
-                              const dim=prof.w[sk]===0;
                               return(
                                 <td key={sk} style={{padding:"3px 6px",textAlign:"center",
-                                  color:hasPop?C.pop:dim?C.txM:C.tx,fontWeight:hasPop?700:400,opacity:dim?0.5:1}}>
+                                  color:hasPop?C.pop:C.tx,fontWeight:hasPop?700:400}}>
                                   {w.levels[sk]}<span style={{color:C.txM,fontSize:9}}>.{Math.floor(w.subs[sk]*100).toString().padStart(2,"0")}</span>
                                 </td>
                               );
