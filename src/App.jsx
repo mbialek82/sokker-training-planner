@@ -1,7 +1,10 @@
 import React, { useState, useMemo, useCallback, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOKKER TRAINING PLANNER v8 — corpus submission (opt-out)
+// SOKKER TRAINING PLANNER v9 — manual builder + corpus submission
+// v9: Manual Builder mode on Stage 2 — user specifies each week's training
+//     via colored chip strip + QuickAdd buttons. Seed-from-Strategy fills the
+//     schedule from any preset. Uses the same _simSched engine as Sale Optimizer.
 // v8: Anonymous bundle submission to a Supabase corpus on every successful
 //     "Load History" call. Default-on, opt-out toggle on the History tile,
 //     choice persisted in localStorage. Opt-outs increment a separate
@@ -242,6 +245,25 @@ function runSaleOpt(skills,td,age,deadWeeks,pos,subs,ssw,maxExt=3){
   return{log,finalSkills:fsk,finalDb:fdb,totalWeeks:best.length,maxedAt:{},
     startSkills:Object.fromEntries(OS.map(sk=>[sk,skills[sk]||0])),startAge:age,
     isSale:true,schedule:best,carryPct,extensions:extUsed,swaps:totSwaps};
+}
+
+// ─── Manual Schedule Simulation ───────────────────────────────────────────
+function runManualPlan(skills,td,age,ssw,pos,subs,schedule){
+  const te=_te(td);
+  if(!schedule||!schedule.length){
+    const fsk={},fdb={};const st=_initSt(skills,age,te,subs);
+    for(const sk of OS){fsk[sk]=st[sk].lv;fdb[sk]=_tdb(st[sk],sk,age,te);}
+    return{log:[],finalSkills:fsk,finalDb:fdb,totalWeeks:0,maxedAt:{},
+      startSkills:{...skills},startAge:age,isSale:false,isManual:true,schedule:[]};
+  }
+  const prof=POS[pos];
+  const{states,log}=_simSched(schedule,skills,td,age,ssw,subs,prof);
+  const fAge=_ageAfter(age,ssw,schedule.length);
+  const fsk={},fdb={},mx={};
+  for(const sk of OS){fsk[sk]=states[sk].lv;fdb[sk]=_tdb(states[sk],sk,fAge,te);}
+  for(const w of log)for(const p of w.pops)if(p[1]>=_MX&&!(p[0] in mx))mx[p[0]]=[w.week,w.age];
+  return{log,finalSkills:fsk,finalDb:fdb,totalWeeks:schedule.length,maxedAt:mx,
+    startSkills:{...skills},startAge:age,isSale:false,isManual:true,schedule:[...schedule]};
 }
 
 // ─── XML History Parser (port of xml_history_parser.py, DOMParser-based) ──
@@ -1007,6 +1029,8 @@ export default function App(){
   const[selStrats,setSelStrats]=useState(["round_robin","closest_to_pop","sale_optimizer"]);
   const[results,setResults]=useState(null);
   const[showLog,setShowLog]=useState(null);
+  const[planMode,setPlanMode]=useState("auto"); // "auto" | "manual"
+  const[manualSchedule,setManualSchedule]=useState([]);
 
   // ─── Derived values (declared before callbacks for TDZ safety) ─────────
   const ysNum=parseFloat(ysTalent)||3.5;
@@ -1143,7 +1167,7 @@ export default function App(){
   const sSel={...sI,cursor:"pointer",appearance:"none",paddingRight:28,backgroundImage:`url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%238a96a8' stroke-width='1.5'/%3E%3C/svg%3E")`,backgroundRepeat:"no-repeat",backgroundPosition:"right 10px center"};
   const sB={background:C.acc,color:"#fff",border:"none",borderRadius:6,padding:"10px 20px",fontFamily:_fs,fontWeight:600,fontSize:14,cursor:"pointer"};
   const sBs={...sB,padding:"6px 14px",fontSize:12,background:C.hi,color:C.txD,border:`1px solid ${C.bdr}`};
-  const allStrats={...STRATS,sale_optimizer:{name:"Sale Optimizer",desc:"Minimize carry-in — best for selling"}};
+  const allStrats={...STRATS,sale_optimizer:{name:"Sale Optimizer",desc:"Minimize carry-in — best for selling"},manual:{name:"Manual",desc:"User-defined schedule"}};
   const validStrats=Object.fromEntries(Object.entries(allStrats).filter(([k,v])=>!v.validPos||v.validPos.includes(pos)));
 
   // ─── Stage tab styling ─────────────────────────────────────────────────
@@ -1198,7 +1222,7 @@ export default function App(){
       {/* ── Header ───────────────────────────────────────────────────── */}
       <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:4}}>
         <span style={{fontSize:22,fontWeight:700,color:C.acc,fontFamily:_ft}}>⚽ Sokker Training Planner</span>
-        <span style={{fontSize:12,color:C.txM}}>v8 · staged interface</span>
+        <span style={{fontSize:12,color:C.txM}}>v9 · staged interface</span>
       </div>
       <div style={{fontSize:12,color:C.txM,marginBottom:20}}>
         Load a player, plan their training, export a calibration bundle.
@@ -1398,6 +1422,102 @@ export default function App(){
           <div style={{display:"grid",gridTemplateColumns:"minmax(0,360px) minmax(0,1fr)",gap:16}}>
             {/* LEFT: parameters + strategies + run */}
             <div>
+              {/* Mode toggle */}
+              <div style={{...sC,display:"flex",gap:6}}>
+                {[["auto","📊 Strategy"],["manual","🔧 Manual"]].map(([k,l])=>(
+                  <button key={k} onClick={()=>{setPlanMode(k);setResults(null);}} style={{
+                    ...sBs,flex:1,fontSize:13,padding:"10px 0",
+                    ...(planMode===k?{background:C.acc,color:"#fff",borderColor:C.acc}:{}),
+                  }}>{l}</button>
+                ))}
+              </div>
+
+              {/* ── MANUAL BUILDER ── */}
+              {planMode==="manual"&&(
+                <>
+                  <div style={sC}>
+                    <div style={sL}>Manual Schedule <span style={{color:C.txM,textTransform:"none",letterSpacing:0}}>({manualSchedule.length} weeks)</span></div>
+                    {/* Chip strip */}
+                    <div style={{display:"flex",flexWrap:"wrap",gap:2,marginBottom:10,minHeight:28}}>
+                      {manualSchedule.length===0&&<span style={{color:C.txM,fontSize:12,fontStyle:"italic"}}>Empty — add weeks below</span>}
+                      {manualSchedule.map((sk,i)=>(
+                        <button key={i} onClick={()=>{const ns=[...manualSchedule];ns.splice(i,1);setManualSchedule(ns);setResults(null);}}
+                          title={`Week ${i+1}: ${SN[sk]} (click to remove)`}
+                          style={{padding:"3px 6px",borderRadius:4,fontSize:10,fontFamily:_ft,fontWeight:600,
+                            background:({pace:"#c0392b",technique:"#2980b9",passing:"#27ae60",defending:"#8e44ad",playmaking:"#d68910",striker:"#16a085"})[sk]||C.hi,
+                            color:"#fff",border:"none",cursor:"pointer",minWidth:36,textAlign:"center",lineHeight:1.3}}>
+                          <div style={{fontSize:7,opacity:0.7}}>{i+1}</div>{SN[sk]}
+                        </button>
+                      ))}
+                    </div>
+                    {/* QuickAdd */}
+                    <div style={{...sL,marginTop:4}}>Add week:</div>
+                    <div style={{display:"flex",gap:4,marginBottom:8}}>
+                      {OS.map(sk=>(
+                        <button key={sk} onClick={()=>{setManualSchedule(p=>[...p,sk]);setResults(null);}}
+                          style={{...sBs,flex:1,fontSize:11,padding:"6px 0",fontWeight:700,
+                            color:({pace:"#c0392b",technique:"#2980b9",passing:"#27ae60",defending:"#8e44ad",playmaking:"#d68910",striker:"#16a085"})[sk],
+                            borderColor:({pace:"#c0392b",technique:"#2980b9",passing:"#27ae60",defending:"#8e44ad",playmaking:"#d68910",striker:"#16a085"})[sk]+"66",
+                          }}>{SN[sk]}</button>
+                      ))}
+                    </div>
+                    {/* Bulk + controls */}
+                    <div style={{display:"flex",gap:4,alignItems:"center",marginBottom:6}}>
+                      <select id="_mb_sk" defaultValue="pace" style={{...sSel,flex:1,fontSize:11,padding:"5px 6px"}}>
+                        {OS.map(sk=><option key={sk} value={sk}>{SN[sk]}</option>)}
+                      </select>
+                      <span style={{color:C.txM,fontSize:11}}>×</span>
+                      <input id="_mb_n" type="number" min={1} max={52} defaultValue={4}
+                        style={{...sI,width:50,fontSize:11,padding:"5px 6px",textAlign:"center"}}/>
+                      <button onClick={()=>{
+                        const sk=document.getElementById("_mb_sk").value;
+                        const n=Math.max(1,Math.min(52,parseInt(document.getElementById("_mb_n").value)||4));
+                        setManualSchedule(p=>[...p,...Array(n).fill(sk)]);setResults(null);
+                      }} style={{...sBs,fontSize:11,padding:"5px 10px",whiteSpace:"nowrap"}}>+ Add</button>
+                    </div>
+                    <div style={{display:"flex",gap:4}}>
+                      <button onClick={()=>{if(manualSchedule.length)setManualSchedule(p=>p.slice(0,-1));setResults(null);}}
+                        disabled={!manualSchedule.length}
+                        style={{...sBs,flex:1,fontSize:11,padding:"5px 0",opacity:manualSchedule.length?1:0.4}}>⬅ Remove last</button>
+                      <button onClick={()=>{setManualSchedule([]);setResults(null);}}
+                        disabled={!manualSchedule.length}
+                        style={{...sBs,flex:1,fontSize:11,padding:"5px 0",opacity:manualSchedule.length?1:0.4,color:C.red,borderColor:C.red+"44"}}>🗑 Clear all</button>
+                    </div>
+                  </div>
+
+                  {/* Seed from strategy */}
+                  <div style={sC}>
+                    <div style={sL}>🌱 Seed from Strategy</div>
+                    <div style={{fontSize:11,color:C.txM,marginBottom:6}}>Generate a schedule using a strategy preset, then edit it manually.</div>
+                    <div style={{display:"flex",gap:4,alignItems:"center"}}>
+                      <select id="_mb_seed_s" defaultValue="closest_to_pop" style={{...sSel,flex:1,fontSize:11,padding:"5px 6px"}}>
+                        {Object.entries(validStrats).filter(([k])=>k!=="sale_optimizer").map(([k,v])=>(
+                          <option key={k} value={k}>{v.name}</option>
+                        ))}
+                      </select>
+                      <button onClick={()=>{
+                        const strat=document.getElementById("_mb_seed_s").value;
+                        const r=runPlan(skills,td,age,ssw,pos,strat,weeks,subsFloat);
+                        setManualSchedule(r.log.map(w=>w.trained));setResults(null);
+                      }} style={{...sBs,fontSize:11,padding:"5px 12px",whiteSpace:"nowrap"}}>Generate</button>
+                    </div>
+                  </div>
+
+                  <button onClick={()=>{
+                    if(!manualSchedule.length||!hasPlayerData)return;
+                    const r=runManualPlan(skills,td,age,ssw,pos,subsFloat,manualSchedule);
+                    setResults({manual:r});setShowLog("manual");
+                  }} disabled={!manualSchedule.length||!hasPlayerData}
+                    style={{...sB,width:"100%",fontSize:16,padding:"14px 20px",
+                      opacity:(!manualSchedule.length||!hasPlayerData)?0.4:1,
+                      cursor:(!manualSchedule.length||!hasPlayerData)?"not-allowed":"pointer"}}>
+                    ▶ Simulate Manual Schedule
+                  </button>
+                </>
+              )}
+
+              {/* ── AUTO MODE (existing) ── */}
+              {planMode==="auto"&&(<>
               <div style={sC}>
                 <div style={sL}>YS Talent</div>
                 <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6}}>
@@ -1468,6 +1588,7 @@ export default function App(){
                   cursor:(selStrats.length===0||!hasPlayerData)?"not-allowed":"pointer"}}>
                 ▶ Run Simulation
               </button>
+              </>)}
             </div>
 
             {/* RIGHT: results */}
@@ -1752,7 +1873,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v8 · Three-stage interface · Calibration corpus enabled
+        Sokker Training Planner v9 · Three-stage interface · Manual builder · Calibration corpus
       </div>
 
       {/* Mobile responsiveness — collapse 2-col grids below 720px */}
