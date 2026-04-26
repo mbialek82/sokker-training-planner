@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback, useRef } from "react";
+import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SOKKER TRAINING PLANNER v8 — corpus submission (opt-out)
@@ -166,6 +166,41 @@ function runPlan(skills,td,age,ssw,pos,strat,weeks,subs){
   const fsk={},fdb={};
   for(const sk of OS){fsk[sk]=st[sk].lv;fdb[sk]=_tdb(st[sk],sk,ca,te);}
   return{log,finalSkills:fsk,finalDb:fdb,totalWeeks:wk,maxedAt:mx,startSkills:startSk,startAge:age,isSale:false};
+}
+
+// v8.4: drive the same engine off an explicit schedule (Manual Schedule Builder)
+function runPlanFromSchedule(skills,td,age,ssw,pos,schedule,subs){
+  const prof=POS[pos],te=_te(td);
+  const st=_initSt(skills,age,te,subs);
+  const startSk={};for(const sk of OS)startSk[sk]=st[sk].lv;
+  let sw=ssw,ca=age,wk=0;const log=[],mx={};
+  const len=Array.isArray(schedule)?schedule.length:0;
+  while(wk<len){
+    let tr=schedule[wk];
+    // If the picked skill is already maxed, gracefully fall back to highest-value
+    // unmaxed skill — same fallback the strategies use, prevents wasted weeks.
+    if(tr&&(!OS.includes(tr)||st[tr].lv>=_MX||_gwm(st[tr],tr,ca,te,len-wk))){
+      let alt=null,ac=-1;
+      for(const sk of OS){const w=prof.w[sk]||0;
+        if(w>0&&st[sk].lv<_MX&&!_gwm(st[sk],sk,ca,te,len-wk)){
+          const sc=w*_dt(sk,st[sk].lv,ca,te);if(sc>ac){ac=sc;alt=sk;}}}
+      if(alt)tr=alt;else break;
+    }
+    if(!tr)break;
+    wk++;const g={},wp=[];
+    for(const sk of OS){if(st[sk].lv>=_MX){g[sk]=0;continue;}
+      const xp=sk===tr?_XD:_XG;g[sk]=xp;
+      for(const l of _applyXp(st[sk],xp,sk,ca,te)){wp.push([sk,l]);
+        if(l>=_MX&&!(sk in mx))mx[sk]=[wk,ca];}}
+    log.push({week:wk,age:ca,sw,trained:tr,
+      levels:Object.fromEntries(OS.map(sk=>[sk,st[sk].lv])),
+      subs:Object.fromEntries(OS.map(sk=>[sk,_sub(st[sk],sk,ca,te)])),
+      gains:g,pops:wp});
+    sw++;if(sw>_SL){sw=1;ca++;}
+  }
+  const fsk={},fdb={};
+  for(const sk of OS){fsk[sk]=st[sk].lv;fdb[sk]=_tdb(st[sk],sk,ca,te);}
+  return{log,finalSkills:fsk,finalDb:fdb,totalWeeks:wk,maxedAt:mx,startSkills:startSk,startAge:age,isSale:false,isManual:true,schedule:[...schedule]};
 }
 
 // ─── Sale Optimizer ────────────────────────────────────────────────────────
@@ -714,7 +749,7 @@ function buildBundle(ctx){
   const lastReport=reports&&reports.length?reports[reports.length-1]:null;
   return{
     format_version:"1.1",
-    source:"sokker-training-planner-online-v8.3",
+    source:"sokker-training-planner-online-v8.4",
     exported_at:new Date().toISOString(),
     player:{
       player_id:playerMeta?.player_id??null,
@@ -861,6 +896,8 @@ function parsePaste(text){
 // ═══════════════════════════════════════════════════════════════════════════
 const C={bg:"#0c0e14",card:"#14171f",hi:"#1a1e29",bdr:"#252a38",
   acc:"#4a90d9",pop:"#48c774",warn:"#f5a623",tx:"#dfe3ed",txD:"#8a96a8",txM:"#4e5a6e",red:"#ef4444"};
+// v8.4: Canonical per-skill chip colors for Manual Schedule
+const SK_COLORS={pace:"#4a90d9",technique:"#48c774",passing:"#a78bfa",defending:"#f5a623",playmaking:"#ec4899",striker:"#ef4444"};
 const _ft="'JetBrains Mono','Fira Code',monospace";
 const _fs="'DM Sans','Segoe UI',system-ui,sans-serif";
 
@@ -1032,6 +1069,11 @@ export default function App(){
   // v8.3: which plans the user has selected to include in the export bundle
   // (independent of the share-to-corpus flow, which always includes everything)
   const[planExportSel,setPlanExportSel]=useState({});
+  // v8.4: Manual Schedule Builder
+  const[manualEnabled,setManualEnabled]=useState(false);
+  const[manualSchedule,setManualSchedule]=useState([]); // array of skill names
+  const[manualHistory,setManualHistory]=useState([]); // for undo (snapshots before each mutation)
+  const[manualSeedFrom,setManualSeedFrom]=useState("round_robin");
 
   // ─── Derived values (declared before callbacks for TDZ safety) ─────────
   const ysNum=parseFloat(ysTalent)||3.5;
@@ -1266,10 +1308,10 @@ export default function App(){
   const handleExportBundle=useCallback(()=>{
     // v8.3: include only plans the user ticked in the picker.
     const plans={};
-    if(results){
-      for(const k of Object.keys(results)){
+    if(displayResults){
+      for(const k of Object.keys(displayResults)){
         if(planExportSel[k]){
-          const p=extractPlan(results[k],k,{weeks,pos,ssw});
+          const p=extractPlan(displayResults[k],k,{weeks,pos,ssw});
           if(p)plans[k]=p;
         }
       }
@@ -1285,7 +1327,7 @@ export default function App(){
     const idPart=pid&&/^\d+$/.test(pid)?pid:(historyMeta?.player_id?`${historyMeta.player_id}`:(playerName||"player").replace(/[^a-zA-Z0-9]+/g,"_").slice(0,40)||"player");
     const ts=new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
     downloadBundle(bundle,`sokker_bundle_${idPart}_${ts}.json`);
-  },[historyReports,historyText,historyMeta,pid,skills,subs,age,ysTalent,td,pos,weeks,ssw,playerName,results,planExportSel]);
+  },[historyReports,historyText,historyMeta,pid,skills,subs,age,ysTalent,td,pos,weeks,ssw,playerName,displayResults,planExportSel]);
 
   const runSim=useCallback(()=>{
     const res={};
@@ -1298,6 +1340,92 @@ export default function App(){
     const sel={};for(const k of Object.keys(res))sel[k]=true;
     setPlanExportSel(sel);
   },[skills,td,age,ssw,pos,weeks,selStrats,subsFloat]);
+
+  // v8.4: Manual Schedule mutation handlers — each snapshots before mutating
+  // so Undo can step back through any number of changes.
+  const _snapshotManual=useCallback(()=>{
+    setManualHistory(h=>[...h.slice(-49),manualSchedule]); // cap at 50 snapshots
+  },[manualSchedule]);
+
+  const manualAppend=useCallback((skill,count=1)=>{
+    _snapshotManual();
+    setManualSchedule(s=>{
+      const n=Math.max(1,Math.min(parseInt(count,10)||1,52));
+      const out=[...s];
+      for(let i=0;i<n;i++)out.push(skill);
+      return out;
+    });
+  },[_snapshotManual]);
+
+  const manualDeleteAt=useCallback((idx)=>{
+    _snapshotManual();
+    setManualSchedule(s=>s.filter((_,i)=>i!==idx));
+  },[_snapshotManual]);
+
+  const manualUndo=useCallback(()=>{
+    setManualHistory(h=>{
+      if(h.length===0)return h;
+      const prev=h[h.length-1];
+      setManualSchedule(prev);
+      return h.slice(0,-1);
+    });
+  },[]);
+
+  const manualClear=useCallback(()=>{
+    if(manualSchedule.length===0)return;
+    if(!window.confirm(`Clear all ${manualSchedule.length} weeks?`))return;
+    _snapshotManual();
+    setManualSchedule([]);
+  },[manualSchedule.length,_snapshotManual]);
+
+  const manualSeed=useCallback(()=>{
+    // Seed by running the chosen strategy and lifting its schedule
+    let seedSched;
+    if(manualSeedFrom==="sale_optimizer"){
+      const r=runSaleOpt(skills,td,age,weeks,pos,subsFloat,ssw);
+      seedSched=r.log.map(w=>w.trained);
+    }else if(STRATS[manualSeedFrom]){
+      const r=runPlan(skills,td,age,ssw,pos,manualSeedFrom,weeks,subsFloat);
+      seedSched=r.log.map(w=>w.trained);
+    }else return;
+    if(manualSchedule.length>0){
+      if(!window.confirm(`Replace current schedule (${manualSchedule.length} weeks) with ${manualSeedFrom} (${seedSched.length} weeks)?`))return;
+    }
+    _snapshotManual();
+    setManualSchedule(seedSched);
+  },[manualSeedFrom,skills,td,age,ssw,pos,weeks,subsFloat,manualSchedule.length,_snapshotManual]);
+
+  const manualToggle=useCallback(()=>{
+    setManualEnabled(e=>{
+      const next=!e;
+      // First-time enable: seed empty so user gets a clean slate
+      if(next&&manualSchedule.length===0)setManualSchedule([]);
+      return next;
+    });
+  },[manualSchedule.length]);
+
+  // v8.4: Manual Schedule auto-resimulates whenever the schedule or player state changes.
+  // Lives outside `results` so it doesn't get clobbered by Run Simulation, and so it
+  // updates instantly on chip edits without requiring a button press.
+  const manualResult=useMemo(()=>{
+    if(!manualEnabled||manualSchedule.length===0)return null;
+    return runPlanFromSchedule(skills,td,age,ssw,pos,manualSchedule,subsFloat);
+  },[manualEnabled,manualSchedule,skills,td,age,ssw,pos,subsFloat]);
+
+  // Merged view that the comparison table iterates over: stored results + manual.
+  const displayResults=useMemo(()=>{
+    const m={};
+    if(results)for(const k of Object.keys(results))m[k]=results[k];
+    if(manualResult)m.manual=manualResult;
+    return Object.keys(m).length?m:null;
+  },[results,manualResult]);
+
+  // v8.4: keep planExportSel.manual in sync with manual existence
+  useEffect(()=>{
+    if(manualResult&&!(("manual" in planExportSel))){
+      setPlanExportSel(s=>({...s,manual:true}));
+    }
+  },[manualResult,planExportSel]);
 
   const prof=POS[pos];
   function wScore(r){
@@ -1315,7 +1443,11 @@ export default function App(){
   const sSel={...sI,cursor:"pointer",appearance:"none",paddingRight:28,backgroundImage:`url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%238a96a8' stroke-width='1.5'/%3E%3C/svg%3E")`,backgroundRepeat:"no-repeat",backgroundPosition:"right 10px center"};
   const sB={background:C.acc,color:"#fff",border:"none",borderRadius:6,padding:"10px 20px",fontFamily:_fs,fontWeight:600,fontSize:14,cursor:"pointer"};
   const sBs={...sB,padding:"6px 14px",fontSize:12,background:C.hi,color:C.txD,border:`1px solid ${C.bdr}`};
-  const allStrats={...STRATS,sale_optimizer:{name:"Sale Optimizer",desc:"Minimize carry-in — best for selling"}};
+  const allStrats={
+    ...STRATS,
+    sale_optimizer:{name:"Sale Optimizer",desc:"Minimize carry-in — best for selling"},
+    manual:{name:"Manual Schedule",desc:"Hand-built week-by-week"},
+  };
   const validStrats=Object.fromEntries(Object.entries(allStrats).filter(([k,v])=>!v.validPos||v.validPos.includes(pos)));
 
   // ─── Stage tab styling ─────────────────────────────────────────────────
@@ -1370,7 +1502,7 @@ export default function App(){
       {/* ── Header ───────────────────────────────────────────────────── */}
       <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:4}}>
         <span style={{fontSize:22,fontWeight:700,color:C.acc,fontFamily:_ft}}>⚽ Sokker Training Planner</span>
-        <span style={{fontSize:12,color:C.txM}}>v8.3 · staged interface</span>
+        <span style={{fontSize:12,color:C.txM}}>v8.4 · staged interface</span>
       </div>
       <div style={{fontSize:12,color:C.txM,marginBottom:20}}>
         Load a player, plan their training, export a calibration bundle.
@@ -1667,19 +1799,29 @@ export default function App(){
                   cursor:(selStrats.length===0||!hasPlayerData)?"not-allowed":"pointer"}}>
                 ▶ Run Simulation
               </button>
+
+              {/* v8.4: Manual Schedule toggle */}
+              <button onClick={manualToggle} disabled={!hasPlayerData}
+                style={{...sB,width:"100%",fontSize:13,padding:"10px 16px",marginTop:8,
+                  background:manualEnabled?C.warn:C.hi,
+                  color:manualEnabled?"#fff":C.txD,
+                  border:manualEnabled?"none":`1px solid ${C.bdr}`,
+                  opacity:hasPlayerData?1:0.4,cursor:hasPlayerData?"pointer":"not-allowed"}}>
+                {manualEnabled?"✓ Manual Schedule active — editor below":"✏️ Build Manual Schedule"}
+              </button>
             </div>
 
             {/* RIGHT: results */}
             <div>
-              {!results&&(
+              {!displayResults&&(
                 <div style={{...sC,textAlign:"center",padding:60,color:C.txM}}>
                   <div style={{fontSize:40,marginBottom:8,opacity:0.4}}>📊</div>
                   <div>Configure parameters and run the simulation.</div>
                 </div>
               )}
 
-              {results&&(()=>{
-                const keys=Object.keys(results);const first=results[keys[0]];
+              {displayResults&&(()=>{
+                const keys=Object.keys(displayResults);const first=displayResults[keys[0]];
                 return(<div>
                   <div style={{...sC,borderLeft:`3px solid ${C.acc}`}}>
                     <div style={{fontSize:13,color:C.txD,marginBottom:4}}>
@@ -1703,7 +1845,7 @@ export default function App(){
                           <th style={{textAlign:"center",padding:"6px 4px",color:C.txD,width:50}}>Start</th>
                           {keys.map(k=>(
                             <th key={k} style={{textAlign:"center",padding:"6px 8px",fontWeight:600,borderLeft:`1px solid ${C.bdr}`,
-                              color:results[k].isSale?C.warn:C.acc}}>{allStrats[k]?.name||k}</th>
+                              color:displayResults[k].isSale?C.warn:C.acc}}>{allStrats[k]?.name||k}</th>
                           ))}
                         </tr>
                       </thead>
@@ -1719,7 +1861,7 @@ export default function App(){
                                 {first.startSkills[sk]}<span style={{fontSize:9,color:C.txM}}>.{(subs[sk]??25).toString().padStart(2,"0")}</span>
                               </td>
                               {keys.map(kk=>{
-                                const r=results[kk];const lv=r.finalSkills[sk];const gained=lv-first.startSkills[sk];
+                                const r=displayResults[kk];const lv=r.finalSkills[sk];const gained=lv-first.startSkills[sk];
                                 const lastSub=r.log.length?r.log[r.log.length-1].subs[sk]:0;
                                 return(
                                   <td key={kk} style={{textAlign:"center",padding:"5px 8px",borderLeft:`1px solid ${C.bdr}`,fontWeight:600}}>
@@ -1735,7 +1877,7 @@ export default function App(){
                         <tr style={{borderTop:`2px solid ${C.bdr}`}}>
                           <td colSpan={2} style={{padding:"6px 8px",fontWeight:700,color:C.acc}}>Weighted Score</td>
                           {keys.map(k=>{
-                            const sc=wScore(results[k]);const best=Math.max(...keys.map(kk=>wScore(results[kk])));
+                            const sc=wScore(displayResults[k]);const best=Math.max(...keys.map(kk=>wScore(displayResults[kk])));
                             return(<td key={k} style={{textAlign:"center",padding:"6px 8px",fontWeight:700,
                               borderLeft:`1px solid ${C.bdr}`,color:Math.abs(sc-best)<0.05?C.pop:C.tx}}>{sc.toFixed(1)}</td>);
                           })}
@@ -1745,18 +1887,18 @@ export default function App(){
                   </div>
 
                   {(()=>{
-                    const best=keys.reduce((a,b)=>wScore(results[a])>wScore(results[b])?a:b);
+                    const best=keys.reduce((a,b)=>wScore(displayResults[a])>wScore(displayResults[b])?a:b);
                     return(
                       <div style={{...sC,background:C.pop+"11",borderLeft:`3px solid ${C.pop}`}}>
                         <span style={{fontWeight:700,color:C.pop}}>★ Best: {allStrats[best]?.name||best}</span>
-                        <span style={{color:C.txD,marginLeft:8}}>(score {wScore(results[best]).toFixed(1)})</span>
+                        <span style={{color:C.txD,marginLeft:8}}>(score {wScore(displayResults[best]).toFixed(1)})</span>
                       </div>
                     );
                   })()}
 
                   {(()=>{
                     const logKey=showLog||keys[0];
-                    const logData=results[logKey]?.log||[];
+                    const logData=displayResults[logKey]?.log||[];
                     const relCols=OS.filter(sk=>prof.w[sk]>0);
                     const header=["Wk","Age","SW","Trains","Pops",...relCols.map(sk=>SN[sk]),...relCols.map(sk=>SN[sk]+"_sub")].join(",");
                     const rows=logData.map(w=>{
@@ -1778,8 +1920,8 @@ export default function App(){
                     );
                   })()}
 
-                  {keys.filter(k=>results[k].isSale).map(k=>{
-                    const r=results[k];
+                  {keys.filter(k=>displayResults[k].isSale).map(k=>{
+                    const r=displayResults[k];
                     return(
                       <div key={k} style={{...sC,borderLeft:`3px solid ${C.warn}`}}>
                         <div style={{...sL,color:C.warn}}>💰 Sale Optimizer Details</div>
@@ -1821,12 +1963,12 @@ export default function App(){
                     <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:8}}>
                       {keys.map(k=>(
                         <button key={k} onClick={()=>setShowLog(showLog===k?null:k)} style={{
-                          ...sBs,...(showLog===k?{background:results[k].isSale?C.warn:C.acc,color:"#fff",
-                            borderColor:results[k].isSale?C.warn:C.acc}:{}),
+                          ...sBs,...(showLog===k?{background:displayResults[k].isSale?C.warn:C.acc,color:"#fff",
+                            borderColor:displayResults[k].isSale?C.warn:C.acc}:{}),
                         }}>{allStrats[k]?.name||k}</button>
                       ))}
                     </div>
-                    {showLog&&results[showLog]&&(
+                    {showLog&&displayResults[showLog]&&(
                       <div style={{maxHeight:420,overflow:"auto",borderRadius:6}}>
                         <table style={{width:"100%",borderCollapse:"collapse",fontFamily:_ft,fontSize:11}}>
                           <thead style={{position:"sticky",top:0,background:C.hi}}>
@@ -1842,7 +1984,7 @@ export default function App(){
                             </tr>
                           </thead>
                           <tbody>
-                            {results[showLog].log.map((w,i)=>(
+                            {displayResults[showLog].log.map((w,i)=>(
                               <tr key={i} style={{borderBottom:`1px solid ${C.bdr}22`,
                                 background:w.pops.length?C.pop+"0d":"transparent"}}>
                                 <td style={{padding:"3px 6px",textAlign:"center"}}>{w.week}</td>
@@ -1878,6 +2020,121 @@ export default function App(){
               })()}
             </div>
           </div>
+
+          {/* v8.4: Full-width Manual Schedule Builder */}
+          {manualEnabled&&hasPlayerData&&(
+            <div style={{...sC,borderLeft:`3px solid ${C.warn}`,marginTop:8}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10,flexWrap:"wrap",gap:10}}>
+                <div>
+                  <div style={{...sL,color:C.warn,marginBottom:2}}>✏️ Manual Schedule Builder</div>
+                  <div style={{fontSize:11,color:C.txM,lineHeight:1.4}}>
+                    Hand-pick training week by week. Updates the Manual column in the comparison table above on every edit. Click a chip to delete that week.
+                  </div>
+                </div>
+                <div style={{fontSize:12,fontFamily:_ft,color:C.txD}}>
+                  <span style={{color:C.warn,fontWeight:700}}>{manualSchedule.length}</span> weeks
+                  {manualSchedule.length>0&&<span style={{color:C.txM}}> · {(manualSchedule.length/13).toFixed(1)} seasons</span>}
+                </div>
+              </div>
+
+              {/* Quick-add row */}
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,flexWrap:"wrap"}}>
+                <span style={{fontSize:11,color:C.txM,fontFamily:_fs,letterSpacing:"0.04em",textTransform:"uppercase"}}>Add</span>
+                <input type="number" id="manualBulk" min={1} max={52} defaultValue={1}
+                  style={{...sI,width:60,padding:"6px 8px",textAlign:"center",fontSize:13}}/>
+                <span style={{fontSize:11,color:C.txM}}>×</span>
+                {OS.map(sk=>{
+                  const w=prof.w[sk]||0;
+                  const dim=w===0;
+                  return(
+                    <button key={sk} onClick={()=>{
+                      const n=parseInt(document.getElementById("manualBulk").value,10)||1;
+                      manualAppend(sk,n);
+                    }} disabled={dim} style={{
+                      padding:"6px 12px",fontSize:12,fontFamily:_ft,fontWeight:700,
+                      borderRadius:5,cursor:dim?"not-allowed":"pointer",
+                      background:dim?C.hi:SK_COLORS[sk]+"33",
+                      color:dim?C.txM:SK_COLORS[sk],
+                      border:`1px solid ${dim?C.bdr:SK_COLORS[sk]}`,
+                      opacity:dim?0.4:1,
+                    }}>{SN[sk]}</button>
+                  );
+                })}
+                <span style={{flex:1}}/>
+                <button onClick={manualUndo} disabled={manualHistory.length===0}
+                  style={{...sBs,opacity:manualHistory.length===0?0.4:1,cursor:manualHistory.length===0?"not-allowed":"pointer"}}>
+                  ↶ Undo
+                </button>
+                <button onClick={manualClear} disabled={manualSchedule.length===0}
+                  style={{...sBs,opacity:manualSchedule.length===0?0.4:1,cursor:manualSchedule.length===0?"not-allowed":"pointer",
+                    color:manualSchedule.length>0?C.red:C.txM,borderColor:manualSchedule.length>0?C.red:C.bdr}}>
+                  🗑 Clear
+                </button>
+              </div>
+
+              {/* Seed-from-strategy row */}
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14,flexWrap:"wrap",
+                padding:"8px 10px",background:C.bg,borderRadius:6,border:`1px dashed ${C.bdr}`}}>
+                <span style={{fontSize:11,color:C.txM}}>Or seed from strategy:</span>
+                <select value={manualSeedFrom} onChange={e=>setManualSeedFrom(e.target.value)}
+                  style={{...sSel,width:200,padding:"5px 28px 5px 8px",fontSize:12}}>
+                  {Object.entries(validStrats).filter(([k])=>k!=="manual").map(([k,v])=>(
+                    <option key={k} value={k}>{v.name}</option>
+                  ))}
+                </select>
+                <button onClick={manualSeed} style={{...sBs,background:C.warn+"22",borderColor:C.warn,color:C.warn}}>
+                  🌱 Seed ({weeks} weeks)
+                </button>
+                <span style={{fontSize:10,color:C.txM,fontFamily:_ft}}>(replaces current schedule)</span>
+              </div>
+
+              {/* Chip strip — grouped by season */}
+              {manualSchedule.length===0?(
+                <div style={{padding:"24px 12px",textAlign:"center",color:C.txM,fontSize:12,
+                  background:C.bg,borderRadius:6,border:`1px dashed ${C.bdr}`}}>
+                  No weeks yet. Pick a skill above to start, or seed from a strategy.
+                </div>
+              ):(
+                <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                  {(()=>{
+                    // Group chips into rows of 13 (one season each)
+                    const rows=[];
+                    for(let i=0;i<manualSchedule.length;i+=13){
+                      rows.push(manualSchedule.slice(i,i+13).map((sk,j)=>({sk,idx:i+j})));
+                    }
+                    return rows.map((row,si)=>(
+                      <div key={si} style={{display:"flex",alignItems:"center",gap:6}}>
+                        <span style={{fontSize:9,color:C.txM,fontFamily:_ft,minWidth:54,letterSpacing:"0.04em"}}>
+                          SEASON {si+1}
+                        </span>
+                        <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
+                          {row.map(({sk,idx})=>(
+                            <button key={idx} onClick={()=>manualDeleteAt(idx)} title={`Week ${idx+1}: ${sk} (click to delete)`}
+                              style={{
+                                padding:"4px 8px",borderRadius:4,fontSize:10,fontFamily:_ft,fontWeight:700,
+                                background:SK_COLORS[sk]+"33",color:SK_COLORS[sk],
+                                border:`1px solid ${SK_COLORS[sk]}`,cursor:"pointer",
+                                minWidth:38,textAlign:"center",
+                                transition:"transform .1s,box-shadow .1s",
+                              }}
+                              onMouseEnter={e=>{e.target.style.transform="scale(1.08)";e.target.style.boxShadow=`0 0 0 2px ${C.red}66`;}}
+                              onMouseLeave={e=>{e.target.style.transform="scale(1)";e.target.style.boxShadow="none";}}>
+                              <div style={{fontSize:7,color:C.txM,marginBottom:1}}>{idx+1}</div>
+                              {SN[sk]}
+                            </button>
+                          ))}
+                          {/* Pad row to 13 chips so seasons line up visually */}
+                          {row.length<13&&Array.from({length:13-row.length}).map((_,k)=>(
+                            <div key={"pad"+k} style={{minWidth:38,padding:"4px 8px",fontSize:10}}/>
+                          ))}
+                        </div>
+                      </div>
+                    ));
+                  })()}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -1906,21 +2163,21 @@ export default function App(){
                 <ul style={{fontSize:12,color:C.txD,lineHeight:1.7,marginTop:8,paddingLeft:20}}>
                   <li><b style={{color:C.tx}}>Snapshot</b> — current skills and your sub-level estimates, age, YS talent, position, horizon you planned for.</li>
                   <li><b style={{color:C.tx}}>Reports</b> — {historyReports?`${historyReports.length} weekly training records (week ${historyReports[0].week} → ${historyReports[historyReports.length-1].week})`:"empty (no training history loaded — load it on Stage 1 for richer calibration)"}.</li>
-                  <li><b style={{color:C.tx}}>Plans</b> — {results?`${Object.keys(results).length} simulated strategy${Object.keys(results).length>1?"ies":""} available, pick which to include below`:"none (run simulations on the Plan stage first)"}.</li>
+                  <li><b style={{color:C.tx}}>Plans</b> — {displayResults?`${Object.keys(displayResults).length} simulated strategy${Object.keys(displayResults).length>1?"ies":""} available, pick which to include below`:"none (run simulations on the Plan stage first)"}.</li>
                   <li><b style={{color:C.tx}}>Player ID</b> — {pid&&/^\d+$/.test(pid)?pid:historyMeta?.player_id?historyMeta.player_id:"not set (the file will use the player name instead)"}.</li>
                 </ul>
               </div>
 
               {/* v8.3: Plan-export picker */}
-              {results&&Object.keys(results).length>0&&(
+              {displayResults&&Object.keys(displayResults).length>0&&(
                 <div style={sC}>
                   <div style={sL}>Plans to include</div>
                   <div style={{fontSize:11,color:C.txM,marginBottom:8,lineHeight:1.5}}>
                     Re-loading the bundle will restore exactly these plans, ready to compare against future training. Untick any you don't want carried forward.
                   </div>
                   <div style={{display:"flex",flexDirection:"column",gap:6}}>
-                    {Object.keys(results).map(k=>{
-                      const r=results[k];
+                    {Object.keys(displayResults).map(k=>{
+                      const r=displayResults[k];
                       const sel=!!planExportSel[k];
                       const name=allStrats[k]?.name||k;
                       const len=r.log?r.log.length:0;
@@ -1967,7 +2224,7 @@ export default function App(){
     horizon_weeks:weeks,
   },
   reports:historyReports?`[ ${historyReports.length} reports ]`:[],
-  plans:results?Object.fromEntries(Object.keys(results).filter(k=>planExportSel[k]).map(k=>[k,`{ schedule: [${results[k].log?.length||0} weeks] }`])):{},
+  plans:displayResults?Object.fromEntries(Object.keys(displayResults).filter(k=>planExportSel[k]).map(k=>[k,`{ schedule: [${displayResults[k].log?.length||0} weeks] }`])):{},
 },null,2)}
                 </pre>
               </div>
@@ -1979,7 +2236,7 @@ export default function App(){
                 </button>
                 <div style={{fontSize:11,color:C.txM,marginTop:10,lineHeight:1.5}}>
                   {(()=>{
-                    const planCount=results?Object.keys(results).filter(k=>planExportSel[k]).length:0;
+                    const planCount=displayResults?Object.keys(displayResults).filter(k=>planExportSel[k]).length:0;
                     const reportCount=historyReports?historyReports.length:0;
                     if(reportCount>0&&planCount>0)return `Bundle includes ${reportCount} training weeks and ${planCount} planned strategy${planCount>1?"ies":""}. Re-load it later to compare predictions against new training data.`;
                     if(reportCount>0)return `Bundle includes ${reportCount} training weeks. Run simulations on the Plan stage to also save your strategies.`;
@@ -1994,7 +2251,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v8.3 · Three-stage interface · Calibration corpus enabled
+        Sokker Training Planner v8.4 · Three-stage interface · Calibration corpus enabled
       </div>
 
       {/* Mobile responsiveness — collapse 2-col grids below 720px */}
