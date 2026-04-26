@@ -1082,6 +1082,28 @@ export default function App(){
     const o={};for(const sk of OS)o[sk]=(subs[sk]??25)/100;return o;
   },[subs]);
 
+  // v8.4: Manual Schedule auto-resimulates whenever the schedule or player state changes.
+  // Declared before any callback that references it (TDZ safety).
+  const manualResult=useMemo(()=>{
+    if(!manualEnabled||manualSchedule.length===0)return null;
+    return runPlanFromSchedule(skills,td,age,ssw,pos,manualSchedule,subsFloat);
+  },[manualEnabled,manualSchedule,skills,td,age,ssw,pos,subsFloat]);
+
+  // Merged view that the comparison table iterates over: stored results + manual.
+  const displayResults=useMemo(()=>{
+    const m={};
+    if(results)for(const k of Object.keys(results))m[k]=results[k];
+    if(manualResult)m.manual=manualResult;
+    return Object.keys(m).length?m:null;
+  },[results,manualResult]);
+
+  // Keep planExportSel.manual in sync with manual existence
+  useEffect(()=>{
+    if(manualResult&&!(("manual" in planExportSel))){
+      setPlanExportSel(s=>({...s,manual:true}));
+    }
+  },[manualResult,planExportSel]);
+
   // ─── Callbacks ─────────────────────────────────────────────────────────
   const handleParse=useCallback(()=>{
     if(!paste.trim())return;
@@ -1403,29 +1425,6 @@ export default function App(){
       return next;
     });
   },[manualSchedule.length]);
-
-  // v8.4: Manual Schedule auto-resimulates whenever the schedule or player state changes.
-  // Lives outside `results` so it doesn't get clobbered by Run Simulation, and so it
-  // updates instantly on chip edits without requiring a button press.
-  const manualResult=useMemo(()=>{
-    if(!manualEnabled||manualSchedule.length===0)return null;
-    return runPlanFromSchedule(skills,td,age,ssw,pos,manualSchedule,subsFloat);
-  },[manualEnabled,manualSchedule,skills,td,age,ssw,pos,subsFloat]);
-
-  // Merged view that the comparison table iterates over: stored results + manual.
-  const displayResults=useMemo(()=>{
-    const m={};
-    if(results)for(const k of Object.keys(results))m[k]=results[k];
-    if(manualResult)m.manual=manualResult;
-    return Object.keys(m).length?m:null;
-  },[results,manualResult]);
-
-  // v8.4: keep planExportSel.manual in sync with manual existence
-  useEffect(()=>{
-    if(manualResult&&!(("manual" in planExportSel))){
-      setPlanExportSel(s=>({...s,manual:true}));
-    }
-  },[manualResult,planExportSel]);
 
   const prof=POS[pos];
   function wScore(r){
