@@ -1085,8 +1085,13 @@ export default function App(){
       // v8: fire-and-forget corpus submission (unless opted out)
       if(shareEnabled){
         setShareStatus(""); // clear any previous status
+        // v8.4.3: fall back to the typed-in PID when the parsed history
+        // metadata doesn't carry one (the /api/training/{pid}/report JSON
+        // body doesn't echo the player_id, so meta.player_id is usually null).
+        // Mirrors the patch already present in the manual-export path.
         const bundle=buildBundle({
-          reports,rawText:historyText,playerMeta:meta,
+          reports,rawText:historyText,
+          playerMeta:{...meta,player_id:meta?.player_id||(pid&&/^\d+$/.test(pid)?parseInt(pid,10):null)},
           skills:sk,subs:{},age:last.age||21,
           ysTalent,td:tdNow,pos,weeks,ssw,playerName:meta.name||playerName,
         });
@@ -1202,7 +1207,7 @@ export default function App(){
       {/* ── Header ───────────────────────────────────────────────────── */}
       <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:4}}>
         <span style={{fontSize:22,fontWeight:700,color:C.acc,fontFamily:_ft}}>⚽ Sokker Training Planner</span>
-        <span style={{fontSize:12,color:C.txM}}>v8.4.2 · staged interface</span>
+        <span style={{fontSize:12,color:C.txM}}>v8.4.3 · staged interface</span>
       </div>
       <div style={{fontSize:12,color:C.txM,marginBottom:20}}>
         Load a player, plan their training, export a calibration bundle.
@@ -1756,7 +1761,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v8.4.2 · Three-stage interface · Calibration corpus enabled
+        Sokker Training Planner v8.4.3 · Three-stage interface · Calibration corpus enabled
       </div>
 
       {/* Mobile responsiveness — collapse 2-col grids below 720px */}
