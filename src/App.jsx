@@ -617,7 +617,11 @@ function _stateSubskill(s){
   const max=s.skill==="stamina"?_LEVELS_STAM:_LEVELS_STD;
   if(s.level>=max)return 0.0;
   const t=_stateThreshold(s);
-  return t>0?Math.min(1.0,s.dbAccum/t):0.0;
+  if(t<=0)return 0.0;
+  // v8.4.1: include fractional gain buffer so accumulated GT is visible
+  // before it crosses an integer DB boundary. Matches user mental model:
+  // "he got 3 GT after the pop" should show as ~3*0.15/threshold, not 0.
+  return Math.min(1.0,(s.dbAccum+(s.gainBuf||0))/t);
 }
 function _stateAddGain(s,gain){
   s.gainBuf+=gain;const earned=Math.floor(s.gainBuf);s.gainBuf-=earned;return earned;
@@ -749,7 +753,7 @@ function buildBundle(ctx){
   const lastReport=reports&&reports.length?reports[reports.length-1]:null;
   return{
     format_version:"1.1",
-    source:"sokker-training-planner-online-v8.4",
+    source:"sokker-training-planner-online-v8.4.1",
     exported_at:new Date().toISOString(),
     player:{
       player_id:playerMeta?.player_id??null,
@@ -1501,7 +1505,7 @@ export default function App(){
       {/* ── Header ───────────────────────────────────────────────────── */}
       <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:4}}>
         <span style={{fontSize:22,fontWeight:700,color:C.acc,fontFamily:_ft}}>⚽ Sokker Training Planner</span>
-        <span style={{fontSize:12,color:C.txM}}>v8.4 · staged interface</span>
+        <span style={{fontSize:12,color:C.txM}}>v8.4.1 · staged interface</span>
       </div>
       <div style={{fontSize:12,color:C.txM,marginBottom:20}}>
         Load a player, plan their training, export a calibration bundle.
@@ -2250,7 +2254,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v8.4 · Three-stage interface · Calibration corpus enabled
+        Sokker Training Planner v8.4.1 · Three-stage interface · Calibration corpus enabled
       </div>
 
       {/* Mobile responsiveness — collapse 2-col grids below 720px */}
