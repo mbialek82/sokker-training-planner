@@ -709,12 +709,12 @@ function simulateSubskills(reports,td,coachEff){
 
 // ─── Calibration Bundle Builder ───────────────────────────────────────────
 function buildBundle(ctx){
-  const{reports,rawText,playerMeta,skills,subs,age,ysTalent,td,pos,weeks,ssw,playerName}=ctx;
+  const{reports,rawText,playerMeta,skills,subs,age,ysTalent,td,pos,weeks,ssw,playerName,plans}=ctx;
   const subsEst={};for(const sk of OS)subsEst[sk]=(subs[sk]??25)/100;
   const lastReport=reports&&reports.length?reports[reports.length-1]:null;
   return{
-    format_version:"1.0",
-    source:"sokker-training-planner-online-v8.1",
+    format_version:"1.1",
+    source:"sokker-training-planner-online-v8.3",
     exported_at:new Date().toISOString(),
     player:{
       player_id:playerMeta?.player_id??null,
@@ -733,6 +733,7 @@ function buildBundle(ctx){
       latest_report_week:lastReport?.week??null,
     },
     reports:reports||[],
+    plans:plans||{},
     raw_history:rawText||null,
   };
 }
@@ -742,6 +743,22 @@ function downloadBundle(bundle,filename){
   const a=document.createElement("a");
   a.href=url;a.download=filename;document.body.appendChild(a);a.click();
   setTimeout(()=>{document.body.removeChild(a);URL.revokeObjectURL(url);},100);
+}
+
+// v8.3: Extract a portable plan from a sim result.
+// Schedule is a flat array of skill names per week — same shape regardless
+// of whether the sim was a regular strategy or the sale optimizer.
+function extractPlan(result,strategyKey,opts){
+  if(!result||!result.log)return null;
+  const schedule=result.log.map(w=>w.trained);
+  return{
+    strategy:strategyKey,
+    schedule,
+    horizon_weeks:opts?.weeks??schedule.length,
+    position:opts?.pos??null,
+    start_season_week:opts?.ssw??null,
+    is_sale_optimizer:!!result.isSale,
+  };
 }
 
 // ─── Corpus Submission (Supabase) ──────────────────────────────────────────
@@ -788,7 +805,7 @@ async function submitBundleToCorpus(bundle){
         "Content-Type":"application/json",
         "apikey":_SB_KEY,
         "Authorization":`Bearer ${_SB_KEY}`,
-        "Prefer":"return=minimal",
+        "Prefer":"return=minimal,resolution=merge-duplicates",
       },
       body:JSON.stringify(row),
     });
@@ -1012,6 +1029,9 @@ export default function App(){
   const[selStrats,setSelStrats]=useState(["round_robin","closest_to_pop","sale_optimizer"]);
   const[results,setResults]=useState(null);
   const[showLog,setShowLog]=useState(null);
+  // v8.3: which plans the user has selected to include in the export bundle
+  // (independent of the share-to-corpus flow, which always includes everything)
+  const[planExportSel,setPlanExportSel]=useState({});
 
   // ─── Derived values (declared before callbacks for TDZ safety) ─────────
   const ysNum=parseFloat(ysTalent)||3.5;
@@ -1095,6 +1115,14 @@ export default function App(){
           const f=sim&&sim.subskills?sim.subskills[s]:null;
           subsForBundle[s]=f!=null?Math.max(0,Math.min(99,Math.round(f*100))):25;
         }
+        // v8.3: include any plans the user has run in this session
+        const corpusPlans={};
+        if(results){
+          for(const k of Object.keys(results)){
+            const p=extractPlan(results[k],k,{weeks,pos,ssw});
+            if(p)corpusPlans[k]=p;
+          }
+        }
         const bundle=buildBundle({
           reports,
           rawText:historyText,
@@ -1104,6 +1132,7 @@ export default function App(){
           age:last.age||21,
           ysTalent,td:tdNow,pos,weeks,ssw,
           playerName:meta?.name||playerName,
+          plans:corpusPlans,
         });
         submitBundleToCorpus(bundle).then(r=>{
           if(r.ok)setShareStatus(r.duplicate?"duplicate":"sent");
@@ -1112,7 +1141,7 @@ export default function App(){
         });
       }
     }
-  },[historyText,playerName,ysTalent,shareEnabled,pos,weeks,ssw,pid]);
+  },[historyText,playerName,ysTalent,shareEnabled,pos,weeks,ssw,pid,results]);
 
   // v8.1: load a previously-exported calibration bundle from disk.
   // Restores the same state Load History would produce, but skips corpus
@@ -1182,6 +1211,43 @@ export default function App(){
         }else setSubs({...DEF_SUBS});
       }
       setHasPlayerData(true);
+      // v8.3: restore plans by re-running the strategies the bundle recorded.
+      // We re-simulate (rather than wrapping the saved schedule directly)
+      // because the sim produces the full result shape Stage 2 expects.
+      // The saved schedule will match the re-sim as long as nothing about
+      // the player state has changed since export.
+      if(bundle.plans&&Object.keys(bundle.plans).length>0){
+        const planKeys=Object.keys(bundle.plans);
+        // Apply the saved horizon/position/ssw if they were stored, else keep current
+        const savedHorizon=bundle.plans[planKeys[0]]?.horizon_weeks||snap.horizon_weeks||52;
+        const savedPos=bundle.plans[planKeys[0]]?.position||snap.position_assumed||"ATT";
+        const savedSsw=bundle.plans[planKeys[0]]?.start_season_week||snap.start_season_week||1;
+        // Compute talent_db from YS talent (snap or current state)
+        const ysForTd=parseFloat(snap.ys_talent_user||ysTalent)||3.5;
+        const tdForSim=_fromYS(Math.max(3.0,ysForTd));
+        // Compute subskill floats from the snapshot or fall back to defaults
+        const subFloats={};
+        for(const s of OS){
+          const f=snap.subskills_estimate?.[s];
+          subFloats[s]=f!=null?f:0.25;
+        }
+        const ageForSim=snap.age_current||last.age||21;
+        const restored={};
+        for(const k of planKeys){
+          if(k==="sale_optimizer"){
+            restored[k]=runSaleOpt(sk,tdForSim,ageForSim,savedHorizon,savedPos,subFloats,savedSsw);
+          }else if(STRATS[k]){
+            restored[k]=runPlan(sk,tdForSim,ageForSim,savedSsw,savedPos,k,savedHorizon,subFloats);
+          }
+        }
+        if(Object.keys(restored).length>0){
+          setResults(restored);
+          // Default-select all restored plans for re-export
+          const sel={};for(const k of Object.keys(restored))sel[k]=true;
+          setPlanExportSel(sel);
+          setSelStrats(planKeys.filter(k=>STRATS[k]||k==="sale_optimizer"));
+        }
+      }
       // No corpus submission — this data already exists in the corpus.
     };
     reader.readAsText(file);
@@ -1198,17 +1264,28 @@ export default function App(){
   },[pid]);
 
   const handleExportBundle=useCallback(()=>{
+    // v8.3: include only plans the user ticked in the picker.
+    const plans={};
+    if(results){
+      for(const k of Object.keys(results)){
+        if(planExportSel[k]){
+          const p=extractPlan(results[k],k,{weeks,pos,ssw});
+          if(p)plans[k]=p;
+        }
+      }
+    }
     const bundle=buildBundle({
       reports:historyReports,
       rawText:historyText||null,
       playerMeta:{...historyMeta,player_id:historyMeta?.player_id||(pid&&/^\d+$/.test(pid)?parseInt(pid,10):null)},
       skills,subs,age,
       ysTalent,td,pos,weeks,ssw,playerName,
+      plans,
     });
     const idPart=pid&&/^\d+$/.test(pid)?pid:(historyMeta?.player_id?`${historyMeta.player_id}`:(playerName||"player").replace(/[^a-zA-Z0-9]+/g,"_").slice(0,40)||"player");
     const ts=new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
     downloadBundle(bundle,`sokker_bundle_${idPart}_${ts}.json`);
-  },[historyReports,historyText,historyMeta,pid,skills,subs,age,ysTalent,td,pos,weeks,ssw,playerName]);
+  },[historyReports,historyText,historyMeta,pid,skills,subs,age,ysTalent,td,pos,weeks,ssw,playerName,results,planExportSel]);
 
   const runSim=useCallback(()=>{
     const res={};
@@ -1217,6 +1294,9 @@ export default function App(){
       else res[k]=runPlan(skills,td,age,ssw,pos,k,weeks,subsFloat);
     }
     setResults(res);setShowLog(null);
+    // v8.3: default-select all newly-computed plans for export
+    const sel={};for(const k of Object.keys(res))sel[k]=true;
+    setPlanExportSel(sel);
   },[skills,td,age,ssw,pos,weeks,selStrats,subsFloat]);
 
   const prof=POS[pos];
@@ -1290,7 +1370,7 @@ export default function App(){
       {/* ── Header ───────────────────────────────────────────────────── */}
       <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:4}}>
         <span style={{fontSize:22,fontWeight:700,color:C.acc,fontFamily:_ft}}>⚽ Sokker Training Planner</span>
-        <span style={{fontSize:12,color:C.txM}}>v8.1 · staged interface</span>
+        <span style={{fontSize:12,color:C.txM}}>v8.3 · staged interface</span>
       </div>
       <div style={{fontSize:12,color:C.txM,marginBottom:20}}>
         Load a player, plan their training, export a calibration bundle.
@@ -1319,6 +1399,33 @@ export default function App(){
                 Find it in the URL of any Sokker player page. Optional — but unlocks the one-click training-report fetch below.
               </span>
             </div>
+          </div>
+
+          {/* v8.2: Load saved bundle — visible at top of stage, no clicks required */}
+          <div style={{...sC,borderLeft:`3px solid ${C.acc}`}}>
+            <div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
+              <div style={{flex:"1 1 280px"}}>
+                <div style={sL}>Returning? Load a saved bundle</div>
+                <div style={{fontSize:11,color:C.txM,lineHeight:1.5}}>
+                  Pick any <code style={{color:C.tx,fontSize:10,fontFamily:_ft}}>sokker_bundle_*.json</code> file
+                  exported earlier — yours, or one shared with you. The player, training history, skills, and subskill estimates restore exactly. No need to re-paste anything.
+                </div>
+              </div>
+              <label style={{
+                ...sB,padding:"10px 18px",fontSize:13,cursor:"pointer",
+                display:"inline-flex",alignItems:"center",gap:8,
+              }}>
+                📂 Load bundle (.json)
+                <input type="file" accept=".json,application/json"
+                  style={{display:"none"}}
+                  onChange={e=>{
+                    const f=e.target.files?.[0];
+                    if(f)handleLoadBundle(f);
+                    e.target.value="";
+                  }}/>
+              </label>
+            </div>
+            {historyError&&<div style={{fontSize:11,color:C.red,marginTop:8}}>⚠ {historyError}</div>}
           </div>
 
           {/* Tile picker + skill editor — two columns on desktop */}
@@ -1369,26 +1476,6 @@ export default function App(){
                       ?`↗ Open training report for player ${pid}`
                       :"↗ Enter player ID above first"}
                   </button>
-                  {/* v8.1: Load a previously-exported bundle from disk */}
-                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,
-                    padding:"6px 10px",background:C.bg,border:`1px dashed ${C.bdr}`,
-                    borderRadius:6,fontSize:11,color:C.txM}}>
-                    <span style={{flex:1}}>Or revisit a previous session:</span>
-                    <label style={{
-                      ...sBs,padding:"5px 12px",fontSize:11,cursor:"pointer",
-                      background:C.hi,color:C.tx,border:`1px solid ${C.bdr}`,
-                      display:"inline-flex",alignItems:"center",gap:6,
-                    }}>
-                      📂 Load saved bundle
-                      <input type="file" accept=".json,application/json"
-                        style={{display:"none"}}
-                        onChange={e=>{
-                          const f=e.target.files?.[0];
-                          if(f)handleLoadBundle(f);
-                          e.target.value=""; // allow re-loading same file
-                        }}/>
-                    </label>
-                  </div>
                   {/* v8: share toggle */}
                   <div style={{
                     background:C.bg,border:`1px solid ${C.bdr}`,borderRadius:6,
@@ -1819,9 +1906,46 @@ export default function App(){
                 <ul style={{fontSize:12,color:C.txD,lineHeight:1.7,marginTop:8,paddingLeft:20}}>
                   <li><b style={{color:C.tx}}>Snapshot</b> — current skills and your sub-level estimates, age, YS talent, position, horizon you planned for.</li>
                   <li><b style={{color:C.tx}}>Reports</b> — {historyReports?`${historyReports.length} weekly training records (week ${historyReports[0].week} → ${historyReports[historyReports.length-1].week})`:"empty (no training history loaded — load it on Stage 1 for richer calibration)"}.</li>
+                  <li><b style={{color:C.tx}}>Plans</b> — {results?`${Object.keys(results).length} simulated strategy${Object.keys(results).length>1?"ies":""} available, pick which to include below`:"none (run simulations on the Plan stage first)"}.</li>
                   <li><b style={{color:C.tx}}>Player ID</b> — {pid&&/^\d+$/.test(pid)?pid:historyMeta?.player_id?historyMeta.player_id:"not set (the file will use the player name instead)"}.</li>
                 </ul>
               </div>
+
+              {/* v8.3: Plan-export picker */}
+              {results&&Object.keys(results).length>0&&(
+                <div style={sC}>
+                  <div style={sL}>Plans to include</div>
+                  <div style={{fontSize:11,color:C.txM,marginBottom:8,lineHeight:1.5}}>
+                    Re-loading the bundle will restore exactly these plans, ready to compare against future training. Untick any you don't want carried forward.
+                  </div>
+                  <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                    {Object.keys(results).map(k=>{
+                      const r=results[k];
+                      const sel=!!planExportSel[k];
+                      const name=allStrats[k]?.name||k;
+                      const len=r.log?r.log.length:0;
+                      return(
+                        <label key={k} style={{
+                          display:"flex",alignItems:"center",gap:10,cursor:"pointer",
+                          padding:"8px 10px",borderRadius:6,
+                          background:sel?(r.isSale?C.warn+"15":C.acc+"15"):C.bg,
+                          border:`1px solid ${sel?(r.isSale?C.warn:C.acc):C.bdr}`,
+                        }}>
+                          <input type="checkbox" checked={sel}
+                            onChange={()=>setPlanExportSel(s=>({...s,[k]:!s[k]}))}
+                            style={{cursor:"pointer",accentColor:r.isSale?C.warn:C.acc}}/>
+                          <span style={{flex:1,fontSize:12,fontWeight:600,color:r.isSale?C.warn:C.acc}}>
+                            {name} {r.isSale&&"💰"}
+                          </span>
+                          <span style={{fontSize:10,fontFamily:_ft,color:C.txM}}>
+                            {len} weeks
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
               <div style={sC}>
                 <div style={sL}>Bundle preview</div>
@@ -1831,8 +1955,8 @@ export default function App(){
                   maxHeight:200,overflow:"auto",margin:"8px 0 0",lineHeight:1.5,
                 }}>
 {JSON.stringify({
-  format_version:"1.0",
-  source:"sokker-training-planner-online-v7",
+  format_version:"1.1",
+  source:"sokker-training-planner-online-v8.3",
   player:{player_id:pid&&/^\d+$/.test(pid)?parseInt(pid,10):historyMeta?.player_id||null,name:playerName||historyMeta?.name||null},
   user_snapshot:{
     current_skills:skills,
@@ -1843,6 +1967,7 @@ export default function App(){
     horizon_weeks:weeks,
   },
   reports:historyReports?`[ ${historyReports.length} reports ]`:[],
+  plans:results?Object.fromEntries(Object.keys(results).filter(k=>planExportSel[k]).map(k=>[k,`{ schedule: [${results[k].log?.length||0} weeks] }`])):{},
 },null,2)}
                 </pre>
               </div>
@@ -1853,9 +1978,14 @@ export default function App(){
                   ⬇ Download Calibration Bundle (.json)
                 </button>
                 <div style={{fontSize:11,color:C.txM,marginTop:10,lineHeight:1.5}}>
-                  {historyReports
-                    ?`Bundle includes ${historyReports.length} training weeks plus your subskill/talent estimates. Drop into the desktop calibration tool to backtest the model against your real pop history.`
-                    :"Bundle includes the current snapshot only. Loading training history on Stage 1 makes the bundle dramatically more useful — it lets the calibration backtest weekly predictions against real outcomes."}
+                  {(()=>{
+                    const planCount=results?Object.keys(results).filter(k=>planExportSel[k]).length:0;
+                    const reportCount=historyReports?historyReports.length:0;
+                    if(reportCount>0&&planCount>0)return `Bundle includes ${reportCount} training weeks and ${planCount} planned strategy${planCount>1?"ies":""}. Re-load it later to compare predictions against new training data.`;
+                    if(reportCount>0)return `Bundle includes ${reportCount} training weeks. Run simulations on the Plan stage to also save your strategies.`;
+                    if(planCount>0)return `Bundle includes ${planCount} planned strategy${planCount>1?"ies":""}, but no training history. Add training history on Stage 1 to make calibration possible.`;
+                    return "Bundle includes the current snapshot only. Loading training history on Stage 1 and running simulations on Stage 2 makes the bundle dramatically more useful.";
+                  })()}
                 </div>
               </div>
             </>
@@ -1864,7 +1994,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v8.1 · Three-stage interface · Calibration corpus enabled
+        Sokker Training Planner v8.3 · Three-stage interface · Calibration corpus enabled
       </div>
 
       {/* Mobile responsiveness — collapse 2-col grids below 720px */}
