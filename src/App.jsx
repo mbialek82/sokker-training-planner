@@ -1,32 +1,27 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOKKER TRAINING PLANNER v8.4.6 — RLS-compatible wire format
+// SOKKER TRAINING PLANNER v8.4.7 — corpus 42501 fix (UPSERT regression)
 //
-// v8.4.6 fixes the corpus auto-submit which broke in v8.4.5 (= v8.4.1
-// restoration). The Supabase RLS policy on `submissions` gates on
-// row content — specifically, it requires format_version = '1.0' and
-// the original source string 'sokker-training-planner-online-v8'.
-// v8.4.5 sent the bundle's evolving values (1.1 / v8.4.5) to the wire,
-// triggering 42501 (RLS policy violation, surfaced as HTTP 401).
+// Root cause of the 42501 / HTTP 401 corpus failures:
+// v8.4.5 added "resolution=merge-duplicates" to the submission Prefer
+// header. PostgREST translates that into INSERT ... ON CONFLICT DO UPDATE,
+// which Postgres evaluates against BOTH the INSERT and UPDATE RLS policies
+// at statement-prep time — even when no conflict actually fires. The
+// original Supabase schema only ever granted INSERT to anon (no UPDATE
+// policy), so every v8.4.5+ submission was rejected with 42501.
 //
-// Fix: the row constructed inside submitBundleToCorpus now pins
-// format_version and source to the legacy values the policy accepts.
-// The local bundle download (downloadBundle, manual export) is
-// untouched — it keeps format_version "1.1" and `plans` for desktop
-// calibration tooling. This decouples the wire format from the local
-// file format so future app versions never break the corpus contract.
+// v8.4.6's format_version / source pin was a wrong diagnosis on my part;
+// the policy isn't gating on row content, it's failing the statement
+// because the UPDATE branch lacks a policy. Pinning the format did
+// nothing.
 //
-// Long-term cleanup: relax the RLS policy in Supabase to accept any
-// format_version ≥ '1.0' and any source matching the app prefix, then
-// the wire-pinning here can be removed. SQL:
-//   drop policy "anon_insert" on submissions;
-//   create policy "anon_insert" on submissions
-//     for insert to anon
-//     with check (
-//       format_version in ('1.0', '1.1')
-//       and source like 'sokker-training-planner-online-%'
-//     );
+// v8.4.7 fix: drop "resolution=merge-duplicates" and rely on the existing
+// 409 catch for hash-collision dedup — the design v8 shipped with and
+// the design that actually worked. No server-side changes required.
+// The format_version / source pin from v8.4.6 is kept defensively in case
+// a content-checking policy is still lurking on the table, but it can
+// be removed once the corpus is confirmed healthy.
 //
 // v8.4.5: restoration of v8.4.1 feature set (manual planner, subskill
 // carry-in fix in _stateSubskill, extractPlan helper, v1.1 bundle
@@ -876,7 +871,7 @@ async function submitBundleToCorpus(bundle){
         "Content-Type":"application/json",
         "apikey":_SB_KEY,
         "Authorization":`Bearer ${_SB_KEY}`,
-        "Prefer":"return=minimal,resolution=merge-duplicates",
+        "Prefer":"return=minimal",
       },
       body:JSON.stringify(row),
     });
