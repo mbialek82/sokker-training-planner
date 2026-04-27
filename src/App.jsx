@@ -1,7 +1,21 @@
 import React, { useState, useMemo, useCallback, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOKKER TRAINING PLANNER v8 — corpus submission (opt-out)
+// SOKKER TRAINING PLANNER v8.4.4 — subskill carry-in fix
+// v8.4.4: Fixed _stateSubskill to include the fractional gainBuf. Without
+//     this, any sub-DB-unit progress (most often 1–4 GT weeks since the
+//     last pop, each depositing ~0.2–0.4 DB units) was floored to 0%, so
+//     the planner pre-fill showed "0 extras" for skills that actually had
+//     real GT carry-in. Worst case was the post-pop GT-only window: a
+//     striker with three weeks of GT since its last pop (~0.9 DB units of
+//     progress) read as 0% sub instead of ≈18%. The integer dbAccum is
+//     still what drives pop detection inside _updateStates; only the
+//     read-side _stateSubskill now reports true fractional progress, so
+//     the value sanity-check residual and the planner extras pre-fill
+//     both shift slightly more accurate.
+//     Mirrors subskill.py v12 of the desktop app.
+// v8.4.3 → v8.4.4: one function (`_stateSubskill`); no API or storage shape
+//     changes.
 // v8: Anonymous bundle submission to a Supabase corpus on every successful
 //     "Load History" call. Default-on, opt-out toggle on the History tile,
 //     choice persisted in localStorage. Opt-outs increment a separate
@@ -441,14 +455,14 @@ function mikoosEstimateSubskill(skills,form,realValue){
 }
 
 // ─── Per-Skill Forward Simulator ──────────────────────────────────────────
-// Faithful JS port of subskill.py PlayerTracker (April 2026 model, v11).
+// Faithful JS port of subskill.py PlayerTracker (April 2026 model, v12).
 // Walks the training history forward from the first record, accumulating
 // integer DB per skill, handling pops, formation training, fractional XP
 // buffering, and stamina's fixed-rate exception. Returns per-skill subskills
 // at the LATEST report — far better than uniform Mikoos when history is
 // available.
 //
-// Sources: constants.py v9, training_week.py v2, subskill.py v11.
+// Sources: constants.py v9, training_week.py v2, subskill.py v12.
 // ──────────────────────────────────────────────────────────────────────────
 
 // Constants (constants.py)
@@ -579,10 +593,16 @@ function _makeState(skill,level,dbAccum){
 }
 function _stateThreshold(s){return _dbThresh(s.level,s.skill==="stamina");}
 function _stateSubskill(s){
+  // v8.4.4: include gainBuf (fractional DB progress not yet rolled into
+  // dbAccum). Earlier versions returned dbAccum/threshold, which floors
+  // any sub-1-DB progress to 0 — a player 0.9 DB units into a level
+  // appeared identical to one who had just popped, so the planner extras
+  // pre-fill silently lost up to ~1 DB unit of carry-in per skill.
   const max=s.skill==="stamina"?_LEVELS_STAM:_LEVELS_STD;
   if(s.level>=max)return 0.0;
   const t=_stateThreshold(s);
-  return t>0?Math.min(1.0,s.dbAccum/t):0.0;
+  if(t<=0)return 0.0;
+  return Math.min(1.0,(s.dbAccum+s.gainBuf)/t);
 }
 function _stateAddGain(s,gain){
   s.gainBuf+=gain;const earned=Math.floor(s.gainBuf);s.gainBuf-=earned;return earned;
