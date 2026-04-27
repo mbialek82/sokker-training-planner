@@ -1,35 +1,43 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOKKER TRAINING PLANNER v8.4.7 — corpus 42501 fix (UPSERT regression)
+// SOKKER TRAINING PLANNER v9 — v25 senior-age threshold correction
 //
-// Root cause of the 42501 / HTTP 401 corpus failures:
-// v8.4.5 added "resolution=merge-duplicates" to the submission Prefer
-// header. PostgREST translates that into INSERT ... ON CONFLICT DO UPDATE,
-// which Postgres evaluates against BOTH the INSERT and UPDATE RLS policies
-// at statement-prep time — even when no conflict actually fires. The
-// original Supabase schema only ever granted INSERT to anon (no UPDATE
-// policy), so every v8.4.5+ submission was rejected with 42501.
+// The level×age coupling in the pop-threshold formula is no longer flat.
+// Below age 23 the formula reduces exactly to v24 (k = 0.50, original
+// 84-pop calibration intact). Above age 23 each senior year adds 4
+// percentage points of slope:
 //
-// v8.4.6's format_version / source pin was a wrong diagnosis on my part;
-// the policy isn't gating on row content, it's failing the statement
-// because the UPDATE branch lacks a policy. Pinning the format did
-// nothing.
+//   k(age) = 0.50 + 0.04 × max(0, age − 23)
+//          = (50 + 4 · max(0, age − 23)) / 100
 //
-// v8.4.7 fix: drop "resolution=merge-duplicates" and rely on the existing
-// 409 catch for hash-collision dedup — the design v8 shipped with and
-// the design that actually worked. No server-side changes required.
-// The format_version / source pin from v8.4.6 is kept defensively in case
-// a content-checking policy is still lurking on the table, but it can
-// be removed once the corpus is confirmed healthy.
+//   threshold = (B/75) × (100 + k(age) × db_mid × (age − 15))
 //
+// Calibrated April 2026 against a young-anchor crossover panel (8 players,
+// 26 closed pops at ages 24–27). Under v24's flat k=0.50, the implied DB
+// of every old-age gap was lower than the player's young-anchor DB —
+// signs 0+/26−, median bias −23 DB. Under v25, signs 9+/17−, median −2.
+//
+// User-facing impact: simulated pops for 24+ players take longer to land
+// on the same talent value (because thresholds rose ~17–24% per pop in
+// that regime). If users want the *same* pop times they observed under
+// v8.x for an older player, they need to enter a HIGHER YS talent value
+// in Stage 1 — which is the correct talent the v25 panel evidence
+// supports. Quadri (39117069) example: gap-based talent_db moves from
+// 73.7 → 86.2 (CS_ys 3.93 → 3.43) under the desktop estimator.
+//
+// History prior to v9 — patches v8.4.x:
+// v8.4.7: corpus 42501 fix (UPSERT regression). Drop "resolution=
+//   merge-duplicates" Prefer header. Postgres was rejecting every
+//   submission because the UPDATE branch lacked an RLS policy.
+// v8.4.6: format_version / source pin (kept defensively in v8.4.7).
 // v8.4.5: restoration of v8.4.1 feature set (manual planner, subskill
-// carry-in fix in _stateSubskill, extractPlan helper, v1.1 bundle
-// format with `plans`, plan-export picker). v8.4.2/v8.4.3 was a
-// regression branch that lost ~25KB of code; v8.4.5 brought it back.
+//   carry-in fix in _stateSubskill, extractPlan helper, v1.1 bundle
+//   format with `plans`, plan-export picker). v8.4.2/3 was a regression
+//   branch that lost ~25KB of code.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ─── Engine (v24 model, April 2026) ───────────────────────────────────────
+// ─── Engine (v25 model, April 2026) ───────────────────────────────────────
 const _K1=93,_K2=96,_SL=13,_R=100/18,_U=18,_MX=18;
 const _B={pace:99,striker:90,technique:82,defending:82,playmaking:75,passing:75};
 const OS=["pace","technique","passing","defending","playmaking","striker"];
@@ -39,7 +47,9 @@ const _XG=Math.round(_K2*_K1*15/10000);
 
 function _fromYS(ys){const db=(300/ys-10)*100/90;return Math.max(0,Math.min(100,db));}
 function _te(td){return(40+60*td/100)/100;}
-function _dt(sk,lv,a,te){const db=(lv+0.5)*_R;return(_B[sk]/75)*(100+0.5*db*(a-15))/te;}
+// v25 product-slope k(age) = 0.50 + 0.04·max(0, age − 23)
+function _ks(a){return 0.5+0.04*Math.max(0,a-23);}
+function _dt(sk,lv,a,te){const db=(lv+0.5)*_R;return(_B[sk]/75)*(100+_ks(a)*db*(a-15))/te;}
 function _duc(sk,lv,a,te){return _dt(sk,lv,a,te)/_U;}
 function _mk(lv,du=0,xp=0){return{lv,du,xp};}
 function _mkSub(lv,sub,sk,a,te){
@@ -502,7 +512,7 @@ function mikoosEstimateSubskill(skills,form,realValue){
 // at the LATEST report — far better than uniform Mikoos when history is
 // available.
 //
-// Sources: constants.py v9, training_week.py v2, subskill.py v11.
+// Sources: constants.py v10, training_week.py v2, subskill.py v11, talent.py v24.
 // ──────────────────────────────────────────────────────────────────────────
 
 // Constants (constants.py)
@@ -510,7 +520,12 @@ const _LEVELS_STD=18,_LEVELS_STAM=11;
 const _DB_PER_LV=100/18,_DB_PER_STAM=100/11;
 const _GT_RATE=15,_COACH_DB=93;
 const _B_INT={pace:99,striker:90,technique:82,defending:82,playmaking:75,passing:75,keeper:75,stamina:null};
-const _B_NORM=75,_THR_BASE=100,_STAM_THR=80,_PROD_SLOPE=0.5,_AGE_OFF=15;
+const _B_NORM=75,_THR_BASE=100,_STAM_THR=80,_AGE_OFF=15;
+// v25 senior-age threshold correction (constants_v10.py)
+const _PROD_SLOPE_Y=0.50,_PROD_SLOPE_GAIN=0.04,_AGE_PIVOT=23;
+// Legacy alias — kept for any downstream code reading _PROD_SLOPE by name.
+// Reflects only the youth value; use _prodSlope(age) for the live slope.
+const _PROD_SLOPE=_PROD_SLOPE_Y;
 const _FORM_CODE_TO_SK={0:"keeper",1:"defending",2:"playmaking",3:"striker"};
 const _GT_THR=93,_W_CL_OFF=93,_W_CL_FRI=70,_W_NT_OFF=70;
 // Value formula (in-game-calibrated VALUE_*, not Mikoos)
@@ -526,13 +541,16 @@ function _dbThresh(lv,isStam){return _dbFloor(lv+1,isStam)-_dbFloor(lv,isStam);}
 // Talent eff (constants.py)
 function _talEffSenior(td){return 40.0+60.0*(td/100.0);}
 
-// Canonical pop threshold — v24 product model
+// v25 senior-age slope: k(age) = 0.50 + 0.04 · max(0, age − 23)
+function _prodSlope(age){return _PROD_SLOPE_Y+_PROD_SLOPE_GAIN*Math.max(0.0,age-_AGE_PIVOT);}
+
+// Canonical pop threshold — v25 product model with senior-age k correction
 function _canonThr(skill,level,age){
   if(skill==="stamina")return _STAM_THR;
   const b=_B_INT[skill];if(b==null)return Infinity;
   const dbMid=(level+0.5)*(100.0/18.0);
   const years=Math.max(0.0,age-_AGE_OFF);
-  return(b/_B_NORM)*(_THR_BASE+_PROD_SLOPE*dbMid*years);
+  return(b/_B_NORM)*(_THR_BASE+_prodSlope(age)*dbMid*years);
 }
 
 // DB gain per week for one skill
@@ -772,6 +790,11 @@ function buildBundle(ctx){
   const lastReport=reports&&reports.length?reports[reports.length-1]:null;
   return{
     format_version:"1.1",
+    // Defensively pinned at v8.4.6 — the backend RLS policy on the
+    // calibration corpus may still gate on this exact string. v9 ships
+    // the v25 threshold formula change but does not retouch this pin
+    // (per the v8.4.7 release note). Move forward when the corpus is
+    // confirmed healthy on a free-form source string.
     source:"sokker-training-planner-online-v8.4.6",
     exported_at:new Date().toISOString(),
     player:{
@@ -1532,7 +1555,7 @@ export default function App(){
       {/* ── Header ───────────────────────────────────────────────────── */}
       <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:4}}>
         <span style={{fontSize:22,fontWeight:700,color:C.acc,fontFamily:_ft}}>⚽ Sokker Training Planner</span>
-        <span style={{fontSize:12,color:C.txM}}>v8.4.6 · staged interface</span>
+        <span style={{fontSize:12,color:C.txM}}>v9 · v25 threshold · staged interface</span>
       </div>
       <div style={{fontSize:12,color:C.txM,marginBottom:20}}>
         Load a player, plan their training, export a calibration bundle.
@@ -2281,7 +2304,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v8.4.6 · Three-stage interface · Calibration corpus enabled
+        Sokker Training Planner v9 · v25 threshold · Three-stage interface · Calibration corpus enabled
       </div>
 
       {/* Mobile responsiveness — collapse 2-col grids below 720px */}
