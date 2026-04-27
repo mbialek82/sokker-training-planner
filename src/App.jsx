@@ -1,36 +1,37 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOKKER TRAINING PLANNER v8.4.5 — restoration of v8.4.1 feature set
+// SOKKER TRAINING PLANNER v8.4.6 — RLS-compatible wire format
 //
-// v8.4.5 is bit-identical to v8.4.1 in feature surface, with version stamps
-// bumped. The intervening v8.4.2 and v8.4.3 builds were a regression branch
-// that lost ~25KB of code: the Manual Schedule Builder, the subskill
-// carry-in fix in _stateSubskill, the extractPlan helper, the v1.1 bundle
-// format with embedded `plans`, and the plan-export picker UI. v8.4.3
-// added back only one small fix (player_id null fallback in the corpus
-// auto-submit). That fix is already present in v8.4.1 (via the pidNum
-// helper at line ~1180), so no forward-port is needed — restoring v8.4.1
-// is a strict superset of v8.4.3.
+// v8.4.6 fixes the corpus auto-submit which broke in v8.4.5 (= v8.4.1
+// restoration). The Supabase RLS policy on `submissions` gates on
+// row content — specifically, it requires format_version = '1.0' and
+// the original source string 'sokker-training-planner-online-v8'.
+// v8.4.5 sent the bundle's evolving values (1.1 / v8.4.5) to the wire,
+// triggering 42501 (RLS policy violation, surfaced as HTTP 401).
 //
-// Carried forward from v8.4.1:
-// - Manual Schedule Builder: runPlanFromSchedule, draggable per-skill chips,
-//   season-grouped layout, undo via snapshot history (capped at 50),
-//   seed-from-strategy, auto-resimulate on schedule change.
-// - Subskill carry-in fix: _stateSubskill includes the fractional gainBuf
-//   (~Python subskill.py v12). Without this a player with 3 GT weeks since
-//   the last pop reads as 0% sub instead of ~18%, because the fractional
-//   progress sits in gainBuf and never crosses an integer DB boundary.
-// - Bundle format v1.1 with `plans` field — re-loading restores all
-//   simulated strategies for comparison against future training.
-// - Plan-export picker on the Bundle stage.
-// - Both player_id null fallbacks (auto-submit and manual download).
+// Fix: the row constructed inside submitBundleToCorpus now pins
+// format_version and source to the legacy values the policy accepts.
+// The local bundle download (downloadBundle, manual export) is
+// untouched — it keeps format_version "1.1" and `plans` for desktop
+// calibration tooling. This decouples the wire format from the local
+// file format so future app versions never break the corpus contract.
 //
-// v8: Anonymous bundle submission to a Supabase corpus on every successful
-//     "Load History" call. Default-on, opt-out toggle on the History tile,
-//     choice persisted in localStorage. Opt-outs increment a separate
-//     counter table (no player data attached). Fire-and-forget — failures
-//     do not block the user-visible flow.
+// Long-term cleanup: relax the RLS policy in Supabase to accept any
+// format_version ≥ '1.0' and any source matching the app prefix, then
+// the wire-pinning here can be removed. SQL:
+//   drop policy "anon_insert" on submissions;
+//   create policy "anon_insert" on submissions
+//     for insert to anon
+//     with check (
+//       format_version in ('1.0', '1.1')
+//       and source like 'sokker-training-planner-online-%'
+//     );
+//
+// v8.4.5: restoration of v8.4.1 feature set (manual planner, subskill
+// carry-in fix in _stateSubskill, extractPlan helper, v1.1 bundle
+// format with `plans`, plan-export picker). v8.4.2/v8.4.3 was a
+// regression branch that lost ~25KB of code; v8.4.5 brought it back.
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ─── Engine (v24 model, April 2026) ───────────────────────────────────────
@@ -776,7 +777,7 @@ function buildBundle(ctx){
   const lastReport=reports&&reports.length?reports[reports.length-1]:null;
   return{
     format_version:"1.1",
-    source:"sokker-training-planner-online-v8.4.5",
+    source:"sokker-training-planner-online-v8.4.6",
     exported_at:new Date().toISOString(),
     player:{
       player_id:playerMeta?.player_id??null,
@@ -853,8 +854,16 @@ async function submitBundleToCorpus(bundle){
     const row={
       player_id:bundle.player?.player_id||null,
       player_name:bundle.player?.name||null,
-      format_version:bundle.format_version||null,
-      source:bundle.source||null,
+      // v8.4.6: wire format pinned to legacy values that the Supabase RLS
+      // policy accepts. The local bundle download keeps the live values
+      // (format_version 1.1 with `plans`, source string with current app
+      // version) for desktop calibration tooling — see buildBundle. The
+      // two formats are intentionally decoupled so future app version
+      // bumps don't break the corpus contract. If the RLS policy is later
+      // relaxed (see v8.4.6 release notes), these can be dropped and the
+      // bundle's own values used directly.
+      format_version:"1.0",
+      source:"sokker-training-planner-online-v8",
       user_snapshot:bundle.user_snapshot||{},
       reports:bundle.reports||[],
       raw_history:bundle.raw_history||null,
@@ -1528,7 +1537,7 @@ export default function App(){
       {/* ── Header ───────────────────────────────────────────────────── */}
       <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:4}}>
         <span style={{fontSize:22,fontWeight:700,color:C.acc,fontFamily:_ft}}>⚽ Sokker Training Planner</span>
-        <span style={{fontSize:12,color:C.txM}}>v8.4.5 · staged interface</span>
+        <span style={{fontSize:12,color:C.txM}}>v8.4.6 · staged interface</span>
       </div>
       <div style={{fontSize:12,color:C.txM,marginBottom:20}}>
         Load a player, plan their training, export a calibration bundle.
@@ -2239,7 +2248,7 @@ export default function App(){
                 }}>
 {JSON.stringify({
   format_version:"1.1",
-  source:"sokker-training-planner-online-v8.4.5",
+  source:"sokker-training-planner-online-v8.4.6",
   player:{player_id:pid&&/^\d+$/.test(pid)?parseInt(pid,10):historyMeta?.player_id||null,name:playerName||historyMeta?.name||null},
   user_snapshot:{
     current_skills:skills,
@@ -2277,7 +2286,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v8.4.5 · Three-stage interface · Calibration corpus enabled
+        Sokker Training Planner v8.4.6 · Three-stage interface · Calibration corpus enabled
       </div>
 
       {/* Mobile responsiveness — collapse 2-col grids below 720px */}
