@@ -1,30 +1,31 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOKKER TRAINING PLANNER v9 — v25 senior-age threshold correction
+// SOKKER TRAINING PLANNER v10 — coach_db structural fix + recalibration
 //
-// The level×age coupling in the pop-threshold formula is no longer flat.
-// Below age 23 the formula reduces exactly to v24 (k = 0.50, original
-// 84-pop calibration intact). Above age 23 each senior year adds 4
-// percentage points of slope:
+// Two paired changes (mirroring desktop subskill v13 + constants v11):
 //
-//   k(age) = 0.50 + 0.04 × max(0, age − 23)
-//          = (50 + 4 · max(0, age − 23)) / 100
+//  1. _dbGainPerWeek now multiplies by coach_db/100, matching the
+//     XP path used elsewhere in the planner (_XD = round(96·_K1/100)).
+//     Previously the simulator computed gain as
+//       _DB_PER_LV × intensity × coachEff × (eff/100) / thr
+//     with no coach_db factor — effectively running the simulator at
+//     coach=100 while every other path used coach=93. The mismatch
+//     accumulated db_accum ~7-8% faster than the rest of the engine
+//     assumed, producing pop predictions ~2-3 weeks early and
+//     occasionally pushing carry-in subskill above 0.99 (which the
+//     desktop tab_planner widget choked on with StreamlitValueAboveMax).
 //
-//   threshold = (B/75) × (100 + k(age) × db_mid × (age − 15))
+//  2. Coach value lowered 93 → 91. Desktop calibration on a 28-player,
+//     497-pop validation panel (train=first 26 weeks, test=remainder)
+//     showed minimum aggregate count error at ~91 once the structural
+//     bug was fixed. _K1 and _COACH_DB unified at 91.
 //
-// Calibrated April 2026 against a young-anchor crossover panel (8 players,
-// 26 closed pops at ages 24–27). Under v24's flat k=0.50, the implied DB
-// of every old-age gap was lower than the player's young-anchor DB —
-// signs 0+/26−, median bias −23 DB. Under v25, signs 9+/17−, median −2.
+// User-facing impact: simulated pop times shift later by ~9% (no longer
+// over-predicting). Subskill carry-in display reaches 0.99 maximum at
+// the ceiling, and never above. Existing bundles continue to load.
 //
-// User-facing impact: simulated pops for 24+ players take longer to land
-// on the same talent value (because thresholds rose ~17–24% per pop in
-// that regime). If users want the *same* pop times they observed under
-// v8.x for an older player, they need to enter a HIGHER YS talent value
-// in Stage 1 — which is the correct talent the v25 panel evidence
-// supports. Quadri (39117069) example: gap-based talent_db moves from
-// 73.7 → 86.2 (CS_ys 3.93 → 3.43) under the desktop estimator.
+// v9 — v25 senior-age threshold correction (k(age) = 0.50 + 0.04·max(0, age−23)).
 //
 // History prior to v9 — patches v8.4.x:
 // v8.4.7: corpus 42501 fix (UPSERT regression). Drop "resolution=
@@ -37,8 +38,9 @@ import React, { useState, useMemo, useCallback, useEffect, useRef } from "react"
 //   branch that lost ~25KB of code.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ─── Engine (v25 model, April 2026) ───────────────────────────────────────
-const _K1=93,_K2=96,_SL=13,_R=100/18,_U=18,_MX=18;
+// ─── Engine (v25 model + v10 coach recalibration, April 2026) ────────────
+// _K1 (coach_db) lowered 93→91 paired with _dbGainPerWeek structural fix.
+const _K1=91,_K2=96,_SL=13,_R=100/18,_U=18,_MX=18;
 const _B={pace:99,striker:90,technique:82,defending:82,playmaking:75,passing:75};
 const OS=["pace","technique","passing","defending","playmaking","striker"];
 const SN={pace:"PAC",technique:"TEC",passing:"PAS",defending:"DEF",playmaking:"PLM",striker:"STR"};
@@ -505,20 +507,20 @@ function mikoosEstimateSubskill(skills,form,realValue){
 }
 
 // ─── Per-Skill Forward Simulator ──────────────────────────────────────────
-// Faithful JS port of subskill.py PlayerTracker (April 2026 model, v11).
+// Faithful JS port of subskill.py PlayerTracker (April 2026 model, v13).
 // Walks the training history forward from the first record, accumulating
 // integer DB per skill, handling pops, formation training, fractional XP
 // buffering, and stamina's fixed-rate exception. Returns per-skill subskills
 // at the LATEST report — far better than uniform Mikoos when history is
 // available.
 //
-// Sources: constants.py v10, training_week.py v2, subskill.py v11, talent.py v24.
+// Sources: constants.py v11, training_week.py v2, subskill.py v13, talent.py v24.
 // ──────────────────────────────────────────────────────────────────────────
 
 // Constants (constants.py)
 const _LEVELS_STD=18,_LEVELS_STAM=11;
 const _DB_PER_LV=100/18,_DB_PER_STAM=100/11;
-const _GT_RATE=15,_COACH_DB=93;
+const _GT_RATE=15,_COACH_DB=91;
 const _B_INT={pace:99,striker:90,technique:82,defending:82,playmaking:75,passing:75,keeper:75,stamina:null};
 const _B_NORM=75,_THR_BASE=100,_STAM_THR=80,_AGE_OFF=15;
 // v25 senior-age threshold correction (constants_v10.py)
@@ -554,13 +556,17 @@ function _canonThr(skill,level,age){
 }
 
 // DB gain per week for one skill
+// v10: multiplied by _COACH_DB/100 to match the planner's XP path
+// (_XD = round(_K2*_K1/100)). Previously omitted the coach_db factor,
+// effectively running the simulator at coach=100 while the rest of
+// the engine ran at coach=_K1. Mirrors desktop subskill v13 fix.
 function _dbGainPerWeek(td,skill,level,age,intensity,coachEff){
   if(skill==="stamina")return 0.0;
   if(level>=_LEVELS_STD)return 0.0;
   const thr=_canonThr(skill,level,age);
   if(thr<=0||thr===Infinity)return 0.0;
   const eff=_talEffSenior(td);
-  return _DB_PER_LV*intensity*coachEff*(eff/100.0)/thr;
+  return _DB_PER_LV*intensity*coachEff*(_COACH_DB/100.0)*(eff/100.0)/thr;
 }
 
 // Geston intensity estimators
