@@ -1,9 +1,22 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOKKER TRAINING PLANNER v10 — coach_db structural fix + recalibration
+// SOKKER TRAINING PLANNER v11 — coach value pin synced to engine
 //
-// Two paired changes (mirroring desktop subskill v13 + constants v11):
+// v11 (May 2026): single-source-of-truth tidy-up. The engine has run at
+// _COACH_DB = 91 since v10, but the corpus bundle export was still
+// labelling submissions with `coach_value_assumed: 93` — a leftover from
+// before the v10 recalibration. v11 changes that label to 91 so the
+// corpus metadata matches the simulation that produced talent_db_estimate.
+// No engine math changes. Existing bundles in the corpus are unaffected.
+//
+// Mirror change on desktop: constants.py v11 lowers COACH_DB_UNEARTHLY
+// 93 → 91, and subskill.py v13 adds the missing coach_db/100 factor in
+// db_gain_per_week (the same structural fix v10 applied here). After
+// these three commits, desktop and online both run at coach_db = 91 with
+// the canonical gain formula end-to-end.
+//
+// v10 — coach_db structural fix + recalibration. Two paired changes:
 //
 //  1. _dbGainPerWeek now multiplies by coach_db/100, matching the
 //     XP path used elsewhere in the planner (_XD = round(96·_K1/100)).
@@ -21,7 +34,7 @@ import React, { useState, useMemo, useCallback, useEffect, useRef } from "react"
 //     showed minimum aggregate count error at ~91 once the structural
 //     bug was fixed. _K1 and _COACH_DB unified at 91.
 //
-// User-facing impact: simulated pop times shift later by ~9% (no longer
+// User-facing impact (v10): simulated pop times shift later by ~9% (no longer
 // over-predicting). Subskill carry-in display reaches 0.99 maximum at
 // the ceiling, and never above. Existing bundles continue to load.
 //
@@ -38,8 +51,9 @@ import React, { useState, useMemo, useCallback, useEffect, useRef } from "react"
 //   branch that lost ~25KB of code.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ─── Engine (v25 model + v10 coach recalibration, April 2026) ────────────
-// _K1 (coach_db) lowered 93→91 paired with _dbGainPerWeek structural fix.
+// ─── Engine (v25 model + v10 coach recalibration, May 2026) ─────────────
+// _K1 (coach_db) = 91 since v10 (paired with _dbGainPerWeek structural fix).
+// v11 keeps engine math identical; only the corpus-export label moves to 91.
 const _K1=91,_K2=96,_SL=13,_R=100/18,_U=18,_MX=18;
 const _B={pace:99,striker:90,technique:82,defending:82,playmaking:75,passing:75};
 const OS=["pace","technique","passing","defending","playmaking","striker"];
@@ -816,7 +830,10 @@ function buildBundle(ctx){
       position_assumed:pos,
       horizon_weeks:weeks,
       start_season_week:ssw,
-      coach_value_assumed:93,
+      coach_value_assumed:_COACH_DB,  // v11: use the live engine constant (91 since v10)
+                                      //      instead of the stale literal 93. Guarantees the
+                                      //      corpus metadata matches the simulation that
+                                      //      produced talent_db_estimate.
       latest_report_week:lastReport?.week??null,
     },
     reports:reports||[],
@@ -1561,7 +1578,7 @@ export default function App(){
       {/* ── Header ───────────────────────────────────────────────────── */}
       <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:4}}>
         <span style={{fontSize:22,fontWeight:700,color:C.acc,fontFamily:_ft}}>⚽ Sokker Training Planner</span>
-        <span style={{fontSize:12,color:C.txM}}>v9 · v25 threshold · staged interface</span>
+        <span style={{fontSize:12,color:C.txM}}>v11 · v25 threshold · coach 91 · staged interface</span>
       </div>
       <div style={{fontSize:12,color:C.txM,marginBottom:20}}>
         Load a player, plan their training, export a calibration bundle.
@@ -2310,7 +2327,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v9 · v25 threshold · Three-stage interface · Calibration corpus enabled
+        Sokker Training Planner v11 · v25 threshold · coach 91 · Three-stage interface · Calibration corpus enabled
       </div>
 
       {/* Mobile responsiveness — collapse 2-col grids below 720px */}
