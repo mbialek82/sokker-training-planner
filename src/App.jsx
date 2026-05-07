@@ -23,6 +23,11 @@ import React, { useState, useMemo, useCallback, useEffect, useRef } from "react"
 //      button stays on Stage 2 next to the YS Talent input. Lets users
 //      sanity-check the estimate while reviewing skills, without having
 //      to navigate to the planner first.
+//   5. Start Season Week now auto-defaults to (last_history_week + 1)
+//      when a training history is loaded (per Lipa91 forum feedback).
+//      Most users plan forward from "next week"; the current Sokker
+//      week's training is already locked in. Wraps cleanly at the season
+//      boundary (week 13 → 1). User can override on Stage 2.
 // No engine math changes; no estimator changes. This is a UX-only release.
 //
 // v12 (May 2026): Adds a JS port of talent.py v25's gap-based estimator,
@@ -1746,6 +1751,16 @@ export default function App(){
     const last=reports[reports.length-1];
     if(last){
       if(last.age)setAge(last.age);
+      // v13 (per Lipa91 forum feedback): default the Start Season Week to
+      // the week AFTER the last history record. Most users plan forward
+      // from "next week" — the current Sokker week's training is already
+      // locked in. Sokker's `week` field is 1–13 wrapping per season
+      // (persistence.py L185), so (last.week % 13) + 1 handles both the
+      // normal case (week 7 → 8) and the season boundary (week 13 → 1).
+      // User can override via the Start Season Week input on Stage 2.
+      if(typeof last.week==="number"&&last.week>0){
+        setSsw((last.week%13)+1);
+      }
       const sk={};for(const s of OS)sk[s]=last.skills?.[s]??0;
       setSkills(sk);
       // v7.2: full forward simulation per skill (replaces uniform Mikoos)
