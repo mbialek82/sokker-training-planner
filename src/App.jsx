@@ -1,7 +1,56 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOKKER TRAINING PLANNER v11 — coach value pin synced to engine
+// SOKKER TRAINING PLANNER v13 — onboarding + load-flow rework
+//
+// v13 (May 2026): Three layout/UX changes that address first-time-user
+// friction observed once v12's talent estimator went live.
+//   1. New Stage 0 ("How it works") — a self-contained intro card that the
+//      app boots into. Explains the goals (decision support + corpus
+//      contribution), the two loading paths, the three planning stages,
+//      and how to read the v12 talent-estimate chip. Single Get-Started
+//      button advances to Stage 1.
+//   2. Stage 1 default load tile flipped: "Known history" (training-
+//      history JSON/XML) is now ON by default instead of "Paste card".
+//      Reflects the recommendation in the new intro and matches the
+//      direction of the upcoming XML-default work.
+//   3. Stage 1 tile labels reframed around what the user has rather than
+//      what they type: "Training history" → "Known history" and "Paste
+//      card" → "No known history". Manual-entry tile retained as power-
+//      user override. Tile order reshuffled so Known history sits first.
+//   4. Talent-estimate badge surfaced on Stage 1 too, inline with the
+//      player's age in the SkillEditor header. Display-only — the Apply
+//      button stays on Stage 2 next to the YS Talent input. Lets users
+//      sanity-check the estimate while reviewing skills, without having
+//      to navigate to the planner first.
+// No engine math changes; no estimator changes. This is a UX-only release.
+//
+// v12 (May 2026): Adds a JS port of talent.py v25's gap-based estimator,
+// surfacing a "talent estimate" chip under the YS Talent input on Stage 2
+// whenever a training history is loaded. The chip shows a point estimate
+// on the YS-standard scale (the harsher one — `300 / (10 + 0.9 × DB)`,
+// matching the existing _fromYS scale used by the input itself) plus a
+// confidence label (reliable / indicative / unreliable) and an Apply
+// button that fills the YS Talent input.
+//
+// Estimator scope (v1):
+//   - Full gap extraction: closed mixed gaps + open in-progress gap
+//   - Per-gap bound inversion via canonical_threshold
+//   - Aggregate flat intersection + per-skill consensus + outlier rejection
+//   - Auto-detect is_gk via keeper > max(outfield) heuristic
+//   - Drop-eligibility exclusion (pace>=28, others>=30)
+//
+// Deferred from v1 (kept simple intentionally):
+//   - Subskill carry-in soft-anchoring of partial gaps (use_subskill=False)
+//   - Prior-club training injection
+//   - Per-gap evidence table UI (estimator returns it; not displayed yet)
+//
+// The math (xp_per_week, xp_gt_per_week, threshold inversion, consensus
+// pruning, no-pop bounds) matches talent.py v25 byte-for-byte modulo the
+// omissions above. Estimator unit:
+//   - DB-native integers everywhere (no display-level rounding inside)
+//   - Output rounded to 1 decimal place (talent_db) before scale conversion
+//   - YS-scale display rounded to 2 decimals to match the input field
 //
 // v11 (May 2026): single-source-of-truth tidy-up. The engine has run at
 // _COACH_DB = 91 since v10, but the corpus bundle export was still
@@ -969,6 +1018,434 @@ function parsePaste(text){
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// TALENT ESTIMATOR — JS port of talent.py v25 (May 2026, App v12)
+//
+// Walks training history per outfield skill, extracts gaps (closed pop-to-pop
+// spans and the open in-progress span), inverts canonical_threshold to bound
+// talent_db per gap, then intersects across skills with consensus filtering
+// for outlier rejection.
+//
+// Symbols match talent.py v25 byte-for-byte for the math; v1 omits the
+// soft-anchor partial-gap path (use_subskill=False) and prior-club training
+// injection. Outputs rounded to 0.1 DB before scale conversion.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// XP/week from intensity (constants.py xp_per_week, xp_gt_per_week)
+function _xpPerWeek(intensity,coachDb){return Math.round(intensity*coachDb/100);}
+function _xpGtPerWeek(intensity,coachDb){return Math.round(intensity*coachDb*15/10000);}
+
+// Drop-eligibility (constants.py is_drop_eligible).
+// pace drops from age 28; other outfield skills drop from age 30.
+const _DROP_AGE_PACE=28,_DROP_AGE_OTHER=30;
+function _dropEligible(skill,age){
+  if(skill==="stamina")return false;
+  const t=skill==="pace"?_DROP_AGE_PACE:_DROP_AGE_OTHER;
+  return age>=t;
+}
+
+// Per-skill GT XP for one week (training_week.py TrainingWeek.gt_xp).
+// Outfield players never receive keeper XP, even from GT — guard with isGk.
+function _gtXp(tw,skill,coachDb,isGk){
+  if(skill==="keeper"&&!isGk)return 0;
+  if(tw.isFormation){
+    if(tw.formationIntensity===0)return 0;
+    const gt=_xpGtPerWeek(tw.advancedIntensity,coachDb);
+    if(tw.formationSkill===skill){
+      const ft=_xpGtPerWeek(tw.formationIntensity,coachDb);
+      return gt+ft;
+    }
+    return gt;
+  }
+  return _xpGtPerWeek(tw.intensity,coachDb);
+}
+
+// (xp, kind) for one week's contribution to one skill.
+// kind ∈ {'direct','formation','gt','zero'}. Matches talent.py
+// _week_xp_contribution; the v23 fix means non-target skills on a formation
+// week get 'gt', not 'formation' — so the [0D+...] pure-GT classifier works.
+function _weekXpContribution(tw,skill,coachDb,isGk){
+  if(tw.severeInjury)return[0,"zero"];
+  if(!tw.isFormation&&tw.intensity===0)return[0,"zero"];
+  if(tw.trainedSkill===skill){
+    if(skill==="keeper"&&!isGk)return[0,"zero"];
+    return[_xpPerWeek(tw.intensity,coachDb),"direct"];
+  }
+  if(tw.isFormation){
+    if(tw.formationSkill===skill)return[_gtXp(tw,skill,coachDb,isGk),"formation"];
+    return[_gtXp(tw,skill,coachDb,isGk),"gt"];
+  }
+  return[_gtXp(tw,skill,coachDb,isGk),"gt"];
+}
+
+// Build a closed gap from accumulated week records.
+// Returns [gap, dropBad]. dropBad=true means any week was drop-eligible
+// for this skill — caller must discard the gap and increment nDrop.
+function _finaliseMixedGap(skill,levelBefore,weekStart,weekEnd,weekRecords,hasKnownStart){
+  if(!weekRecords.length)return[null,true];
+  const xps=weekRecords.map(w=>w.xp);
+  const xpTotal=xps.reduce((a,b)=>a+b,0);
+  const xpFirst=xps[0],xpLast=xps[xps.length-1];
+  const agePop=weekRecords[weekRecords.length-1].age;
+  const thr=_canonThr(skill,levelBefore,agePop);
+  let dropBad=false;
+  for(const w of weekRecords)if(_dropEligible(skill,w.age)){dropBad=true;break;}
+  const directWeeks=weekRecords.filter(w=>w.kind==="direct").length;
+  const formationWeeks=weekRecords.filter(w=>w.kind==="formation").length;
+  const gtWeeks=weekRecords.filter(w=>w.kind==="gt").length;
+  const gap={skill,levelBefore,weekStart,weekEnd,
+    weeksElapsed:weekRecords.length,
+    xpTotal,xpFirst,xpLast,thresholdRaw:thr,hasKnownStart,
+    ageMid:agePop,directWeeks,formationWeeks,gtWeeks};
+  return[gap,dropBad];
+}
+
+// Extract closed gaps for one skill (talent.py extract_mixed_gaps).
+// A gap runs from (start-of-history | previous pop) → next pop. Zero-XP
+// weeks are appended once a gap is open (they don't change xp_total but
+// they DO change weeks_elapsed and feed drop-eligibility checks).
+function _extractMixedGaps(history,skill,coachDb,isGk){
+  const gaps=[];
+  let nDrop=0,isFirst=true;
+  let gapStartWeek=null,gapLevel=null,weekRecords=[];
+  for(const rec of history){
+    const tw=_parseRecord(rec);
+    const currLv=tw.skills[skill]??0;
+    const popped=(tw.skillsChange[skill]||0)>0;
+    const[xp,kind]=_weekXpContribution(tw,skill,coachDb,isGk);
+    if(gapStartWeek===null){
+      if(xp===0&&!popped)continue;
+      gapStartWeek=tw.week;
+      gapLevel=currLv-(popped?1:0);
+      weekRecords=[];
+    }
+    weekRecords.push({age:tw.age,xp,kind});
+    if(popped){
+      const hasKnownStart=!isFirst;
+      const[gap,dropBad]=_finaliseMixedGap(skill,gapLevel,gapStartWeek,tw.week,weekRecords,hasKnownStart);
+      if(dropBad)nDrop+=1;
+      else if(gap)gaps.push(gap);
+      gapStartWeek=tw.week;
+      gapLevel=currLv;
+      weekRecords=[];
+      isFirst=false;
+    }
+  }
+  return[gaps,nDrop];
+}
+
+// Extract the in-progress gap at end of history (talent.py extract_open_mixed_gap).
+// hasHadPop=true (i.e. has_known_start) iff we observed any pop during scan.
+// Zero-XP weeks are skipped entirely here — open-gap math doesn't need them.
+function _extractOpenMixedGap(history,skill,coachDb,isGk){
+  let hasHadPop=false,gapLevel=null,weekRecords=[];
+  for(const rec of history){
+    const tw=_parseRecord(rec);
+    const currLv=tw.skills[skill]??0;
+    const popped=(tw.skillsChange[skill]||0)>0;
+    if(popped){hasHadPop=true;gapLevel=currLv;weekRecords=[];continue;}
+    const[xp,kind]=_weekXpContribution(tw,skill,coachDb,isGk);
+    if(xp===0)continue;
+    if(gapLevel===null)gapLevel=currLv;
+    weekRecords.push({age:tw.age,xp,kind});
+  }
+  if(!weekRecords.length||gapLevel===null)return null;
+  const xps=weekRecords.map(w=>w.xp);
+  const xpTotal=xps.reduce((a,b)=>a+b,0);
+  const xpFirst=xps[0];
+  const ageEnd=weekRecords[weekRecords.length-1].age;
+  const thr=_canonThr(skill,gapLevel,ageEnd);
+  const directWeeks=weekRecords.filter(w=>w.kind==="direct").length;
+  const formationWeeks=weekRecords.filter(w=>w.kind==="formation").length;
+  const gtWeeks=weekRecords.filter(w=>w.kind==="gt").length;
+  return{skill,level:gapLevel,xpTotal,xpFirst,thresholdRaw:thr,
+    hasKnownStart:hasHadPop,nWeeks:weekRecords.length,ageMid:ageEnd,
+    directWeeks,formationWeeks,gtWeeks};
+}
+
+// eff → talent_db, bounds-aware (talent.py _eff_to_td).
+// eff > 1.0 means "no constraint": hi-bound returns 100, lo-bound returns 1.
+function _effToTd(eff,bound){
+  if(eff<=1.0)return(eff-0.40)/0.60*100.0;
+  return bound==="hi"?100.0:1.0;
+}
+
+// Closed-gap [td_lo, td_hi] (talent.py estimate_gap_bounds, use_subskill=False).
+// Returns [null, null] for impossible/contaminated gaps (XP exceeds even
+// minimum-talent threshold). Partial gaps (no known start) get td_lo=1.0.
+function _estimateGapBounds(gap){
+  if(gap.xpTotal<=0||!isFinite(gap.thresholdRaw))return[null,null];
+  const thr=gap.thresholdRaw;
+  // Upper bound — denom = total - last (carry-out bounded by xp_last)
+  const denomHi=gap.xpTotal-gap.xpLast;
+  let tdHi;
+  if(denomHi<=0)tdHi=100.0;
+  else{
+    const effHi=thr/denomHi;
+    if(effHi<0.40)return[null,null];
+    tdHi=_effToTd(effHi,"hi");
+  }
+  // Lower bound — known-start: denom = total + first (carry-in bounded
+  // by xp_first); partial: no informative lower bound.
+  let tdLo;
+  if(gap.hasKnownStart){
+    const denomLo=gap.xpTotal+gap.xpFirst;
+    const effLo=thr/denomLo;
+    if(effLo<0.40)return[null,null];
+    tdLo=_effToTd(effLo,"lo");
+  }else tdLo=1.0;
+  return[tdLo,tdHi];
+}
+
+// Open-gap upper bound (talent.py no_pop_upper_bound, use_subskill=False).
+// Returns null if contradictory (player should have popped even at min talent).
+function _noPopUpperBound(og){
+  if(og.xpTotal<=0)return 100.0;
+  const thr=og.thresholdRaw;
+  const denom=og.hasKnownStart?(og.xpTotal+og.xpFirst):og.xpTotal;
+  if(thr<=0)return 100.0;
+  const eff=thr/denom;
+  if(eff>1.0)return 100.0;
+  if(eff<0.40)return null;
+  return _effToTd(eff,"hi");
+}
+
+// Composition tag [xD+yG+zF] — used to identify pure-GT gaps in confidence.
+function _compositionTag(g){return`[${g.directWeeks}D+${g.gtWeeks}G+${g.formationWeeks}F]`;}
+
+// YS-standard scale conversion (talent.py cs_ys_from_td).
+// eff_ys = 10 + 90·(td/100); CS_ys = 300 / eff_ys.
+// DB100 → 3.00, DB50 → 5.45, DB0 → 30. This is the harsher YS scale (the
+// inverse of _fromYS already used by the input), NOT the kinder Mikoos
+// senior-eff-anchored scale. Per design: show users the worse-looking number.
+function _csYsFromTd(td){
+  if(!isFinite(td))return NaN;
+  const eff=10.0+90.0*td/100.0;
+  if(eff<=0)return NaN;
+  return 300.0/eff;
+}
+
+// is_gk auto-detect (subskill.py / tab_player heuristic):
+// keeper > max(outfield_skills). Conservative — outfield with anomalously
+// high keeper rating still detects as GK, which is the safe direction
+// (would only matter if the player had real keeper XP to invert).
+function _detectIsGk(latestSkills){
+  if(!latestSkills)return false;
+  const kp=latestSkills.keeper??0;
+  let maxOf=0;
+  for(const sk of OS){const v=latestSkills[sk]??0;if(v>maxOf)maxOf=v;}
+  return kp>maxOf;
+}
+
+// ─── Main estimator ──────────────────────────────────────────────────────
+// Returns:
+//   {td, tdLo, tdHi, confidence, nGaps, nGtGaps, nDirectGaps, nNoPopBounds,
+//    nNoPopSkills, nExclDrop, nExclRange, excludedSkills, perGap, notes,
+//    isGk, contradictory}
+// confidence ∈ {'reliable','indicative','unreliable','no_data'}.
+// td is point estimate (midpoint of consensus intersection); tdLo/tdHi
+// are the intersection bounds. NaN throughout means no data / no estimate.
+function estimateTalent(history,options){
+  options=options||{};
+  const coachDb=options.coachDb??_COACH_DB;
+  const empty={td:NaN,tdLo:NaN,tdHi:NaN,confidence:"no_data",
+    nGaps:0,nGtGaps:0,nDirectGaps:0,nNoPopBounds:0,nNoPopSkills:0,
+    nExclDrop:0,nExclRange:0,excludedSkills:[],perGap:[],notes:["no history"],
+    isGk:false,contradictory:false};
+  if(!history||!history.length)return empty;
+  // Sort ascending defensively (parser already does this, but cheap to repeat)
+  const hist=[...history].sort((a,b)=>(a.week||0)-(b.week||0));
+  const latest=hist[hist.length-1]||{};
+  const latestSkills=latest.skills||{};
+  const latestAge=parseInt(latest.age||21,10);
+  const isGk=options.isGk!=null?options.isGk:_detectIsGk(latestSkills);
+  // Skip max-level skills — no further pops are possible
+  const skillsToProcess=OS.filter(s=>(latestSkills[s]??0)<_LEVELS_STD).sort();
+
+  const allLo=[],allHi=[],allPgIdx=[];
+  const perGapLog=[];
+  let gtGapCount=0,directGapCount=0;
+  let nExclDrop=0,nExclRange=0,nNoPopSkills=0;
+  // Per-skill known-start ranges (for consensus intersection).
+  // Only known-start gaps with informative lo>1 contribute to consensus —
+  // partial gaps' lo=1 would dominate the max() and break the algorithm.
+  const skillKsRanges={};
+
+  function processGaps(gaps,skill){
+    for(const g of gaps){
+      const isPureGt=(g.directWeeks===0);
+      const[lo,hi]=_estimateGapBounds(g);
+      if(lo===null){nExclRange+=1;continue;}
+      const pgIdx=perGapLog.length;
+      allLo.push(lo);allHi.push(hi);allPgIdx.push(pgIdx);
+      if(g.hasKnownStart){
+        if(!(skill in skillKsRanges))skillKsRanges[skill]={los:[],his:[]};
+        if(lo>1.0)skillKsRanges[skill].los.push(lo);
+        if(hi<100.0)skillKsRanges[skill].his.push(hi);
+      }
+      const loStr=lo>1?`${Math.round(lo)}`:"?";
+      const hiStr=hi<100?`${Math.round(hi)}`:"100";
+      perGapLog.push(["Gap",g.skill,g.levelBefore,`${_compositionTag(g)} ${loStr}-${hiStr}`]);
+      if(isPureGt)gtGapCount+=1;else directGapCount+=1;
+    }
+  }
+
+  // Closed gaps per skill
+  for(const skill of skillsToProcess){
+    const[gaps,nd]=_extractMixedGaps(hist,skill,coachDb,isGk);
+    nExclDrop+=nd;
+    if(!gaps.length){nNoPopSkills+=1;continue;}
+    processGaps(gaps,skill);
+  }
+
+  // Open-gap no-pop upper bounds
+  const nopopHiCaps=[];
+  let nNoPopBounds=0;
+  for(const skill of skillsToProcess){
+    const og=_extractOpenMixedGap(hist,skill,coachDb,isGk);
+    if(og===null)continue;
+    if(og.level>=_LEVELS_STD)continue;
+    if(_dropEligible(skill,latestAge))continue;
+    const ub=_noPopUpperBound(og);
+    if(ub===null)continue;
+    if(ub>=100)continue;
+    const pgIdx=perGapLog.length;
+    nopopHiCaps.push({ub,skill:og.skill,level:og.level,nWeeks:og.nWeeks,pgIdx});
+    nNoPopBounds+=1;
+    perGapLog.push(["OpenGap",og.skill,og.level,
+      `${_compositionTag(og)} <${Math.round(ub)} (${og.nWeeks}w no pop)`]);
+  }
+
+  // Flat intersection (use_subskill=False → all bounds are hard)
+  let loFinal=allLo.length?Math.max(...allLo):1.0;
+  let hiFinal=allHi.length?Math.min(...allHi):100.0;
+  for(const e of nopopHiCaps)hiFinal=Math.min(hiFinal,e.ub);
+  hiFinal=Math.min(100.0,hiFinal);
+
+  if(loFinal===1.0&&hiFinal===100.0){
+    return{...empty,perGap:perGapLog,nNoPopSkills,nExclDrop,nExclRange,
+      isGk,notes:["Insufficient training history — more data needed"]};
+  }
+
+  const loFlat=loFinal,hiFlat=hiFinal;
+
+  // Consensus intersection — per-skill outlier rejection.
+  // Iteratively kick out the single skill whose removal opens the largest
+  // gap toward overlap, until the remaining skills' KS ranges overlap.
+  const consensusSkills={};
+  for(const sk in skillKsRanges){
+    const rng=skillKsRanges[sk];
+    if(rng.los.length){
+      consensusSkills[sk]=[Math.max(...rng.los),
+        rng.his.length?Math.min(...rng.his):100.0];
+    }
+  }
+  const excludedSkills=[];
+  if(Object.keys(consensusSkills).length>=2){
+    const active={...consensusSkills};
+    while(Object.keys(active).length>1){
+      const cLo=Math.max(...Object.values(active).map(r=>r[0]));
+      const cHi=Math.min(...Object.values(active).map(r=>r[1]));
+      if(cLo<=cHi)break;
+      let bestSk=null,bestGap=Infinity;
+      for(const sk in active){
+        const remKeys=Object.keys(active).filter(k=>k!==sk);
+        const rLo=Math.max(...remKeys.map(k=>active[k][0]));
+        const rHi=Math.min(...remKeys.map(k=>active[k][1]));
+        const g=rLo-rHi;
+        if(g<bestGap){bestGap=g;bestSk=sk;}
+      }
+      excludedSkills.push(bestSk);
+      delete active[bestSk];
+    }
+    if(Object.keys(active).length){
+      loFinal=Math.max(...Object.values(active).map(r=>r[0]));
+      hiFinal=Math.min(...Object.values(active).map(r=>r[1]));
+      // Re-incorporate no-pop caps from non-excluded skills only
+      const exclSet=new Set(excludedSkills);
+      nNoPopBounds=0;
+      for(const e of nopopHiCaps){
+        if(exclSet.has(e.skill))continue;
+        if(e.ub>=loFinal){
+          hiFinal=Math.min(hiFinal,e.ub);
+          nNoPopBounds+=1;
+        }
+      }
+      hiFinal=Math.min(100.0,hiFinal);
+    }
+  }else if(Object.keys(consensusSkills).length===1){
+    const sk=Object.keys(consensusSkills)[0];
+    const[clo,chi]=consensusSkills[sk];
+    loFinal=clo;hiFinal=chi;
+    for(const e of nopopHiCaps){
+      if(e.ub>=loFinal)hiFinal=Math.min(hiFinal,e.ub);
+    }
+    hiFinal=Math.min(100.0,hiFinal);
+  }
+
+  // Tag excluded skills' gaps in the log
+  if(excludedSkills.length){
+    const exclSet=new Set(excludedSkills);
+    for(let i=0;i<perGapLog.length;i++){
+      const[gtype,gskill,glv,gstr]=perGapLog[i];
+      if(exclSet.has(gskill)&&!gstr.startsWith("REJECTED:")&&!gstr.startsWith("OUTLIER:")){
+        perGapLog[i]=[gtype,gskill,glv,`OUTLIER:${gstr}`];
+      }
+    }
+  }
+
+  const contradictory=loFinal>hiFinal;
+  let point;
+  if(contradictory){
+    // Fall back to mean of midpoints of bounded (non-? lo) gaps
+    const mids=[];
+    for(let i=0;i<allLo.length;i++){
+      if(allLo[i]>1)mids.push((allLo[i]+allHi[i])/2);
+    }
+    point=mids.length?(mids.reduce((a,b)=>a+b,0)/mids.length):((loFinal+hiFinal)/2);
+  }else point=(loFinal+hiFinal)/2;
+
+  // Confidence — count informative gaps in the consensus set.
+  // Pure-GT gap = composition starts with "[0D+" (no direct weeks).
+  const exclSet2=new Set(excludedSkills);
+  function isInformative(g){
+    const[gtype,gskill,glv,gstr]=g;
+    if(gtype!=="Gap")return false;
+    if(exclSet2.has(gskill))return false;
+    if(gstr.startsWith("REJECTED:")||gstr.startsWith("OUTLIER:"))return false;
+    // Drop "?-N" lower-bound-only entries (partial gaps that survived bound
+    // estimation but contribute no informative lower bound)
+    const after=gstr.split(" ").slice(1).join(" ");
+    if(!after)return false;
+    return !after.split("-")[0].includes("?");
+  }
+  const consInfGt=perGapLog.filter(g=>isInformative(g)&&String(g[3]).indexOf("[0D+")!==-1).length;
+  const consInfDir=perGapLog.filter(g=>isInformative(g)&&String(g[3]).indexOf("[0D+")===-1).length;
+  let confidence;
+  if(consInfGt>=2)confidence="reliable";
+  else if(consInfGt>=1||consInfDir>=2)confidence="indicative";
+  else if(consInfDir===1||nNoPopBounds>=1)confidence="unreliable";
+  else confidence="no_data";
+
+  const notes=[];
+  if(contradictory)notes.push(`contradictory bounds (lo=${loFinal.toFixed(0)} > hi=${hiFinal.toFixed(0)}) — model/carry-in approximation error`);
+  if(excludedSkills.length)notes.push(`consensus excluded: ${excludedSkills.join(", ")}`);
+  if(loFlat!==loFinal||hiFlat!==hiFinal)notes.push(`flat intersection [${loFlat.toFixed(0)}-${hiFlat.toFixed(0)}]`+(loFlat>hiFlat?" ⚠":""));
+  if(gtGapCount)notes.push(`${gtGapCount} pure-GT gap(s)`);
+  if(directGapCount)notes.push(`${directGapCount} direct-containing gap(s)`);
+  if(nNoPopBounds)notes.push(`${nNoPopBounds} no-pop bound(s)`);
+  if(nExclDrop)notes.push(`${nExclDrop} drop-excluded gap(s) (pace>=28 / others>=30)`);
+
+  const td=isFinite(point)?Math.round(point*10)/10:NaN;
+  return{
+    td,tdLo:Math.round(loFinal*10)/10,tdHi:Math.round(hiFinal*10)/10,
+    confidence,nGaps:gtGapCount+directGapCount,
+    nGtGaps:gtGapCount,nDirectGaps:directGapCount,
+    nNoPopBounds,nNoPopSkills,nExclDrop,nExclRange,
+    excludedSkills,perGap:perGapLog,notes,isGk,contradictory,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // REACT UI
 // ═══════════════════════════════════════════════════════════════════════════
 const C={bg:"#0c0e14",card:"#14171f",hi:"#1a1e29",bdr:"#252a38",
@@ -1021,25 +1498,56 @@ function SubBar({value,onChange,color}){
 }
 
 // ─── SkillEditor: unified skill + subskill input ──────────────────────────
-function SkillEditor({skills,setSkills,subs,setSubs,age,setAge,pos,name,warnings,editable=true}){
+function SkillEditor({skills,setSkills,subs,setSubs,age,setAge,pos,name,warnings,editable=true,talentEstimate}){
   const prof=POS[pos];
+  // v13: small badge showing the gap-based talent estimate next to the age,
+  // visible whenever a training history has been loaded. Display-only here —
+  // the Apply button stays on Stage 2 where the YS Talent input lives. Same
+  // confidence colour palette as the Stage 2 chip for visual consistency.
+  const teBadge=(()=>{
+    if(!talentEstimate)return null;
+    const e=talentEstimate;
+    if(e.confidence==="no_data"||!isFinite(e.td))return null;
+    const cMap={reliable:C.pop,indicative:C.acc,unreliable:C.warn,no_data:C.txM};
+    const cBd=cMap[e.confidence]||C.txM;
+    const ys=_csYsFromTd(e.td);
+    return(
+      <span style={{
+        display:"inline-flex",alignItems:"center",gap:6,
+        padding:"2px 8px",borderRadius:4,
+        background:C.card,border:`1px solid ${cBd}`,
+        fontSize:11,fontFamily:_ft,
+      }} title={`Talent estimate from training history: YS ${ys.toFixed(2)} (${e.confidence}, ${e.nGaps} gap${e.nGaps===1?"":"s"}). Apply on Stage 2.`}>
+        <span style={{color:C.txM,letterSpacing:0.3,fontFamily:_fs,fontSize:10,fontWeight:600}}>EST.</span>
+        <span style={{color:C.tx,fontWeight:700}}>{ys.toFixed(2)}</span>
+        <span style={{
+          padding:"0 5px",borderRadius:2,fontSize:9,fontWeight:600,
+          background:cBd,color:"#fff",letterSpacing:0.3,fontFamily:_fs,
+        }}>{e.confidence}</span>
+      </span>
+    );
+  })();
   return(
     <div style={{background:C.bg,borderRadius:6,border:`1px solid ${C.bdr}`,padding:12}}>
       {name&&(
-        <div style={{fontWeight:600,marginBottom:8,color:warnings?.length?C.warn:C.pop,fontSize:14}}>
-          {name} {age?`· age ${age}`:""}
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8,flexWrap:"wrap"}}>
+          <div style={{fontWeight:600,color:warnings?.length?C.warn:C.pop,fontSize:14}}>
+            {name} {age?`· age ${age}`:""}
+          </div>
+          {teBadge}
         </div>
       )}
       {warnings?.length>0&&<div style={{fontSize:11,color:C.warn,marginBottom:8}}>⚠ {warnings.join("; ")}</div>}
 
-      {/* Age row (manual mode) */}
+      {/* Age row (manual mode) — v13: talent badge shown alongside if estimate available */}
       {editable&&!name&&(
-        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,flexWrap:"wrap"}}>
           <span style={{fontSize:11,color:C.txD,fontFamily:_fs,textTransform:"uppercase",letterSpacing:"0.06em"}}>Age</span>
           <input type="number" min={16} max={40} value={age}
             onChange={e=>setAge(Math.max(16,Math.min(40,parseInt(e.target.value)||16)))}
             style={{background:C.card,border:`1px solid ${C.bdr}`,borderRadius:4,color:C.tx,fontFamily:_ft,fontSize:14,fontWeight:600,
               padding:"4px 8px",width:52,textAlign:"center",outline:"none"}}/>
+          {teBadge}
         </div>
       )}
 
@@ -1093,13 +1601,20 @@ function SkillEditor({skills,setSkills,subs,setSubs,age,setAge,pos,name,warnings
 // ═══════════════════════════════════════════════════════════════════════════
 export default function App(){
   // ─── Stage navigation ──────────────────────────────────────────────────
-  const[stage,setStage]=useState("player"); // "player" | "plan" | "export"
+  // v13: app boots on the new Stage 0 ("How it works") intro card.
+  // Users navigate to Stage 1 via the explicit Get Started button or the
+  // tab strip. Repeat users can click straight to Player; no persistence
+  // of "I've seen the intro" yet — that's a v14 candidate if friction shows.
+  const[stage,setStage]=useState("intro"); // "intro" | "player" | "plan" | "export"
 
   // ─── Player ID (drives all fetch/handoff actions) ──────────────────────
   const[pid,setPid]=useState("");
 
   // ─── Stage 1: input tile activation (multi-select) ─────────────────────
-  const[tilesOn,setTilesOn]=useState({card:true,history:false,manual:false});
+  // v13: default load path is "Known history" (was "Paste card" in v11–v12).
+  // Tile keys retained ("history", "card", "manual") so all existing
+  // handlers work unchanged; only labels and order in the picker change.
+  const[tilesOn,setTilesOn]=useState({card:false,history:true,manual:false});
   const toggleTile=(k)=>setTilesOn(t=>({...t,[k]:!t[k]}));
 
   // ─── Card paste state ──────────────────────────────────────────────────
@@ -1158,6 +1673,20 @@ export default function App(){
   const subsFloat=useMemo(()=>{
     const o={};for(const sk of OS)o[sk]=(subs[sk]??25)/100;return o;
   },[subs]);
+
+  // v12: gap-based talent estimate from training history. Memoised on
+  // historyReports — recomputed whenever the user (re)loads history.
+  // Returns null when no history is loaded; otherwise an object with
+  // {td, tdLo, tdHi, confidence, nGaps, ...}. The chip UI under the
+  // YS Talent input reads this and exposes an Apply button.
+  const talentEstimate=useMemo(()=>{
+    if(!historyReports||!historyReports.length)return null;
+    return estimateTalent(historyReports);
+  },[historyReports]);
+  // YS-standard scale value the Apply button writes to the input.
+  // _csYsFromTd matches the inverse of _fromYS — round-trips cleanly.
+  const estYs=talentEstimate&&isFinite(talentEstimate.td)
+    ?_csYsFromTd(talentEstimate.td):null;
 
   // v8.4: Manual Schedule auto-resimulates whenever the schedule or player state changes.
   // Declared before any callback that references it (TDZ safety).
@@ -1578,18 +2107,126 @@ export default function App(){
       {/* ── Header ───────────────────────────────────────────────────── */}
       <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:4}}>
         <span style={{fontSize:22,fontWeight:700,color:C.acc,fontFamily:_ft}}>⚽ Sokker Training Planner</span>
-        <span style={{fontSize:12,color:C.txM}}>v11 · v25 threshold · coach 91 · staged interface</span>
+        <span style={{fontSize:12,color:C.txM}}>v13 · v25 threshold · coach 91 · staged interface</span>
       </div>
       <div style={{fontSize:12,color:C.txM,marginBottom:20}}>
         Load a player, plan their training, export a calibration bundle.
       </div>
 
       {/* ── Stage tabs (freely navigable) ────────────────────────────── */}
+      {/* v13: added "How" tab (Stage 0). Numbered 0 to keep Player/Plan/
+          Export at their familiar positions. */}
       <div style={{display:"flex",gap:8,maxWidth:1300,marginBottom:20}}>
+        {stageTab("intro","How",0)}
         {stageTab("player","Player",1)}
         {stageTab("plan","Plan",2)}
         {stageTab("export","Export",3)}
       </div>
+
+      {/* ═════════════════════════════════════════════════════════════════ */}
+      {/* STAGE 0 — HOW IT WORKS (intro card, v13)                          */}
+      {/* ═════════════════════════════════════════════════════════════════ */}
+      {/* Self-contained onboarding view. The app boots into this stage so
+          first-time visitors get the goals + the two loading paths +
+          how to read the talent estimate before they hit the Player tab.
+          Repeat users can click "1 · Player" in the tab strip to skip. */}
+      {stage==="intro"&&(
+        <div style={{maxWidth:900}}>
+          <div style={sC}>
+            <div style={{fontSize:18,fontWeight:600,color:C.tx,marginBottom:8,fontFamily:_fs}}>
+              How it works
+            </div>
+            <div style={{fontSize:13,color:C.txD,lineHeight:1.6}}>
+              A decision-support tool for Sokker. You give it a player's current state and a
+              planning horizon; it returns a side-by-side comparison of training strategies and
+              the predicted skill trajectory under each one. Two goals: (1) make the trade-offs
+              between strategies explicit so you can pick a plan you trust, (2) build a public
+              calibration corpus that sharpens the underlying model with every new history loaded.
+            </div>
+          </div>
+
+          <div style={sC}>
+            <div style={sL}>What it does</div>
+            <div style={{fontSize:12,color:C.txD,lineHeight:1.6}}>
+              For each candidate strategy, the planner forward-simulates every week of training
+              and reports the predicted level of every skill at the horizon, the timing of each
+              level-up, and the subskill — the partial fill between level-ups — carried into the
+              next one. You compare strategies side by side and pick the one that fits your goals.
+            </div>
+          </div>
+
+          <div style={sC}>
+            <div style={sL}>Two ways to start</div>
+            <div style={{fontSize:12,color:C.txD,lineHeight:1.6,marginBottom:12}}>
+              Stage 1 offers two entry points.
+            </div>
+            <div style={{paddingLeft:12,borderLeft:`3px solid ${C.acc}`,marginBottom:12}}>
+              <div style={{fontSize:13,fontWeight:600,color:C.tx,marginBottom:4}}>
+                Known history <span style={{fontWeight:400,color:C.txM,fontSize:11}}>(recommended)</span>
+              </div>
+              <div style={{fontSize:12,color:C.txD,lineHeight:1.6}}>
+                Load the player's training history from Sokker. The planner reconstructs every
+                week, fits a talent estimate from the level-up record (point + confidence band),
+                and seeds the subskills via per-skill forward simulation. This is the highest-
+                fidelity path, and the only one where the talent number is inferred from data
+                rather than guessed. If you have never fetched a training history before, the
+                planner walks you through it — no technical knowledge required.
+              </div>
+            </div>
+            <div style={{paddingLeft:12,borderLeft:`3px solid ${C.txM}`}}>
+              <div style={{fontSize:13,fontWeight:600,color:C.tx,marginBottom:4}}>No known history</div>
+              <div style={{fontSize:12,color:C.txD,lineHeight:1.6}}>
+                Paste the player's in-game card — name, age, levels of each skill, value. You
+                enter talent yourself (Mikoos, SkTables, or a guess). Subskills default to a
+                uniform Mikoos estimate back-solved from the player's value. Use this for
+                opponent scouting or for any player whose history you cannot access.
+              </div>
+            </div>
+          </div>
+
+          <div style={sC}>
+            <div style={sL}>The three stages</div>
+            <ol style={{margin:"6px 0 0 0",paddingLeft:22,fontSize:12,color:C.txD,lineHeight:1.8}}>
+              <li><b style={{color:C.tx}}>Player</b> — load the player; confirm skills, age, position, talent.</li>
+              <li><b style={{color:C.tx}}>Plan</b> — pick the horizon, pick the strategies to compare, run.</li>
+              <li><b style={{color:C.tx}}>Compare</b> — side-by-side deltas, total levels gained, level-up timing. Manual schedules can be built here and simulated alongside the algorithmic strategies.</li>
+            </ol>
+          </div>
+
+          <div style={sC}>
+            <div style={sL}>Reading the talent estimate</div>
+            <div style={{fontSize:12,color:C.txD,lineHeight:1.6,marginBottom:8}}>
+              When a training history is loaded, a chip under the YS Talent input shows:
+            </div>
+            <ul style={{margin:"0 0 10px 0",paddingLeft:22,fontSize:12,color:C.txD,lineHeight:1.7}}>
+              <li>a point estimate on the YS-standard scale (lower is better; 3.00 is the cap) and the [low, high] band,</li>
+              <li>a confidence label, from <code style={{color:C.pop,fontSize:11,fontFamily:_ft,background:"transparent"}}>reliable</code> (history is rich enough to anchor the estimate) down to <code style={{color:C.txM,fontSize:11,fontFamily:_ft,background:"transparent"}}>no_data</code> (too short to infer anything),</li>
+              <li>the count of level-ups used and any skills excluded as outliers.</li>
+            </ul>
+            <div style={{fontSize:12,color:C.txD,lineHeight:1.6}}>
+              Click <b style={{color:C.tx}}>Apply</b> to write the estimate into the input. If the
+              estimate is flagged contradictory, the model residual exceeds the data — treat the
+              number as indicative and check against an external source.
+            </div>
+          </div>
+
+          <div style={{...sC,borderLeft:`3px solid ${C.warn}`}}>
+            <div style={sL}>Caveats</div>
+            <ul style={{margin:"0",paddingLeft:22,fontSize:12,color:C.txD,lineHeight:1.7}}>
+              <li>The coach value is currently fixed at the corpus-calibrated default. If your coach is lower, the planner will overestimate training gains.</li>
+              <li>Drop-eligible ages are excluded from talent estimation: pace from 28, other outfield skills from 30.</li>
+              <li>This is a planning tool, not a market valuation tool — the value formula here anchors the simulator, not the transfer market.</li>
+            </ul>
+          </div>
+
+          <div style={{display:"flex",justifyContent:"flex-end",marginTop:12}}>
+            <button onClick={()=>setStage("player")}
+              style={{...sB,fontSize:14,padding:"12px 28px"}}>
+              Get started — load a player →
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ═════════════════════════════════════════════════════════════════ */}
       {/* STAGE 1 — PLAYER                                                  */}
@@ -1646,28 +2283,24 @@ export default function App(){
                 <div style={{fontSize:11,color:C.txM,marginBottom:10,lineHeight:1.4}}>
                   Pick one or more — they can stack. Manual entry on top of a parsed card lets you fix anything the parser got wrong.
                 </div>
+                {/* v13: tile order is now [history, card, manual]. "Known
+                    history" (was "Training history") is the recommended
+                    path and sits first; "No known history" (was "Paste
+                    card") covers the snapshot/scouting case. */}
                 <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
-                  {inputTile("card","📋","Paste card","Player card text from sokker.org — fastest path.")}
-                  {inputTile("history","📄","Training history","Best accuracy. JSON from the API endpoint.")}
+                  {inputTile("history","📄","Known history","Best accuracy. Load the player's training history from Sokker — we'll walk you through it.")}
+                  {inputTile("card","📋","No known history","Paste the player's in-game card. You enter talent yourself.")}
                   {inputTile("manual","✏️","Manual entry","Type skills directly. Useful for hypothetical players.")}
                 </div>
               </div>
 
-              {/* Card paste block */}
-              {tilesOn.card&&(
-                <div style={sC}>
-                  <div style={sL}>📋 Paste player card</div>
-                  <textarea value={paste} onChange={e=>setPaste(e.target.value)}
-                    placeholder={"Roman Rysio, wiek: 20\nklub: Zabójcze Strzały, kraj: Polska\nwartość : 788 000 zł\nwynagrodzenie: 13 800 zł\ntragiczna [0] forma\nbardzo dobra [9] dyscyplina taktyczna\ndobra [7] kondycja        słaby [4] bramkarz\nświetna [11] szybkość     bardzo dobry [9] obrońca\ndobra [7] technika        celujący [10] rozgrywający\nprzeciętne [5] podania    świetny [11] strzelec"}
-                    style={{...sI,height:130,resize:"vertical",fontFamily:_ft,fontSize:11,lineHeight:1.5}}/>
-                  <button onClick={handleParse} style={{...sB,marginTop:8,width:"100%"}}>Parse Player Card</button>
-                </div>
-              )}
-
-              {/* Training history block */}
+              {/* v13: Training history block now renders FIRST (the
+                  recommended path). Card block follows for users without
+                  history access. Manual entry stays last as a power-user
+                  override. */}
               {tilesOn.history&&(
                 <div style={sC}>
-                  <div style={sL}>📄 Training history</div>
+                  <div style={sL}>📄 Known history — fetch from Sokker</div>
                   <div style={{fontSize:11,color:C.txM,marginBottom:8,lineHeight:1.4}}>
                     Two steps. <b style={{color:C.tx}}>1.</b> Click the button below — it opens your training report in a new tab.
                     <b style={{color:C.tx}}> 2.</b> Select all the JSON, copy it, come back, paste it in the box.
@@ -1735,6 +2368,17 @@ export default function App(){
                 </div>
               )}
 
+              {/* Card paste block (v13: was first, now second) */}
+              {tilesOn.card&&(
+                <div style={sC}>
+                  <div style={sL}>📋 No known history — paste the player's card</div>
+                  <textarea value={paste} onChange={e=>setPaste(e.target.value)}
+                    placeholder={"Roman Rysio, wiek: 20\nklub: Zabójcze Strzały, kraj: Polska\nwartość : 788 000 zł\nwynagrodzenie: 13 800 zł\ntragiczna [0] forma\nbardzo dobra [9] dyscyplina taktyczna\ndobra [7] kondycja        słaby [4] bramkarz\nświetna [11] szybkość     bardzo dobry [9] obrońca\ndobra [7] technika        celujący [10] rozgrywający\nprzeciętne [5] podania    świetny [11] strzelec"}
+                    style={{...sI,height:130,resize:"vertical",fontFamily:_ft,fontSize:11,lineHeight:1.5}}/>
+                  <button onClick={handleParse} style={{...sB,marginTop:8,width:"100%"}}>Parse Player Card</button>
+                </div>
+              )}
+
               {/* Manual entry block */}
               {tilesOn.manual&&(
                 <div style={sC}>
@@ -1761,6 +2405,7 @@ export default function App(){
                       name={playerName||null}
                       warnings={playerWarnings}
                       editable={true}
+                      talentEstimate={talentEstimate}
                     />
                   </>
                 ):(
@@ -1821,6 +2466,78 @@ export default function App(){
                     }}>{p.l}</button>
                   ))}
                 </div>
+                {/* v12: gap-based talent estimate chip — appears only when
+                    a training history is loaded. Confidence colour-codes
+                    border (green=reliable, blue=indicative, amber=unreliable,
+                    grey=no_data). Apply button writes the YS-standard
+                    estimate into the input. */}
+                {historyReports&&talentEstimate&&(()=>{
+                  const e=talentEstimate;
+                  const noData=e.confidence==="no_data"||!isFinite(e.td);
+                  const cMap={reliable:C.pop,indicative:C.acc,unreliable:C.warn,no_data:C.txM};
+                  const cBd=cMap[e.confidence]||C.txM;
+                  const ysVal=estYs;
+                  const ysLo=isFinite(e.tdHi)?_csYsFromTd(e.tdHi):null; // td_hi → ys_lo (tighter ys)
+                  const ysHi=isFinite(e.tdLo)?_csYsFromTd(e.tdLo):null; // td_lo → ys_hi
+                  return(
+                    <div style={{
+                      borderLeft:`3px solid ${cBd}`,
+                      background:C.hi,
+                      padding:"8px 10px",
+                      marginBottom:12,
+                      fontSize:11,
+                    }}>
+                      <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                        <span style={{color:C.txD,fontWeight:600,letterSpacing:0.3}}>EST. FROM HISTORY</span>
+                        {noData?(
+                          <span style={{color:C.txM,fontStyle:"italic"}}>
+                            no estimate — {e.nNoPopSkills>=5?"no pops in history":"not enough informative gaps"}
+                          </span>
+                        ):(
+                          <>
+                            <span style={{
+                              fontFamily:_ft,fontSize:14,fontWeight:700,color:C.tx,
+                            }}>{ysVal.toFixed(2)}</span>
+                            {ysLo!=null&&ysHi!=null&&(ysLo!==ysHi)&&(
+                              <span style={{color:C.txM,fontFamily:_ft,fontSize:11}}>
+                                ({ysLo.toFixed(2)}–{ysHi.toFixed(2)})
+                              </span>
+                            )}
+                            <span style={{
+                              padding:"1px 6px",borderRadius:3,fontSize:10,fontWeight:600,
+                              background:cBd,color:"#fff",letterSpacing:0.3,
+                            }}>{e.confidence}</span>
+                            <span style={{color:C.txM}}>
+                              · {e.nGaps} gap{e.nGaps===1?"":"s"}
+                              {e.nNoPopBounds?` · ${e.nNoPopBounds} no-pop`:""}
+                              {e.isGk?" · GK":""}
+                            </span>
+                            <button onClick={()=>setYsTalent(ysVal.toFixed(2))}
+                              disabled={Math.abs(ysNum-ysVal)<0.005}
+                              style={{
+                                ...sBs,padding:"2px 10px",fontSize:11,marginLeft:"auto",
+                                ...(Math.abs(ysNum-ysVal)<0.005
+                                  ?{opacity:0.5,cursor:"default"}
+                                  :{background:cBd,color:"#fff",borderColor:cBd}),
+                              }}>
+                              {Math.abs(ysNum-ysVal)<0.005?"applied":"Apply"}
+                            </button>
+                          </>
+                        )}
+                      </div>
+                      {!noData&&e.contradictory&&(
+                        <div style={{color:C.warn,fontSize:10,marginTop:4}}>
+                          ⚠ contradictory bounds — model residual; treat as indicative
+                        </div>
+                      )}
+                      {!noData&&e.excludedSkills.length>0&&(
+                        <div style={{color:C.txM,fontSize:10,marginTop:4}}>
+                          consensus excluded: {e.excludedSkills.join(", ")}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
                 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
                   <div>
                     <div style={sL}>Position</div>
@@ -2327,7 +3044,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v11 · v25 threshold · coach 91 · Three-stage interface · Calibration corpus enabled
+        Sokker Training Planner v13 · v25 threshold · coach 91 · talent estimator · Four-stage interface · Calibration corpus enabled
       </div>
 
       {/* Mobile responsiveness — collapse 2-col grids below 720px */}
