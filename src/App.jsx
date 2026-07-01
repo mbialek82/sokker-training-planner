@@ -1,6 +1,79 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SOKKER TRAINING PLANNER v14 — coupled engine + balance talent + 2 bug fixes
+//
+// v14 (Jul 2026): Engine sync with desktop production + two field-reported
+// bug fixes.
+//
+//  1. THRESHOLD ENGINE → COUPLED (constants.py v8+, sokker_03 v49).
+//     The v25 product-slope model is REMOVED (no legacy selector — coupled
+//     only). Per-DB cost: K·(B/75)·(1 + d/50)^(1 + 0.10·max(0, age−16)),
+//     K = 16.0 (senior-Mikoos-anchored post value-fix). Per-level threshold
+//     = Σ per-DB cost over the level's true DB span (LEVEL_WIDTHS 5/6 by
+//     parity), replacing the old (level+0.5)·(100/18) midpoint form. Both
+//     the planner engine (_dt) and the tracker/estimator (_canonThr) route
+//     through the same per-DB sum. Intra-level accumulation keeps the
+//     uniform 18-du subdivision (planner) / fractional-buffer (tracker)
+//     structure — pop TIMING is exact (level totals match desktop);
+//     within-level carry display is a uniform approximation, as before.
+//
+//  2. COACH_DB 91 → 93. Desktop reverted to flat 93 in the v37 commit
+//     (320-pop backtest, MAE 3.5); online follows. _XD = 89, _XG = 13.
+//     The v10 structural fix (_dbGainPerWeek × coach/100) is retained.
+//
+//  3. VALUE FORMULA — Mikoos-faithful port replacing the exponential
+//     approximation. Corrected cumulative skill_table (the desktop
+//     constants.py v9 off-by-one fix: base_values[i], not [i+1] — the old
+//     form ran ~8% hot at mid/high levels), VALUE_LEVEL_MULT^(L+f)
+//     interpolation, stamina lb·216.4·1.511^lb, form penalty 1/40 → 1/39.
+//     Affects _computeValue and the Mikoos subskill back-out.
+//
+//  4. TALENT ESTIMATOR → BALANCE-v1 (talent_balance.py port, sokker_11).
+//     The v12 flat-intersection estimate is retained as the event producer
+//     and fallback. Known-start closed gaps become over/under events: at
+//     candidate td, td < gap.td_lo ⇒ under, td > gap.td_hi ⇒ over. The
+//     count signal C(td) = n_under − n_over drives a monotone bisection
+//     (direction by COUNT, never by weight); the confidence band is the
+//     reliability-weighted noise floor ε_w/|slope| with the coupled
+//     _BAND_RMSE table (talent_weighting v4) keyed on gap level. Degenerate
+//     cases ported verbatim: ceiling/floor-pinned (virtual point past the
+//     cap, late clamp), flat-band narrowing via the v12 gap band,
+//     insufficient-signal → keep the v12 gap estimate.
+//     v1 deviations from desktop (documented): events come from known-start
+//     gaps only (no anchor-solved first pops — anchor_refiner v14 is not
+//     yet reference-validated and is deliberately NOT ported); range-
+//     excluded gaps stay excluded (v12 contamination semantics); partial
+//     gaps contribute to the gap band only, never to direction.
+//
+//  5. BUG FIX — manual schedule pace substitution (report: Lipa91,
+//     2026-06-22). runPlanFromSchedule silently swapped a maxed (or
+//     _gwm-predicted-to-max) assigned skill for the highest weight×threshold
+//     alternative — which pace (B=99) almost always won. The fallback is
+//     REMOVED for manual schedules: the assignment is honored literally
+//     (direct XP burns against the ceiling, GT still flows to the others,
+//     matching game reality). Wasted weeks are flagged (log[i].wasted) and
+//     rendered RED in the schedule chips and the week-by-week log. Auto
+//     strategies keep their fallback — it is correct there.
+//
+//  6. BUG FIX — season-rollover aging (report: Lipa91, 2026-06-22).
+//     Training reports are Thursday snapshots; the season boundary (and
+//     the global +1 aging) lands Friday. Loading a player in that window
+//     simulated the whole horizon one year young. On history/bundle load
+//     the boundary phase is now derived from age increments inside the
+//     report stream; sim start = last.week + 1, and if that step crosses
+//     the boundary the starting age is bumped +1 and ssw set to 1 (else
+//     ssw is set to the derived season week). Auto-derivation only —
+//     age and ssw inputs stay editable as overrides; a visible note
+//     explains any adjustment. Histories spanning no boundary fall back
+//     to previous behavior (phase unknowable).
+//
+//  Corpus/bundle: source string stays pinned at v8.4.6 (RLS gate); engine
+//  and estimator metadata ride inside user_snapshot (engine:
+//  "coupled-K16-coach93", talent_estimator: "balance-v1").
+//  coach_value_assumed follows the live constant → 93.
+//
+// ═══════════════════════════════════════════════════════════════════════════
 // SOKKER TRAINING PLANNER v13 — onboarding + load-flow rework
 //
 // v13 (May 2026): Three layout/UX changes that address first-time-user
@@ -23,11 +96,6 @@ import React, { useState, useMemo, useCallback, useEffect, useRef } from "react"
 //      button stays on Stage 2 next to the YS Talent input. Lets users
 //      sanity-check the estimate while reviewing skills, without having
 //      to navigate to the planner first.
-//   5. Start Season Week now auto-defaults to (last_history_week + 1)
-//      when a training history is loaded (per Lipa91 forum feedback).
-//      Most users plan forward from "next week"; the current Sokker
-//      week's training is already locked in. Wraps cleanly at the season
-//      boundary (week 13 → 1). User can override on Stage 2.
 // No engine math changes; no estimator changes. This is a UX-only release.
 //
 // v12 (May 2026): Adds a JS port of talent.py v25's gap-based estimator,
@@ -105,21 +173,41 @@ import React, { useState, useMemo, useCallback, useEffect, useRef } from "react"
 //   branch that lost ~25KB of code.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ─── Engine (v25 model + v10 coach recalibration, May 2026) ─────────────
-// _K1 (coach_db) = 91 since v10 (paired with _dbGainPerWeek structural fix).
-// v11 keeps engine math identical; only the corpus-export label moves to 91.
-const _K1=91,_K2=96,_SL=13,_R=100/18,_U=18,_MX=18;
-const _B={pace:99,striker:90,technique:82,defending:82,playmaking:75,passing:75};
+// ─── Engine (coupled threshold model, K=16 / coach_db=93 — v14, Jul 2026) ──
+// _K1 (coach_db) = 93 since v14, matching desktop COACH_DB_UNEARTHLY (the v37
+// commit reverted the online-only 91 recalibration; the v10 structural
+// coach/100 fix in _dbGainPerWeek is retained). _XD = 89, _XG = 13.
+const _K1=93,_K2=96,_SL=13,_R=100/18,_U=18,_MX=18;
+// v14: the planner-local _B map is retired — all threshold paths key _B_INT.
 const OS=["pace","technique","passing","defending","playmaking","striker"];
 const SN={pace:"PAC",technique:"TEC",passing:"PAS",defending:"DEF",playmaking:"PLM",striker:"STR"};
 const _XD=Math.round(_K2*_K1/100);
 const _XG=Math.round(_K2*_K1*15/10000);
 
+// Coupled threshold constants (constants.py v8+: COUPLED_K_DEFAULT=16.0,
+// COUPLED_X=50, COUPLED_ALPHA=0.10, AGE_PIVOT=16) and the canonical level
+// geometry (LEVEL_WIDTHS / LEVEL_DB_START — 5/6 DB per level by parity).
+const _CK=16.0,_CX=50.0,_CA=0.10,_CAGE0=16;
+const _LW=[6,5,6,5,6,5,6,5,6,6,5,6,5,6,5,6,5,6,1];
+const _LDS=(()=>{const a=[0];for(let i=0;i<_LW.length-1;i++)a.push(a[a.length-1]+_LW[i]);return a;})();
+// _LDS = [0,6,11,17,22,28,33,39,44,50,56,61,67,72,78,83,89,94,100]
+
 function _fromYS(ys){const db=(300/ys-10)*100/90;return Math.max(0,Math.min(100,db));}
 function _te(td){return(40+60*td/100)/100;}
-// v25 product-slope k(age) = 0.50 + 0.04·max(0, age − 23)
-function _ks(a){return 0.5+0.04*Math.max(0,a-23);}
-function _dt(sk,lv,a,te){const db=(lv+0.5)*_R;return(_B[sk]/75)*(100+_ks(a)*db*(a-15))/te;}
+// Coupled per-DB cost: K·(B/75)·(1 + d/50)^(1 + 0.10·max(0, age−16)).
+// Age enters the EXPONENT — the db-cost curve steepens with age.
+function _pdc(sk,d,a){
+  const b=_B_INT[sk];if(b==null)return Infinity;
+  return _CK*(b/75)*Math.pow(1+d/_CX,1+_CA*Math.max(0,a-_CAGE0));
+}
+// Raw per-level threshold = Σ per-DB cost over the level's true DB span.
+function _dtRaw(sk,lv,a){
+  if(lv<0||lv>=_LDS.length)return Infinity;
+  const s=_LDS[lv],w=_LW[lv];let t=0;
+  for(let d=s;d<s+w;d++)t+=_pdc(sk,d,a);
+  return t;
+}
+function _dt(sk,lv,a,te){return _dtRaw(sk,lv,a)/te;}
 function _duc(sk,lv,a,te){return _dt(sk,lv,a,te)/_U;}
 function _mk(lv,du=0,xp=0){return{lv,du,xp};}
 function _mkSub(lv,sub,sk,a,te){
@@ -146,6 +234,35 @@ function _initSt(skills,a,te,subs){
   const st={};for(const sk of OS)st[sk]=_mkSub(skills[sk]||0,subs?.[sk]??0.25,sk,a,te);return st;
 }
 function _ageAfter(a,sw,wks){let s=sw,ag=a;for(let i=0;i<wks;i++){s++;if(s>_SL){s=1;ag++;}}return ag;}
+
+// v14: derive the sim starting (age, ssw) from a training history, handling
+// the season rollover (Lipa91 report, 2026-06-22): reports are Thursday
+// snapshots; the boundary + global aging land Friday. Any age increment
+// INSIDE the report stream marks the boundary week exactly — a report week
+// b whose age is +1 over the previous report is season-week 1. With the
+// phase known, sim start = last.week + 1: if that step lands on a boundary
+// week the starting age is last.age + 1 and ssw = 1; else ssw = offset + 1.
+// Uses the LATEST observed boundary. Returns nulls when no boundary is
+// observable (short history — phase unknowable, caller keeps defaults).
+function _deriveStart(reports){
+  if(!reports||!reports.length)return null;
+  const last=reports[reports.length-1];
+  const lastAge=parseInt(last.age,10);
+  if(!isFinite(lastAge))return null;
+  let b=null;
+  for(let i=1;i<reports.length;i++){
+    const a0=parseInt(reports[i-1].age,10),a1=parseInt(reports[i].age,10);
+    if(isFinite(a0)&&isFinite(a1)&&a1===a0+1)b=reports[i].week||0;
+  }
+  if(b==null)return{age:lastAge,ssw:null,bumped:false};
+  const nextWeek=(last.week||0)+1;
+  const off=((nextWeek-b)%_SL+_SL)%_SL;
+  return{
+    age:off===0?lastAge+1:lastAge,
+    ssw:off+1,           // off=0 ⇒ nextWeek IS a boundary week ⇒ ssw=1
+    bumped:off===0,
+  };
+}
 
 // ─── Positions ─────────────────────────────────────────────────────────────
 const POS={
@@ -274,24 +391,24 @@ function runPlanFromSchedule(skills,td,age,ssw,pos,schedule,subs){
   const startSk={};for(const sk of OS)startSk[sk]=st[sk].lv;
   let sw=ssw,ca=age,wk=0;const log=[],mx={};
   const len=Array.isArray(schedule)?schedule.length:0;
+  let wastedWeeks=0;
   while(wk<len){
-    let tr=schedule[wk];
-    // If the picked skill is already maxed, gracefully fall back to highest-value
-    // unmaxed skill — same fallback the strategies use, prevents wasted weeks.
-    if(tr&&(!OS.includes(tr)||st[tr].lv>=_MX||_gwm(st[tr],tr,ca,te,len-wk))){
-      let alt=null,ac=-1;
-      for(const sk of OS){const w=prof.w[sk]||0;
-        if(w>0&&st[sk].lv<_MX&&!_gwm(st[sk],sk,ca,te,len-wk)){
-          const sc=w*_dt(sk,st[sk].lv,ca,te);if(sc>ac){ac=sc;alt=sk;}}}
-      if(alt)tr=alt;else break;
-    }
-    if(!tr)break;
+    const tr=schedule[wk];
+    // v14: the assignment is honored LITERALLY. The old "graceful fallback"
+    // silently swapped a maxed (or _gwm-predicted-to-max) skill for the
+    // highest weight×threshold alternative — pace (B=99) almost always won
+    // (reported by Lipa91). A maxed assignment now burns its direct XP
+    // against the ceiling while GT still flows to the others (game reality);
+    // the week is flagged wasted and rendered red.
+    if(!tr||!OS.includes(tr))break;
+    const wasted=st[tr].lv>=_MX;
+    if(wasted)wastedWeeks++;
     wk++;const g={},wp=[];
     for(const sk of OS){if(st[sk].lv>=_MX){g[sk]=0;continue;}
       const xp=sk===tr?_XD:_XG;g[sk]=xp;
       for(const l of _applyXp(st[sk],xp,sk,ca,te)){wp.push([sk,l]);
         if(l>=_MX&&!(sk in mx))mx[sk]=[wk,ca];}}
-    log.push({week:wk,age:ca,sw,trained:tr,
+    log.push({week:wk,age:ca,sw,trained:tr,wasted,
       levels:Object.fromEntries(OS.map(sk=>[sk,st[sk].lv])),
       subs:Object.fromEntries(OS.map(sk=>[sk,_sub(st[sk],sk,ca,te)])),
       gains:g,pops:wp});
@@ -299,7 +416,7 @@ function runPlanFromSchedule(skills,td,age,ssw,pos,schedule,subs){
   }
   const fsk={},fdb={};
   for(const sk of OS){fsk[sk]=st[sk].lv;fdb[sk]=_tdb(st[sk],sk,ca,te);}
-  return{log,finalSkills:fsk,finalDb:fdb,totalWeeks:wk,maxedAt:mx,startSkills:startSk,startAge:age,isSale:false,isManual:true,schedule:[...schedule]};
+  return{log,finalSkills:fsk,finalDb:fdb,totalWeeks:wk,maxedAt:mx,startSkills:startSk,startAge:age,isSale:false,isManual:true,schedule:[...schedule],wastedWeeks};
 }
 
 // ─── Sale Optimizer ────────────────────────────────────────────────────────
@@ -588,21 +705,30 @@ function mikoosEstimateSubskill(skills,form,realValue){
 // Constants (constants.py)
 const _LEVELS_STD=18,_LEVELS_STAM=11;
 const _DB_PER_LV=100/18,_DB_PER_STAM=100/11;
-const _GT_RATE=15,_COACH_DB=91;
+const _GT_RATE=15,_COACH_DB=93;
 const _B_INT={pace:99,striker:90,technique:82,defending:82,playmaking:75,passing:75,keeper:75,stamina:null};
-const _B_NORM=75,_THR_BASE=100,_STAM_THR=80,_AGE_OFF=15;
-// v25 senior-age threshold correction (constants_v10.py)
-const _PROD_SLOPE_Y=0.50,_PROD_SLOPE_GAIN=0.04,_AGE_PIVOT=23;
-// Legacy alias — kept for any downstream code reading _PROD_SLOPE by name.
-// Reflects only the youth value; use _prodSlope(age) for the live slope.
-const _PROD_SLOPE=_PROD_SLOPE_Y;
+const _STAM_THR=80; // _B_NORM retired in v14 (normaliser folded into _pdc)
+// v14: the v25 product-slope constants (_THR_BASE, _PROD_SLOPE*, _AGE_OFF,
+// _AGE_PIVOT) are removed — the coupled model above is the only engine.
 const _FORM_CODE_TO_SK={0:"keeper",1:"defending",2:"playmaking",3:"striker"};
 const _GT_THR=93,_W_CL_OFF=93,_W_CL_FRI=70,_W_NT_OFF=70;
-// Value formula (in-game-calibrated VALUE_*, not Mikoos)
-const _VAL_BASE=11000.0,_VAL_TM=1.088,_VAL_LM=1.252;
-const _VAL_CM=_VAL_TM*_VAL_LM;
-const _VAL_KP_W=4.0,_VAL_FORM_PEN=1/40;
+// Value formula — Mikoos-faithful port (constants.py v9: corrected
+// cumulative table + VALUE_FORM_PENALTY 1/40 → 1/39). Replaces the old
+// exponential approximation (11000·CM^L), which was calibrated against the
+// pre-fix desktop table and ran ~8% hot at mid/high levels.
+const _VAL_BASE=1588.0,_VAL_TM=1.088,_VAL_LM=1.252;
+const _VAL_KP_W=4.0,_VAL_FORM_PEN=1/39;
 const _VAL_STAM_BASE=216.4,_VAL_STAM_MULT=1.511;
+// Cumulative skill-cost table (build_skill_value_table, n_levels=21):
+//   base_values[0]=0, [1]=BASE, [i]=[i−1]·TM;  skill_table[i]=[i−1]+base_values[i]
+const _VAL_TBL=(()=>{
+  const n=21;
+  const bv=[0.0,_VAL_BASE];
+  for(let i=2;i<=n;i++)bv.push(bv[i-1]*_VAL_TM);
+  const st=[0.0,_VAL_BASE];
+  for(let i=2;i<n;i++)st.push(st[i-1]+bv[i]);
+  return st;
+})();
 
 // DB geometry (subskill.py)
 function _dbFloor(lv,isStam){const d=isStam?11:18;return Math.ceil(lv*100/d);}
@@ -611,16 +737,11 @@ function _dbThresh(lv,isStam){return _dbFloor(lv+1,isStam)-_dbFloor(lv,isStam);}
 // Talent eff (constants.py)
 function _talEffSenior(td){return 40.0+60.0*(td/100.0);}
 
-// v25 senior-age slope: k(age) = 0.50 + 0.04 · max(0, age − 23)
-function _prodSlope(age){return _PROD_SLOPE_Y+_PROD_SLOPE_GAIN*Math.max(0.0,age-_AGE_PIVOT);}
-
-// Canonical pop threshold — v25 product model with senior-age k correction
+// Canonical pop threshold — RAW (talent-free), coupled model. Delegates to
+// the shared per-DB sum so planner and tracker/estimator are one engine.
 function _canonThr(skill,level,age){
   if(skill==="stamina")return _STAM_THR;
-  const b=_B_INT[skill];if(b==null)return Infinity;
-  const dbMid=(level+0.5)*(100.0/18.0);
-  const years=Math.max(0.0,age-_AGE_OFF);
-  return(b/_B_NORM)*(_THR_BASE+_prodSlope(age)*dbMid*years);
+  return _dtRaw(skill,level,age);
 }
 
 // DB gain per week for one skill
@@ -696,18 +817,22 @@ function _inferFormationSkill(history){
   return best!=null?_FORM_CODE_TO_SK[best]||null:null;
 }
 
-// In-game-calibrated value formula (for sanity checking, distinct from Mikoos)
+// In-game value formula — desktop skill_value_at / stamina_value_at port.
+//   outfield/keeper: interp(skill_table[L], skill_table[L+1], f) · LM^(L+f)
+//                    keeper × 4 for all players
+//   stamina:         lb · 216.4 · 1.511^lb   (lb = level + sub, uncapped)
 function _skillValue(skill,level,sub){
   if(sub==null)sub=0;
-  let v0,v1;
   if(skill==="stamina"){
-    v0=level>0?level*_VAL_STAM_BASE*Math.pow(_VAL_STAM_MULT,level):0.0;
-    v1=level<_LEVELS_STAM?(level+1)*_VAL_STAM_BASE*Math.pow(_VAL_STAM_MULT,level+1):v0;
-  }else{
-    v0=_VAL_BASE*Math.pow(_VAL_CM,level);
-    v1=level<_LEVELS_STD?_VAL_BASE*Math.pow(_VAL_CM,level+1):v0;
+    const lb=level+sub;
+    return lb*_VAL_STAM_BASE*Math.pow(_VAL_STAM_MULT,lb);
   }
-  let v=v0+sub*(v1-v0);
+  const L=Math.max(0,Math.min(level,_LEVELS_STD));
+  const f=Math.max(0.0,Math.min(1.0,sub));
+  let interp;
+  if(L+1>=_VAL_TBL.length)interp=_VAL_TBL[_VAL_TBL.length-1];
+  else interp=_VAL_TBL[L]+(_VAL_TBL[L+1]-_VAL_TBL[L])*f;
+  let v=interp*Math.pow(_VAL_LM,L+f);
   if(skill==="keeper")v*=_VAL_KP_W;
   return v;
 }
@@ -884,10 +1009,12 @@ function buildBundle(ctx){
       position_assumed:pos,
       horizon_weeks:weeks,
       start_season_week:ssw,
-      coach_value_assumed:_COACH_DB,  // v11: use the live engine constant (91 since v10)
-                                      //      instead of the stale literal 93. Guarantees the
-                                      //      corpus metadata matches the simulation that
-                                      //      produced talent_db_estimate.
+      coach_value_assumed:_COACH_DB,  // live engine constant (93 since v14, was 91 in v10–v13)
+      // v14: engine/estimator provenance — rides inside user_snapshot so the
+      // pinned source string (RLS gate) stays untouched. The desktop side
+      // reads these to know which producer generated talent_db_estimate.
+      engine:"coupled-K16-coach93",
+      talent_estimator:"balance-v1",
       latest_report_week:lastReport?.week??null,
     },
     reports:reports||[],
@@ -1255,7 +1382,7 @@ function estimateTalent(history,options){
   const empty={td:NaN,tdLo:NaN,tdHi:NaN,confidence:"no_data",
     nGaps:0,nGtGaps:0,nDirectGaps:0,nNoPopBounds:0,nNoPopSkills:0,
     nExclDrop:0,nExclRange:0,excludedSkills:[],perGap:[],notes:["no history"],
-    isGk:false,contradictory:false};
+    isGk:false,contradictory:false,balanceEvents:[]};
   if(!history||!history.length)return empty;
   // Sort ascending defensively (parser already does this, but cheap to repeat)
   const hist=[...history].sort((a,b)=>(a.week||0)-(b.week||0));
@@ -1268,6 +1395,7 @@ function estimateTalent(history,options){
 
   const allLo=[],allHi=[],allPgIdx=[];
   const perGapLog=[];
+  const balanceEvents=[]; // v14: feed for the balance-v1 estimator
   let gtGapCount=0,directGapCount=0;
   let nExclDrop=0,nExclRange=0,nNoPopSkills=0;
   // Per-skill known-start ranges (for consensus intersection).
@@ -1282,6 +1410,10 @@ function estimateTalent(history,options){
       if(lo===null){nExclRange+=1;continue;}
       const pgIdx=perGapLog.length;
       allLo.push(lo);allHi.push(hi);allPgIdx.push(pgIdx);
+      // v14: known-start gaps double as balance events — [lo,hi] is the
+      // td-consistent interval, so at candidate td: td<lo ⇒ under (model
+      // late — raise talent), td>hi ⇒ over. Level keys the band weight.
+      if(g.hasKnownStart)balanceEvents.push({lo,hi,level:g.levelBefore,skill:g.skill});
       if(g.hasKnownStart){
         if(!(skill in skillKsRanges))skillKsRanges[skill]={los:[],his:[]};
         if(lo>1.0)skillKsRanges[skill].los.push(lo);
@@ -1328,6 +1460,7 @@ function estimateTalent(history,options){
 
   if(loFinal===1.0&&hiFinal===100.0){
     return{...empty,perGap:perGapLog,nNoPopSkills,nExclDrop,nExclRange,
+      balanceEvents,
       isGk,notes:["Insufficient training history — more data needed"]};
   }
 
@@ -1447,6 +1580,174 @@ function estimateTalent(history,options){
     nGtGaps:gtGapCount,nDirectGaps:directGapCount,
     nNoPopBounds,nNoPopSkills,nExclDrop,nExclRange,
     excludedSkills,perGap:perGapLog,notes,isGk,contradictory,
+    balanceEvents,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TALENT BALANCE v1 — JS port of talent_balance.py (App v14, Jul 2026)
+//
+// Talent is the value where the over/under residual BALANCES — a regression,
+// not a solver. Hybrid weighting: DIRECTION by pure event COUNT
+// C(td) = n_under − n_over (monotone decreasing; counts can never invert);
+// the confidence BAND is reliability-weighted (sign-symmetric, level-keyed
+// _BAND_RMSE from talent_weighting v4).
+//
+// v1 event source (documented deviation from desktop): known-start closed
+// gaps only. Each gap's td-consistent interval [lo,hi] from the v12 bound
+// inversion classifies statically — td < lo ⇒ under, td > hi ⇒ over, inside
+// ⇒ no event. No anchor-solved first pops (anchor_refiner v14 is not yet
+// reference-validated and is deliberately not ported); range-excluded gaps
+// stay excluded; partial gaps feed the gap band only, never direction.
+// ═══════════════════════════════════════════════════════════════════════════
+const _BAL_RMSE={pooled:0.232,"L0-5":0.313,"L6-8":0.255,"L9-11":0.173,"L12-14":0.153,"L15-17":0.143}; // coupled table
+const _BAL_ACC_EXP=1.5;
+const _BAL_MIN_SIGNAL=3;     // min classified events to attempt a balance
+const _BAL_WIDE_BAND=8.0;    // band wider than this (DB) ⇒ flat
+const _BAL_TOL=0.25,_BAL_MAX_IT=60;
+const _BAL_SEARCH_MAX=130.0; // search past the cap → ceiling keeps a virtual point
+const _BAL_CAP=100.0,_BAL_FLOOR=1.0;
+
+function _balLvlBand(l){
+  return l<=5?"L0-5":l<=8?"L6-8":l<=11?"L9-11":l<=14?"L12-14":"L15-17";
+}
+function _balBandWeight(level){
+  const r=_BAL_RMSE[_balLvlBand(level)]||_BAL_RMSE.pooled;
+  if(r<=0)return 1.0;
+  return Math.pow(_BAL_RMSE.pooled/r,_BAL_ACC_EXP);
+}
+
+// One evaluation of the residual signal at candidate td (NetSample).
+// sumWSq runs over the WHOLE event population (constant across td) so the
+// noise floor matches the Python semantics, where every pop is classified.
+function _balNetSample(events,td){
+  let nu=0,no=0,wu=0,wo=0,sw2=0;
+  for(const e of events){
+    const w=_balBandWeight(e.level);
+    sw2+=w*w;
+    if(td<e.lo){nu++;wu+=w;}
+    else if(td>e.hi){no++;wo+=w;}
+  }
+  return{td,countNet:nu-no,nUnder:nu,nOver:no,wUnder:wu,wOver:wo,
+    sumWSq:sw2,nEvents:nu+no};
+}
+
+function _balEpsW(s){return Math.sqrt(Math.max(s.sumWSq,0.0));}
+function _balWeightedNet(s){return s.wUnder-s.wOver;}
+
+// Root of the monotone-decreasing COUNT signal on [lo,hi].
+function _balCountRoot(fn,lo,hi){
+  const cLo=fn(lo).countNet,cHi=fn(hi).countNet;
+  if(cLo<=0)return lo;
+  if(cHi>=0)return hi;
+  let a=lo,b=hi;
+  for(let i=0;i<_BAL_MAX_IT;i++){
+    if((b-a)<=_BAL_TOL)break;
+    const m=0.5*(a+b);
+    if(fn(m).countNet>0)a=m;else b=m;
+  }
+  return 0.5*(a+b);
+}
+
+// d(weighted net)/dtd near td (central diff, h=3), clamped from 0.
+function _balLocalSlope(fn,td,h){
+  h=h||3.0;
+  const lo=_balWeightedNet(fn(td-h)),hi=_balWeightedNet(fn(td+h));
+  let slope=(hi-lo)/(2.0*h);
+  if(Math.abs(slope)<1e-6)slope=-1e-6;
+  return slope;
+}
+function _balSymBand(fn,vTd,epsW){
+  return epsW/Math.abs(_balLocalSlope(fn,vTd));
+}
+
+// LATE clamp: band symmetric around the UNCAPPED virtual point; only the
+// operative talent_db is clamped.
+function _balFinalize(vTd,half,epsW,confidence,oneSided,countNet,nEvents,tdFloor){
+  const lo=Math.max(vTd-half,tdFloor);
+  const hi=vTd+half; // left uncapped on purpose
+  const operative=Math.min(Math.max(vTd,tdFloor),_BAL_CAP);
+  return{talentDb:operative,talentDbLo:lo,talentDbHi:hi,
+    confidence,oneSided,epsilon:epsW,countNetAtPoint:countNet,
+    nEvents,virtualTalentDb:vTd,capped:vTd>_BAL_CAP};
+}
+
+// estimate_balance port. gapBand ([lo,hi] from the v12 flat intersection)
+// is consulted ONLY to narrow a flat region (case 4).
+function estimateBalance(events,tdFloor,tdCeil,gapBand){
+  if(tdCeil<=tdFloor)tdCeil=tdFloor+1e-6;
+  const searchHi=Math.max(tdCeil,_BAL_SEARCH_MAX);
+  const fn=td=>_balNetSample(events,td);
+  const sFloor=fn(tdFloor),sTop=fn(searchHi);
+  const epsW=Math.max(_balEpsW(sFloor),_balEpsW(sTop));
+
+  // Case 5: insufficient signal → caller keeps the gap estimate.
+  if(Math.max(sFloor.nEvents,sTop.nEvents)<_BAL_MIN_SIGNAL){
+    const mid=0.5*(tdFloor+tdCeil);
+    return{talentDb:mid,talentDbLo:tdFloor,talentDbHi:tdCeil,
+      confidence:"insufficient_signal",oneSided:null,epsilon:epsW,
+      countNetAtPoint:sFloor.countNet,nEvents:sFloor.nEvents,
+      virtualTalentDb:mid,capped:false};
+  }
+  // Case 2: ceiling-pinned — under-dominated by COUNT past the cap.
+  if(sTop.countNet>0){
+    const half=_balSymBand(fn,searchHi,epsW);
+    return _balFinalize(searchHi,half,epsW,"ceiling_pinned","ge",
+      sTop.countNet,sTop.nEvents,tdFloor);
+  }
+  // Case 3: floor-pinned — over-dominated at the floor.
+  if(sFloor.countNet<0){
+    const half=_balSymBand(fn,tdFloor,epsW);
+    return _balFinalize(tdFloor,half,epsW,"floor_pinned","le",
+      sFloor.countNet,sFloor.nEvents,tdFloor);
+  }
+  // Cases 1 & 4: count root exists in [floor, searchHi].
+  const root=_balCountRoot(fn,tdFloor,searchHi);
+  let half=_balSymBand(fn,root,epsW);
+  const sRoot=fn(root);
+  const bandW=2.0*half;
+  if(bandW>_BAL_WIDE_BAND){
+    // Case 4: flat / identifiability-limited — gap band may NARROW only.
+    let vPt=root,conf="weak";
+    const loEdge=root-half,hiEdge=root+half;
+    if(gapBand&&isFinite(gapBand[0])&&isFinite(gapBand[1])){
+      const nLo=Math.max(loEdge,gapBand[0]),nHi=Math.min(hiEdge,gapBand[1]);
+      if(nHi>nLo&&(nHi-nLo)<bandW){
+        vPt=0.5*(nLo+nHi);half=0.5*(nHi-nLo);conf="reliable_via_gap";
+      }
+    }
+    return _balFinalize(vPt,half,epsW,conf,null,
+      sRoot.countNet,sRoot.nEvents,tdFloor);
+  }
+  // Case 1: clean crossing — residual accepted as noise.
+  return _balFinalize(root,half,epsW,"reliable",null,
+    sRoot.countNet,sRoot.nEvents,tdFloor);
+}
+
+// Combined estimator the UI consumes: run the v12 gap estimator (event
+// producer + fallback + gap band), then the balance on its known-start
+// events. On insufficient_signal the v12 verdict passes through unchanged
+// (method "gap"); otherwise the balance verdict overrides td/tdLo/tdHi/
+// confidence (method "balance").
+function estimateTalentCombined(history,options){
+  const base=estimateTalent(history,options);
+  const events=base.balanceEvents||[];
+  if(!events.length)return{...base,method:"gap"};
+  const gapBand=(isFinite(base.tdLo)&&isFinite(base.tdHi)&&!base.contradictory)
+    ?[base.tdLo,base.tdHi]:null;
+  const bal=estimateBalance(events,_BAL_FLOOR,_BAL_CAP,gapBand);
+  if(bal.confidence==="insufficient_signal")return{...base,method:"gap"};
+  return{
+    ...base,
+    method:"balance",
+    td:Math.round(bal.talentDb*10)/10,
+    tdLo:Math.round(Math.max(_BAL_FLOOR,bal.talentDbLo)*10)/10,
+    tdHi:Math.round(bal.talentDbHi*10)/10, // may exceed 100 (virtual band)
+    confidence:bal.confidence,
+    oneSided:bal.oneSided,
+    balance:{epsilon:bal.epsilon,nEvents:bal.nEvents,
+      countNet:bal.countNetAtPoint,virtual:bal.virtualTalentDb,
+      capped:bal.capped},
   };
 }
 
@@ -1513,18 +1814,22 @@ function SkillEditor({skills,setSkills,subs,setSubs,age,setAge,pos,name,warnings
     if(!talentEstimate)return null;
     const e=talentEstimate;
     if(e.confidence==="no_data"||!isFinite(e.td))return null;
-    const cMap={reliable:C.pop,indicative:C.acc,unreliable:C.warn,no_data:C.txM};
+    const cMap={reliable:C.pop,reliable_via_gap:C.pop,indicative:C.acc,
+      ceiling_pinned:C.acc,floor_pinned:C.warn,weak:C.warn,
+      unreliable:C.warn,no_data:C.txM};
     const cBd=cMap[e.confidence]||C.txM;
     const ys=_csYsFromTd(e.td);
+    const src=e.method==="balance"?"balance":"gaps";
+    const pre=e.oneSided==="ge"?"≤":e.oneSided==="le"?"≥":""; // td≥cap ⇒ YS≤
     return(
       <span style={{
         display:"inline-flex",alignItems:"center",gap:6,
         padding:"2px 8px",borderRadius:4,
         background:C.card,border:`1px solid ${cBd}`,
         fontSize:11,fontFamily:_ft,
-      }} title={`Talent estimate from training history: YS ${ys.toFixed(2)} (${e.confidence}, ${e.nGaps} gap${e.nGaps===1?"":"s"}). Apply on Stage 2.`}>
+      }} title={`Talent estimate from training history (${src}): YS ${pre}${ys.toFixed(2)} (${e.confidence}). Apply on Stage 2.`}>
         <span style={{color:C.txM,letterSpacing:0.3,fontFamily:_fs,fontSize:10,fontWeight:600}}>EST.</span>
-        <span style={{color:C.tx,fontWeight:700}}>{ys.toFixed(2)}</span>
+        <span style={{color:C.tx,fontWeight:700}}>{pre}{ys.toFixed(2)}</span>
         <span style={{
           padding:"0 5px",borderRadius:2,fontSize:9,fontWeight:600,
           background:cBd,color:"#fff",letterSpacing:0.3,fontFamily:_fs,
@@ -1660,6 +1965,8 @@ export default function App(){
   const[pos,setPos]=useState("ATT");
   const[weeks,setWeeks]=useState(52);
   const[ssw,setSsw]=useState(1);
+  // v14: visible note when the season-rollover derivation adjusts age/ssw
+  const[seasonNote,setSeasonNote]=useState("");
   const[selStrats,setSelStrats]=useState(["round_robin","closest_to_pop","sale_optimizer"]);
   const[results,setResults]=useState(null);
   const[showLog,setShowLog]=useState(null);
@@ -1681,12 +1988,12 @@ export default function App(){
 
   // v12: gap-based talent estimate from training history. Memoised on
   // historyReports — recomputed whenever the user (re)loads history.
-  // Returns null when no history is loaded; otherwise an object with
-  // {td, tdLo, tdHi, confidence, nGaps, ...}. The chip UI under the
-  // YS Talent input reads this and exposes an Apply button.
+  // v14: routed through estimateTalentCombined — balance-v1 verdict when
+  // enough known-start events exist, v12 gap estimate otherwise (.method
+  // tells the chip which estimator produced the number).
   const talentEstimate=useMemo(()=>{
     if(!historyReports||!historyReports.length)return null;
-    return estimateTalent(historyReports);
+    return estimateTalentCombined(historyReports);
   },[historyReports]);
   // YS-standard scale value the Apply button writes to the input.
   // _csYsFromTd matches the inverse of _fromYS — round-trips cleanly.
@@ -1750,17 +2057,15 @@ export default function App(){
     setHistoryReports(reports);setHistoryMeta(meta);
     const last=reports[reports.length-1];
     if(last){
-      if(last.age)setAge(last.age);
-      // v13 (per Lipa91 forum feedback): default the Start Season Week to
-      // the week AFTER the last history record. Most users plan forward
-      // from "next week" — the current Sokker week's training is already
-      // locked in. Sokker's `week` field is 1–13 wrapping per season
-      // (persistence.py L185), so (last.week % 13) + 1 handles both the
-      // normal case (week 7 → 8) and the season boundary (week 13 → 1).
-      // User can override via the Start Season Week input on Stage 2.
-      if(typeof last.week==="number"&&last.week>0){
-        setSsw((last.week%13)+1);
-      }
+      // v14: season-rollover-aware start derivation (see _deriveStart).
+      const d=_deriveStart(reports);
+      if(d){
+        setAge(d.age);
+        if(d.ssw!=null)setSsw(d.ssw);
+        if(d.bumped)setSeasonNote(`Season rolled over since the last report — starting age adjusted to ${d.age} (was ${d.age-1}), season week set to 1.`);
+        else if(d.ssw!=null)setSeasonNote(`Season week auto-set to ${d.ssw} from the report stream.`);
+        else setSeasonNote("");
+      }else if(last.age)setAge(last.age);
       const sk={};for(const s of OS)sk[s]=last.skills?.[s]??0;
       setSkills(sk);
       // v7.2: full forward simulation per skill (replaces uniform Mikoos)
@@ -1871,6 +2176,18 @@ export default function App(){
       if(snap.horizon_weeks)setWeeks(snap.horizon_weeks);
       if(snap.start_season_week)setSsw(snap.start_season_week);
       if(snap.ys_talent_user)setYsTalent(String(snap.ys_talent_user));
+      // v14: the snapshot's age/ssw were correct at EXPORT time but go stale
+      // across a season boundary the same way a raw history does. When the
+      // report stream yields a boundary phase, the derivation overrides them.
+      {
+        const d=_deriveStart(reports);
+        if(d&&d.ssw!=null){
+          setAge(d.age);setSsw(d.ssw);
+          setSeasonNote(d.bumped
+            ?`Season rolled over since the last report — starting age adjusted to ${d.age}, season week set to 1.`
+            :`Season week auto-set to ${d.ssw} from the report stream.`);
+        }else setSeasonNote("");
+      }
       // Apply skills from latest report (matches Load History behavior)
       const last=reports[reports.length-1];
       const sk={};for(const s of OS)sk[s]=last.skills?.[s]??0;
@@ -2412,6 +2729,13 @@ export default function App(){
                 {hasPlayerData?(
                   <>
                     <div style={sL}>Player skills & sub-levels</div>
+                    {seasonNote&&(
+                      <div style={{fontSize:11,color:C.warn,background:C.hi,
+                        borderLeft:`3px solid ${C.warn}`,padding:"6px 10px",
+                        marginBottom:8,borderRadius:4}}>
+                        🗓 {seasonNote}
+                      </div>
+                    )}
                     <SkillEditor
                       skills={skills} setSkills={setSkills}
                       subs={subs} setSubs={setSubs}
@@ -2489,11 +2813,19 @@ export default function App(){
                 {historyReports&&talentEstimate&&(()=>{
                   const e=talentEstimate;
                   const noData=e.confidence==="no_data"||!isFinite(e.td);
-                  const cMap={reliable:C.pop,indicative:C.acc,unreliable:C.warn,no_data:C.txM};
+                  const cMap={reliable:C.pop,reliable_via_gap:C.pop,indicative:C.acc,
+                    ceiling_pinned:C.acc,floor_pinned:C.warn,weak:C.warn,
+                    unreliable:C.warn,no_data:C.txM};
                   const cBd=cMap[e.confidence]||C.txM;
                   const ysVal=estYs;
-                  const ysLo=isFinite(e.tdHi)?_csYsFromTd(e.tdHi):null; // td_hi → ys_lo (tighter ys)
-                  const ysHi=isFinite(e.tdLo)?_csYsFromTd(e.tdLo):null; // td_lo → ys_hi
+                  // Band → YS: clamp td band to [1,100] for display (the
+                  // balance band's hi may run virtual past the cap).
+                  const bLo=isFinite(e.tdLo)?Math.max(1,Math.min(100,e.tdLo)):null;
+                  const bHi=isFinite(e.tdHi)?Math.max(1,Math.min(100,e.tdHi)):null;
+                  const ysLo=bHi!=null?_csYsFromTd(bHi):null; // td_hi → ys_lo (tighter ys)
+                  const ysHi=bLo!=null?_csYsFromTd(bLo):null; // td_lo → ys_hi
+                  const isBal=e.method==="balance";
+                  const pre=e.oneSided==="ge"?"≤":e.oneSided==="le"?"≥":"";
                   return(
                     <div style={{
                       borderLeft:`3px solid ${cBd}`,
@@ -2512,7 +2844,7 @@ export default function App(){
                           <>
                             <span style={{
                               fontFamily:_ft,fontSize:14,fontWeight:700,color:C.tx,
-                            }}>{ysVal.toFixed(2)}</span>
+                            }}>{pre}{ysVal.toFixed(2)}</span>
                             {ysLo!=null&&ysHi!=null&&(ysLo!==ysHi)&&(
                               <span style={{color:C.txM,fontFamily:_ft,fontSize:11}}>
                                 ({ysLo.toFixed(2)}–{ysHi.toFixed(2)})
@@ -2523,8 +2855,8 @@ export default function App(){
                               background:cBd,color:"#fff",letterSpacing:0.3,
                             }}>{e.confidence}</span>
                             <span style={{color:C.txM}}>
-                              · {e.nGaps} gap{e.nGaps===1?"":"s"}
-                              {e.nNoPopBounds?` · ${e.nNoPopBounds} no-pop`:""}
+                              · {isBal?`balance · ${e.balance.nEvents} event${e.balance.nEvents===1?"":"s"}`:`gaps · ${e.nGaps}`}
+                              {!isBal&&e.nNoPopBounds?` · ${e.nNoPopBounds} no-pop`:""}
                               {e.isGk?" · GK":""}
                             </span>
                             <button onClick={()=>setYsTalent(ysVal.toFixed(2))}
@@ -2540,12 +2872,17 @@ export default function App(){
                           </>
                         )}
                       </div>
-                      {!noData&&e.contradictory&&(
+                      {!noData&&isBal&&e.balance.capped&&(
+                        <div style={{color:C.txM,fontSize:10,marginTop:4}}>
+                          ceiling-pinned: virtual balance point {e.balance.virtual.toFixed(0)} DB past the cap — genuine top talent OR high-level K under-thresholding
+                        </div>
+                      )}
+                      {!noData&&!isBal&&e.contradictory&&(
                         <div style={{color:C.warn,fontSize:10,marginTop:4}}>
                           ⚠ contradictory bounds — model residual; treat as indicative
                         </div>
                       )}
-                      {!noData&&e.excludedSkills.length>0&&(
+                      {!noData&&e.excludedSkills.length>0&&!isBal&&(
                         <div style={{color:C.txM,fontSize:10,marginTop:4}}>
                           consensus excluded: {e.excludedSkills.join(", ")}
                         </div>
@@ -2565,6 +2902,11 @@ export default function App(){
                     <input type="number" min={1} max={13} value={ssw}
                       onChange={e=>setSsw(Math.max(1,Math.min(13,parseInt(e.target.value)||1)))}
                       style={{...sI,width:60}}/>
+                    {seasonNote&&(
+                      <div style={{fontSize:9,color:C.warn,marginTop:3,maxWidth:180,lineHeight:1.3}}>
+                        🗓 auto-derived from history
+                      </div>
+                    )}
                   </div>
                 </div>
                 <div style={{...sL,marginTop:10}}>Training Horizon (weeks)</div>
@@ -2794,11 +3136,15 @@ export default function App(){
                           <tbody>
                             {displayResults[showLog].log.map((w,i)=>(
                               <tr key={i} style={{borderBottom:`1px solid ${C.bdr}22`,
-                                background:w.pops.length?C.pop+"0d":"transparent"}}>
+                                background:w.wasted?C.red+"14":w.pops.length?C.pop+"0d":"transparent"}}>
                                 <td style={{padding:"3px 6px",textAlign:"center"}}>{w.week}</td>
                                 <td style={{padding:"3px 6px",textAlign:"center",color:C.txD}}>{w.age}</td>
                                 <td style={{padding:"3px 6px",textAlign:"center",color:C.txM}}>{w.sw}</td>
-                                <td style={{padding:"3px 6px",color:C.acc,fontWeight:600}}>{SN[w.trained]}</td>
+                                <td style={{padding:"3px 6px",color:w.wasted?C.red:C.acc,fontWeight:600,
+                                  textDecoration:w.wasted?"line-through":"none"}}
+                                  title={w.wasted?"Wasted — assigned skill already maxed":undefined}>
+                                  {SN[w.trained]}{w.wasted?" ✗":""}
+                                </td>
                                 {OS.filter(sk=>prof.w[sk]>0).map(sk=>{
                                   const hasPop=w.pops.some(p=>p[0]===sk);
                                   return(
@@ -2905,6 +3251,12 @@ export default function App(){
               ):(
                 <div style={{display:"flex",flexDirection:"column",gap:6}}>
                   {(()=>{
+                    // v14: weeks the sim flags as wasted (assigned skill maxed)
+                    // render RED — the assignment is honored, not substituted.
+                    const wastedIdx=new Set();
+                    if(manualResult&&manualResult.log){
+                      for(const w of manualResult.log)if(w.wasted)wastedIdx.add(w.week-1);
+                    }
                     // Group chips into rows of 13 (one season each)
                     const rows=[];
                     for(let i=0;i<manualSchedule.length;i+=13){
@@ -2916,21 +3268,29 @@ export default function App(){
                           SEASON {si+1}
                         </span>
                         <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
-                          {row.map(({sk,idx})=>(
-                            <button key={idx} onClick={()=>manualDeleteAt(idx)} title={`Week ${idx+1}: ${sk} (click to delete)`}
+                          {row.map(({sk,idx})=>{
+                            const isWasted=wastedIdx.has(idx);
+                            return(
+                            <button key={idx} onClick={()=>manualDeleteAt(idx)}
+                              title={isWasted
+                                ?`Week ${idx+1}: ${sk} — WASTED (skill already maxed; direct XP burns against the ceiling, GT still flows). Click to delete.`
+                                :`Week ${idx+1}: ${sk} (click to delete)`}
                               style={{
                                 padding:"4px 8px",borderRadius:4,fontSize:10,fontFamily:_ft,fontWeight:700,
-                                background:SK_COLORS[sk]+"33",color:SK_COLORS[sk],
-                                border:`1px solid ${SK_COLORS[sk]}`,cursor:"pointer",
+                                background:isWasted?C.red+"33":SK_COLORS[sk]+"33",
+                                color:isWasted?C.red:SK_COLORS[sk],
+                                border:`1px solid ${isWasted?C.red:SK_COLORS[sk]}`,
+                                textDecoration:isWasted?"line-through":"none",
+                                cursor:"pointer",
                                 minWidth:38,textAlign:"center",
                                 transition:"transform .1s,box-shadow .1s",
                               }}
                               onMouseEnter={e=>{e.target.style.transform="scale(1.08)";e.target.style.boxShadow=`0 0 0 2px ${C.red}66`;}}
                               onMouseLeave={e=>{e.target.style.transform="scale(1)";e.target.style.boxShadow="none";}}>
-                              <div style={{fontSize:7,color:C.txM,marginBottom:1}}>{idx+1}</div>
+                              <div style={{fontSize:7,color:isWasted?C.red:C.txM,marginBottom:1}}>{isWasted?"✗":idx+1}</div>
                               {SN[sk]}
                             </button>
-                          ))}
+                          );})}
                           {/* Pad row to 13 chips so seasons line up visually */}
                           {row.length<13&&Array.from({length:13-row.length}).map((_,k)=>(
                             <div key={"pad"+k} style={{minWidth:38,padding:"4px 8px",fontSize:10}}/>
@@ -2939,6 +3299,11 @@ export default function App(){
                       </div>
                     ));
                   })()}
+                  {manualResult&&manualResult.wastedWeeks>0&&(
+                    <div style={{fontSize:11,color:C.red,marginTop:2}}>
+                      ✗ {manualResult.wastedWeeks} wasted week{manualResult.wastedWeeks===1?"":"s"} — assigned skill already maxed (direct XP lost; GT to other skills still delivered)
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -3027,6 +3392,8 @@ export default function App(){
     current_skills:skills,
     subskills_estimate:Object.fromEntries(OS.map(sk=>[sk,(subs[sk]??25)/100])),
     age_current:age,
+    engine:"coupled-K16-coach93",
+    talent_estimator:"balance-v1",
     talent_db_estimate:Number(td.toFixed(2)),
     position_assumed:pos,
     horizon_weeks:weeks,
