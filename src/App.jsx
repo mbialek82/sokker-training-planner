@@ -1,6 +1,66 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SOKKER TRAINING PLANNER v17 — estimator soundness + interval-first talent
+//
+// v17 (Jul 2026): estimator fixes driven by field reports (forum pg 9–10,
+// dzidzia's three juniors, 2026-07-02), reproduced from corpus submissions
+// 629/630/631 and validated against them + a 143-player corpus sweep.
+// Bundle format, corpus schema, planner engine: unchanged.
+//
+//  1. F3 — SOUND NO-POP UPPER BOUND. _noPopUpperBound denominator is
+//     xpTotal ONLY (known start or not). The previous known-start denom
+//     (xpTotal+xpFirst) assumed MAXIMAL carry-in — the closed-gap lower-
+//     bound logic applied where it flips from conservative to aggressive —
+//     and manufactured hard caps from soft no-pop evidence (Højland
+//     40124291: pace L10 "<71" vs real ~93). Desktop talent.py shares the
+//     defect (its docstring proof only covers the xpTotal case); the
+//     desktop fix ships as a separate talent.py version. Side effect:
+//     some previously contradiction-suppressed caps now bite — those are
+//     the SOUND bounds and legitimately tighten a few estimates.
+//
+//  2. F1 — ONE-SIDED EVENT GUARD. Balance requires the event set to be
+//     able to say "over". On short junior gaps every event's hi saturates
+//     at 100 ⇒ C(td) can never go negative ⇒ the root-find converges to
+//     the LOWER ENVELOPE, not a talent point (Kundrík 40171831: 57.9
+//     [reliable] vs real ~89, with every gap individually consistent
+//     with 89). Zero two-sided events ⇒ balance skipped, gap verdict
+//     passes through. Desktop is immune (tracker-replay events are
+//     inherently two-sided); this closes the static-gap-event port's
+//     degenerate case documented as a v14 deviation.
+//
+//  3. F1b — ZERO-PLATEAU BANDS. C(td) is a monotone non-increasing step
+//     function, so {C=0} is a single interval [z0,z1] (two bisections).
+//     A plateau wider than _BAL_WIDE_BAND is reported AS the band
+//     (center point), instead of the ε-band at whichever edge bisection
+//     happened to hit (Højland: plateau [68,91] → was 71.7±3.6, now
+//     79.7 band 68–91; real 93 at the striker-L3 hard edge).
+//
+//  4. F2 — EARNED CONFIDENCE. The Case-4 weak→reliable_via_gap upgrade
+//     requires ≥1 two-sided event, substantive narrowing (<80% of the
+//     flat width), and non-degenerate result width (≥2·TOL). Trivial
+//     shaves and band-touching intersections stay "weak".
+//
+//  5. F5 — NT-TRAINING WARNING. National minutes anywhere in the loaded
+//     history raise a chip warning: NT coaching adds unmodeled XP, so
+//     the estimate reads better (lower YS) than real (Bledy case).
+//
+//  6. INTERVAL-FIRST TALENT DISPLAY (user decision). Both the Stage-1
+//     badge and the Stage-2 chip lead with the YS interval (td_hi→ys_lo,
+//     td_lo→ys_hi); the point estimate is no longer displayed. Apply
+//     writes the band-midpoint point estimate into the talent input
+//     unchanged. One-sided/degenerate results keep the ≤/≥ point form.
+//
+//  Validation: Kundrík 57.9→76.4 [52.7,100] indicative (real 89.3 in
+//  band); Højland 69.4→79.7 [68.1,91.3] weak (real 93.1 at edge);
+//  Brzęczyszczykiewicz unchanged 100 ceiling (7 DB real error, junior-K
+//  question, by design). Corpus sweep n=143: 62 changed, mean +4.3 DB,
+//  junior-concentrated, demo player byte-identical, jsdom suite green.
+//  NOTE: reference player Rysio 40058307 moved 84.8→91.2 — recheck
+//  against desktop once desktop F3 lands.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
 // SOKKER TRAINING PLANNER v16 — user-friendliness release
 //
 // v16 (Jul 2026): UX-only. No engine, estimator, bundle-format, or corpus-
@@ -1448,7 +1508,16 @@ function _estimateGapBounds(gap){
 function _noPopUpperBound(og){
   if(og.xpTotal<=0)return 100.0;
   const thr=og.thresholdRaw;
-  const denom=og.hasKnownStart?(og.xpTotal+og.xpFirst):og.xpTotal;
+  // v17 (F3): denom = xpTotal ONLY, known start or not. Soundness: no pop
+  // ⇒ carry + eff·xpTotal < thr for the TRUE carry ∈ [0, eff·xpFirst];
+  // only carry=0 gives a bound valid in all worlds: eff < thr/xpTotal.
+  // The previous known-start denom (xpTotal+xpFirst) assumed MAXIMAL
+  // carry-in — the closed-gap lower-bound logic applied where it flips
+  // from conservative to aggressive. It manufactured hard caps from soft
+  // no-pop evidence (Højland 40124291: pace L10 "<71" vs real ~93).
+  // Desktop talent.py has the same defect (docstring proof only covers
+  // the xpTotal case); desktop fix ships separately.
+  const denom=og.xpTotal;
   if(thr<=0)return 100.0;
   const eff=thr/denom;
   if(eff>1.0)return 100.0;
@@ -1751,6 +1820,22 @@ function _balEpsW(s){return Math.sqrt(Math.max(s.sumWSq,0.0));}
 function _balWeightedNet(s){return s.wUnder-s.wOver;}
 
 // Root of the monotone-decreasing COUNT signal on [lo,hi].
+// v17 (F1b): edges of the C=0 plateau. z0 = infimum of {C<=0},
+// z1 = supremum of {C>=0}; both found by bisection on the monotone step.
+function _balZeroPlateau(fn,lo,hi){
+  let a=lo,b=hi; // z0: first td where C<=0
+  if(fn(lo).countNet<=0)a=b=lo;
+  else{for(let i=0;i<_BAL_MAX_IT&&(b-a)>_BAL_TOL;i++){
+    const m=0.5*(a+b);if(fn(m).countNet>0)a=m;else b=m;}}
+  const z0=0.5*(a+b);
+  a=lo;b=hi; // z1: last td where C>=0
+  if(fn(hi).countNet>=0)a=b=hi;
+  else{for(let i=0;i<_BAL_MAX_IT&&(b-a)>_BAL_TOL;i++){
+    const m=0.5*(a+b);if(fn(m).countNet>=0)a=m;else b=m;}}
+  const z1=0.5*(a+b);
+  return[Math.min(z0,z1),Math.max(z0,z1)];
+}
+
 function _balCountRoot(fn,lo,hi){
   const cLo=fn(lo).countNet,cHi=fn(hi).countNet;
   if(cLo<=0)return lo;
@@ -1789,7 +1874,12 @@ function _balFinalize(vTd,half,epsW,confidence,oneSided,countNet,nEvents,tdFloor
 
 // estimate_balance port. gapBand ([lo,hi] from the v12 flat intersection)
 // is consulted ONLY to narrow a flat region (case 4).
-function estimateBalance(events,tdFloor,tdCeil,gapBand){
+function estimateBalance(events,tdFloor,tdCeil,gapBand,nTwoSided){
+  // v17 (F2): nTwoSided — informative-upper-bound events in the set.
+  // The Case-4 confidence upgrade (weak → reliable_via_gap) is earned by
+  // evidence, not by the narrowing arithmetic; a band that is narrow only
+  // because a one-sided envelope met the gap band stays "weak".
+  if(nTwoSided==null)nTwoSided=events.filter(e=>isFinite(e.hi)&&e.hi<100).length;
   if(tdCeil<=tdFloor)tdCeil=tdFloor+1e-6;
   const searchHi=Math.max(tdCeil,_BAL_SEARCH_MAX);
   const fn=td=>_balNetSample(events,td);
@@ -1817,8 +1907,14 @@ function estimateBalance(events,tdFloor,tdCeil,gapBand){
       sFloor.countNet,sFloor.nEvents,tdFloor);
   }
   // Cases 1 & 4: count root exists in [floor, searchHi].
-  const root=_balCountRoot(fn,tdFloor,searchHi);
-  let half=_balSymBand(fn,root,epsW);
+  // v17 (F1b): if the zero set is a wide plateau, the plateau IS the
+  // band — the ε-band at a bisection edge is an artifact. The plateau
+  // center is the point; Case-4 flat handling (gap-band narrowing, F2
+  // confidence rules) applies downstream unchanged.
+  const[z0,z1]=_balZeroPlateau(fn,tdFloor,searchHi);
+  const plateauW=z1-z0;
+  const root=plateauW>_BAL_WIDE_BAND?0.5*(z0+z1):_balCountRoot(fn,tdFloor,searchHi);
+  let half=plateauW>_BAL_WIDE_BAND?0.5*plateauW:_balSymBand(fn,root,epsW);
   const sRoot=fn(root);
   const bandW=2.0*half;
   if(bandW>_BAL_WIDE_BAND){
@@ -1828,7 +1924,13 @@ function estimateBalance(events,tdFloor,tdCeil,gapBand){
     if(gapBand&&isFinite(gapBand[0])&&isFinite(gapBand[1])){
       const nLo=Math.max(loEdge,gapBand[0]),nHi=Math.min(hiEdge,gapBand[1]);
       if(nHi>nLo&&(nHi-nLo)<bandW){
-        vPt=0.5*(nLo+nHi);half=0.5*(nHi-nLo);conf="reliable_via_gap";
+        vPt=0.5*(nLo+nHi);half=0.5*(nHi-nLo);
+        // v17 (F2): the upgrade is earned by evidence — at least one
+        // two-sided event AND a substantive narrowing (>20% of the flat
+        // width). A trivial shave of a wide plateau stays "weak".
+        // A near-zero-width intersection means the plateau and the gap
+        // band barely touch — a tension signal, not precision. Stay weak.
+        conf=(nTwoSided>=1&&(nHi-nLo)<0.8*bandW&&(nHi-nLo)>=2*_BAL_TOL)?"reliable_via_gap":"weak";
       }
     }
     return _balFinalize(vPt,half,epsW,conf,null,
@@ -1848,9 +1950,19 @@ function estimateTalentCombined(history,options){
   const base=estimateTalent(history,options);
   const events=base.balanceEvents||[];
   if(!events.length)return{...base,method:"gap"};
+  // v17 (F1): balance requires the event set to be able to say "over".
+  // On short junior gaps every event's hi saturates at 100 (carry slack
+  // swallows the upper bound) ⇒ C(td)=n_under−n_over can never go
+  // negative ⇒ the root-find converges to the LOWER ENVELOPE (max lo),
+  // not a talent point (Kundrík 40171831: 57.9 vs real ~89, with every
+  // gap individually consistent with 89). Desktop is immune — its events
+  // are tracker-replay timing residuals, inherently two-sided; this
+  // guard closes the static-gap-event port's degenerate case.
+  const nTwoSided=events.filter(e=>isFinite(e.hi)&&e.hi<100).length;
+  if(nTwoSided===0)return{...base,method:"gap"};
   const gapBand=(isFinite(base.tdLo)&&isFinite(base.tdHi)&&!base.contradictory)
     ?[base.tdLo,base.tdHi]:null;
-  const bal=estimateBalance(events,_BAL_FLOOR,_BAL_CAP,gapBand);
+  const bal=estimateBalance(events,_BAL_FLOOR,_BAL_CAP,gapBand,nTwoSided);
   if(bal.confidence==="insufficient_signal")return{...base,method:"gap"};
   return{
     ...base,
@@ -2038,15 +2150,21 @@ function SkillEditor({skills,setSkills,subs,setSubs,age,setAge,pos,name,warnings
     const ys=_csYsFromTd(e.td);
     const src=e.method==="balance"?"balance":"gaps";
     const pre=e.oneSided==="ge"?"≤":e.oneSided==="le"?"≥":""; // td≥cap ⇒ YS≤
+    // v17: interval-first display (band in YS: td_hi→ys_lo, td_lo→ys_hi)
+    const bLo=isFinite(e.tdLo)?Math.max(1,Math.min(100,e.tdLo)):null;
+    const bHi=isFinite(e.tdHi)?Math.max(1,Math.min(100,e.tdHi)):null;
+    const ivl=(bLo!=null&&bHi!=null&&bLo!==bHi)
+      ?`${_csYsFromTd(bHi).toFixed(2)}–${_csYsFromTd(bLo).toFixed(2)}`
+      :`${pre}${ys.toFixed(2)}`;
     return(
       <span style={{
         display:"inline-flex",alignItems:"center",gap:6,
         padding:"2px 8px",borderRadius:4,
         background:C.card,border:`1px solid ${cBd}`,
         fontSize:11,fontFamily:_ft,
-      }} title={`Talent estimate from training history (${src}): YS ${pre}${ys.toFixed(2)} (${e.confidence}). Apply on Stage 2.`}>
+      }} title={`Talent estimate from training history (${src}): YS ${ivl} (${e.confidence}). Apply on Stage 2.`}>
         <span style={{color:C.txM,letterSpacing:0.3,fontFamily:_fs,fontSize:10,fontWeight:600}}>EST.</span>
-        <span style={{color:C.tx,fontWeight:700}}>{pre}{ys.toFixed(2)}</span>
+        <span style={{color:C.tx,fontWeight:700}}>{ivl}</span>
         <span style={{
           padding:"0 5px",borderRadius:2,fontSize:9,fontWeight:600,
           background:cBd,color:"#fff",letterSpacing:0.3,fontFamily:_fs,
@@ -2257,6 +2375,18 @@ export default function App(){
   // pulled from whichever load path supplied them — paste card first, then
   // the last training report. All optional; SokkerCard renders "?" / omits
   // rows when absent.
+  // v17 (F5): NT-training weeks in the loaded history. National-team
+  // coaching delivers extra XP the model doesn't see, accelerating pops —
+  // the estimate reads better (lower YS) than real (Bledy case, forum
+  // 2026-07-02). Detection: any national minutes in the report stream.
+  const ntWeeks=useMemo(()=>{
+    if(!historyReports)return 0;
+    return historyReports.filter(r=>{
+      const g=r.games||{};
+      return (g.minutesNational||0)>0||(g.minutesNtOfficial||0)>0;
+    }).length;
+  },[historyReports]);
+
   const cardMeta=useMemo(()=>{
     const lastRep=historyReports?.length?historyReports[historyReports.length-1]:null;
     const num=v=>{const n=parseInt(v,10);return isFinite(n)?n:null;};
@@ -3172,14 +3302,15 @@ export default function App(){
                           </span>
                         ):(
                           <>
+                            {/* v17: the INTERVAL is the estimate. A point
+                                would fake precision the data doesn't have
+                                (user decision); Apply writes the band
+                                midpoint without displaying it. */}
                             <span style={{
                               fontFamily:_ft,fontSize:14,fontWeight:700,color:C.tx,
-                            }}>{pre}{ysVal.toFixed(2)}</span>
-                            {ysLo!=null&&ysHi!=null&&(ysLo!==ysHi)&&(
-                              <span style={{color:C.txM,fontFamily:_ft,fontSize:11}}>
-                                ({ysLo.toFixed(2)}–{ysHi.toFixed(2)})
-                              </span>
-                            )}
+                            }}>{ysLo!=null&&ysHi!=null&&ysLo!==ysHi
+                              ?`${ysLo.toFixed(2)}–${ysHi.toFixed(2)}`
+                              :`${pre}${ysVal.toFixed(2)}`}</span>
                             <span title={CONF_EXPLAIN[e.confidence]||""} style={{
                               padding:"1px 6px",borderRadius:3,fontSize:10,fontWeight:600,
                               background:cBd,color:"#fff",letterSpacing:0.3,cursor:"help",
@@ -3202,6 +3333,11 @@ export default function App(){
                           </>
                         )}
                       </div>
+                      {ntWeeks>0&&(
+                        <div style={{color:C.warn,fontSize:10,marginTop:4}}>
+                          ⚠ {ntWeeks} national-team week{ntWeeks===1?"":"s"} in this history — NT coaching adds unmodeled XP, so the true talent is likely worse (higher YS) than estimated
+                        </div>
+                      )}
                       {!noData&&isBal&&e.balance.capped&&(
                         <div style={{color:C.txM,fontSize:10,marginTop:4}}>
                           ceiling-pinned: virtual balance point {e.balance.virtual.toFixed(0)} DB past the cap — genuine top talent OR high-level K under-thresholding
@@ -3852,7 +3988,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v16 · coupled engine K16 · coach 93 · balance-v1 talent · Calibration corpus enabled
+        Sokker Training Planner v17 · coupled engine K16 · coach 93 · balance-v1.1 talent · Calibration corpus enabled
       </div>
 
       {/* Mobile responsiveness — collapse 2-col grids below 720px */}
