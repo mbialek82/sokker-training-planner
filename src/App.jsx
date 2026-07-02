@@ -1,6 +1,101 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SOKKER TRAINING PLANNER v16 — user-friendliness release
+//
+// v16 (Jul 2026): UX-only. No engine, estimator, bundle-format, or corpus-
+// schema changes. Six changes from the simplification review:
+//
+//  1. DEMO PLAYER. "Try a demo player" buttons on Stage 0 and Stage 1 load
+//     DEMO_HISTORY_JSON — a fully SYNTHETIC 45-week history generated
+//     offline with the estimator-side forward model (eff(td)·XP vs
+//     _canonThr, XD=93/XG=14, coach 93) so the in-app estimate is self-
+//     consistent by construction: true YS 3.80, in-app estimate YS 3.82,
+//     band 73–79 DB, reliable_via_gap. Age 20→23 across three season
+//     boundaries (exercises _deriveStart). Demo loads route through the
+//     normal history path (applyHistoryText) with opts.demo, which
+//     SUPPRESSES the corpus submission — synthetic data never reaches
+//     Supabase — and raises a persistent demo banner.
+//
+//  2. HYBRID AUTO-RUN. The sim runs automatically once when a player
+//     first loads (no more empty results panel). After that, parameter
+//     edits only mark results STALE — dimmed, with a "parameters changed"
+//     ribbon and a rerun button; nothing recomputes behind the user's
+//     back, and the export/corpus snapshot keeps an explicit settled
+//     moment. Staleness = fingerprint mismatch (paramKey vs lastRunKey)
+//     over skills/subs/age/ssw/pos/weeks/talent/strategy set.
+//
+//  3. SIMPLE/ADVANCED SPLIT (Plan tab). Simple mode: talent (input +
+//     presets + estimate chip), position, and the v15 age/week horizon
+//     picker with the end-of-27 chip. Everything else — season week, raw
+//     weeks input, season presets, strategy multi-select, manual schedule
+//     — folds into an Advanced expander. Nothing removed, only deferred;
+//     a one-line summary under Run shows the active strategy set while
+//     Advanced is closed.
+//
+//  4. EXPORT MERGED INTO PLAN. Stage 3 is removed; the tab strip is
+//     How/Player/Plan. The full former export content (bundle explainer,
+//     plan picker, preview, download) lives unchanged in a collapsible
+//     "Save / export calibration bundle" card at the bottom of the Plan
+//     stage. The corpus-sharing toggle stays on the load flow.
+//
+//  5. JARGON PASS. "YS Talent" → "Talent (YS scale — 3.00 = best)";
+//     Start Season Week lives under Advanced with the auto-derived note
+//     surfaced next to the horizon picker; estimate-confidence badges get
+//     plain-language hover explanations (CONF_EXPLAIN).
+//
+//  6. VISUAL PASS. Cards drop their borders (background contrast instead),
+//     section labels recede, the Best banner carries the weighted score
+//     large, and below 720px the tab strip docks to the bottom of the
+//     viewport (thumb-reachable) with safe-area padding.
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// SOKKER TRAINING PLANNER v15 — game-look player cards + age-based horizon
+//
+// v15 (Jul 2026): UX-only release. No engine, estimator, or export changes.
+//
+//  1. GAME-LOOK PLAYER CARDS (SokkerCard). The Stage 2 results header's
+//     plain skill strip is replaced by two cards side by side — "Now" and
+//     "Projected" — laid out exactly like the in-game player card: header
+//     row (name, age), value row, form row, then the 4×2 skill grid in
+//     game order (stamina|keeper, pace|defender, technique|playmaker,
+//     passing|striker), each cell "levelname [N] skill". English level
+//     names (sokker_01 v23 canonical table, tragic[0]…superdivine[18]).
+//     Projected card reuses the game's green-pop convention: a skill that
+//     improved over the horizon renders green with a +N chip — the card
+//     reads like a training report from the future. Colors stay in the
+//     app theme (the game LAYOUT is what carries over, not the navy).
+//     Stamina/keeper are not simulated: shown from the paste card or the
+//     last history report when known ("?" otherwise) and carried
+//     unchanged onto the projected card. Value rows: current shows the
+//     actual card value when the paste path supplied one, otherwise the
+//     model estimate (Mikoos port); projected is always the model
+//     estimate, with a footnote stating the unchanged form/stamina/keeper
+//     assumption. Cards stack below ~680px (auto-fit grid).
+//
+//  2. PROJECTION STRATEGY IS USER-SELECTED. Strategy column headers in
+//     the comparison table are clickable; the selected column drives the
+//     Projected card (highlighted header + underline). Initial selection
+//     after each run = best weighted score, purely as a starting state.
+//     Falls back safely when the selected key disappears (rerun with
+//     fewer strategies, manual toggle off).
+//
+//  3. AGE-BASED HORIZON PICKER, DEFAULT "END OF 27". The horizon block
+//     gains an "until age XX, week YY" picker (age input + week 1–13
+//     select) that is a two-way view of the same `weeks` state: editing
+//     the picker recomputes weeks via _weeksUntil; editing weeks (or any
+//     preset) live-updates the picker via _horizonEnd. Sim semantics
+//     pinned against runPlan: week ssw is trained first, age increments
+//     after week 13 — so weeks = (14−ssw)+13·(XX−age−1)+YY for XX>age,
+//     YY−ssw+1 for XX==age. A "27yo" preset chip sits first in the preset
+//     row. DEFAULT ON PLAYER LOAD: history and paste loads set the
+//     horizon to end-of-27 (age≤27; falls back to the previous 52-week
+//     default for older players). Bundle loads keep their saved horizon
+//     unchanged (restoring a plan stays faithful). Age/ssw edits after
+//     load do NOT silently move the horizon — the picker just re-renders
+//     the equivalent endpoint.
+//
+// ═══════════════════════════════════════════════════════════════════════════
 // SOKKER TRAINING PLANNER v14 — coupled engine + balance talent + 2 bug fixes
 //
 // v14 (Jul 2026): Engine sync with desktop production + two field-reported
@@ -234,6 +329,26 @@ function _initSt(skills,a,te,subs){
   const st={};for(const sk of OS)st[sk]=_mkSub(skills[sk]||0,subs?.[sk]??0.25,sk,a,te);return st;
 }
 function _ageAfter(a,sw,wks){let s=sw,ag=a;for(let i=0;i<wks;i++){s++;if(s>_SL){s=1;ag++;}}return ag;}
+
+// v15: horizon ⇄ (target age, season week) conversion. Semantics pinned
+// against runPlan: the FIRST simulated week is trained at season week ssw,
+// age increments after week 13 is trained (sw++ / rollover in the loop).
+// _weeksUntil: number of training weeks so the LAST trained week is season
+// week tWeek of the season in which the player is age tAge (inclusive).
+// Returns null when the target lies in the past. End-of-27 default =
+// _weeksUntil(age, ssw, 27, 13).
+function _weeksUntil(age,ssw,tAge,tWeek){
+  if(!isFinite(age)||!isFinite(ssw)||!isFinite(tAge)||!isFinite(tWeek))return null;
+  if(tAge<age)return null;
+  if(tAge===age)return tWeek>=ssw?tWeek-ssw+1:null;
+  return (_SL-ssw+1)+_SL*(tAge-age-1)+tWeek;
+}
+// Inverse view: (age, season week) of the LAST trained week after `weeks`
+// training weeks starting from (age, ssw). Closed-form, no walk needed.
+function _horizonEnd(age,ssw,weeks){
+  const t=ssw-1+Math.max(1,weeks|0)-1; // 0-based index of last trained week from season start
+  return{age:age+Math.floor(t/_SL),week:(t%_SL)+1};
+}
 
 // v14: derive the sim starting (age, ssw) from a training history, handling
 // the season rollover (Lipa91 report, 2026-06-22): reports are Thursday
@@ -1758,6 +1873,41 @@ const C={bg:"#0c0e14",card:"#14171f",hi:"#1a1e29",bdr:"#252a38",
   acc:"#4a90d9",pop:"#48c774",warn:"#f5a623",tx:"#dfe3ed",txD:"#8a96a8",txM:"#4e5a6e",red:"#ef4444"};
 // v8.4: Canonical per-skill chip colors for Manual Schedule
 const SK_COLORS={pace:"#4a90d9",technique:"#48c774",passing:"#a78bfa",defending:"#f5a623",playmaking:"#ec4899",striker:"#ef4444"};
+// v15: canonical English level names (sokker_01 v23 table, display 0–18).
+// Lowercase for in-card sentence fidelity ("solid [8] keeper").
+const LEVEL_NAMES=["tragic","hopeless","unsatisfactory","poor","weak","average",
+  "adequate","good","solid","very good","excellent","formidable","outstanding",
+  "incredible","brilliant","magical","unearthly","divine","superdivine"];
+// v15: game-card skill grid — 4 rows × 2 columns, exact in-game order and
+// the in-game English skill nouns (kondycja→stamina, bramkarz→keeper,
+// obrońca→defender, rozgrywający→playmaker, strzelec→striker).
+const CARD_GRID=[
+  [["stamina","stamina"],["keeper","keeper"]],
+  [["pace","pace"],["defending","defender"]],
+  [["technique","technique"],["playmaking","playmaker"]],
+  [["passing","passing"],["striker","striker"]],
+];
+// v16: synthetic demo player. Generated OFFLINE with the estimator-side
+// forward model (eff(td)·XP vs _canonThr, XD=93/XG=14 at intensity 100,
+// coach 93) so the in-app talent estimate is self-consistent by
+// construction: true YS 3.80 (td 76.6); estimateTalentCombined on this
+// history returns YS 3.82, band 73–79 DB, reliable_via_gap. 45 weekly
+// individual-training reports (defending-heavy DEF plan), age 20→23,
+// spans three season boundaries so _deriveStart resolves ssw. NOT a real
+// Sokker player — demo loads NEVER submit to the corpus (opts.demo).
+const DEMO_PLAYER_NAME="Demo Defender";
+// v16: plain-language explanations for the estimate confidence labels
+const CONF_EXPLAIN={
+  reliable:"History is long and informative enough to trust this estimate.",
+  reliable_via_gap:"History is long and informative enough to trust this estimate.",
+  indicative:"A useful hint, but the history can't fully pin the talent down.",
+  ceiling_pinned:"Evidence points at (or past) the top of the scale.",
+  floor_pinned:"Evidence points at (or past) the bottom of the scale.",
+  weak:"Only weak evidence — treat as a rough hint.",
+  unreliable:"The history contradicts itself somewhat — treat with caution.",
+  no_data:"The history is too short to infer anything.",
+};
+const DEMO_HISTORY_JSON=JSON.stringify({"reports":[{"week":901,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":9,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":430207}},{"week":902,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":9,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":451911}},{"week":903,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":10,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":0,"striker":0},"playerValue":{"value":476506}},{"week":904,"age":20,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":10,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":493900}},{"week":905,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":10,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":522471}},{"week":906,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":10,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":553421}},{"week":907,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":11,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":0,"striker":0},"playerValue":{"value":584610}},{"week":908,"age":20,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":9,"technique":7,"passing":6,"defending":11,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":1,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":603748}},{"week":909,"age":21,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":6,"defending":11,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":1,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":617303}},{"week":910,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":6,"defending":11,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":645454}},{"week":911,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":6,"defending":11,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":675268}},{"week":912,"age":21,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":6,"defending":11,"playmaking":8,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":1,"striker":0},"playerValue":{"value":694227}},{"week":913,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":11,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":1,"defending":0,"playmaking":0,"striker":1},"playerValue":{"value":725947}},{"week":914,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":0,"striker":0},"playerValue":{"value":761363}},{"week":915,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":801853}},{"week":916,"age":21,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":823826}},{"week":917,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":867734}},{"week":918,"age":21,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":889891}},{"week":919,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":937514}},{"week":920,"age":21,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":962174}},{"week":921,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":0,"striker":0},"playerValue":{"value":1006246}},{"week":922,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1036453}},{"week":923,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1079410}},{"week":924,"age":22,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":10,"technique":8,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":1,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1104933}},{"week":925,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":8,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1150775}},{"week":926,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":8,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1198819}},{"week":927,"age":22,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":1,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1222773}},{"week":928,"age":22,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1251058}},{"week":929,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":14,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":0,"striker":0},"playerValue":{"value":1306659}},{"week":930,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":14,"playmaking":8,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":1},"playerValue":{"value":1367634}},{"week":931,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":8,"defending":14,"playmaking":8,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":1,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1431845}},{"week":932,"age":22,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":8,"defending":14,"playmaking":8,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1464036}},{"week":933,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":8,"defending":14,"playmaking":8,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1532425}},{"week":934,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":8,"defending":14,"playmaking":8,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1604596}},{"week":935,"age":23,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":8,"defending":15,"playmaking":8,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":0,"striker":0},"playerValue":{"value":1630906}},{"week":936,"age":23,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":11,"technique":9,"passing":8,"defending":15,"playmaking":8,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":1,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1659868}},{"week":937,"age":23,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":11,"technique":9,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":1,"striker":0},"playerValue":{"value":1717957}},{"week":938,"age":23,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":11,"technique":9,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1778043}},{"week":939,"age":23,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":11,"technique":9,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1840468}},{"week":940,"age":23,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":11,"technique":9,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1869707}},{"week":941,"age":23,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":11,"technique":9,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1935105}},{"week":942,"age":23,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":11,"technique":9,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":2003045}},{"week":943,"age":23,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":11,"technique":9,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":2073625}},{"week":944,"age":23,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":11,"technique":9,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":2105438}},{"week":945,"age":23,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":11,"technique":10,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":1,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":2135263}}]});
 const _ft="'JetBrains Mono','Fira Code',monospace";
 const _fs="'DM Sans','Segoe UI',system-ui,sans-serif";
 
@@ -1804,6 +1954,73 @@ function SubBar({value,onChange,color}){
 }
 
 // ─── SkillEditor: unified skill + subskill input ──────────────────────────
+// ─── v15: Game-look player card ─────────────────────────────────────────────
+// Renders a player the way the in-game card does: header (name, age), value,
+// form, then the 4×2 skill grid (CARD_GRID order) as "levelname [N] skill".
+// deltas: {sk: levelsGained} — a gained skill renders green with a +N chip,
+// mirroring the game's green-pop convention (green = went up since last
+// report; here: since "Now"). skills may miss stamina/keeper (not simulated)
+// → "?". value/form rows render only when a value/form is supplied.
+function SokkerCard({title,name,age,skills,form,value,valueLabel,deltas,footnote}){
+  const cell=(sk,label)=>{
+    const lv=skills?.[sk];
+    const gained=deltas?.[sk]||0;
+    const known=Number.isFinite(lv);
+    return(
+      <div key={sk} style={{padding:"7px 12px",borderBottom:`1px solid ${C.bdr}55`,fontSize:13,
+        display:"flex",alignItems:"baseline",gap:5,minWidth:0}}>
+        {known?(
+          <>
+            <span style={{fontWeight:700,color:gained>0?C.pop:C.tx,whiteSpace:"nowrap"}}>
+              {LEVEL_NAMES[Math.max(0,Math.min(18,lv))]} [{lv}]
+            </span>
+            <span style={{color:C.txD,whiteSpace:"nowrap"}}>{label}</span>
+            {gained>0&&(
+              <span style={{fontSize:10,fontWeight:700,color:C.pop,background:C.pop+"1c",
+                borderRadius:3,padding:"0 4px",fontFamily:_ft}}>+{gained}</span>
+            )}
+          </>
+        ):(
+          <>
+            <span style={{fontWeight:700,color:C.txM}}>?</span>
+            <span style={{color:C.txM}}>{label}</span>
+          </>
+        )}
+      </div>
+    );
+  };
+  return(
+    <div style={{background:C.card,border:`1px solid ${C.bdr}`,borderRadius:8,overflow:"hidden",flex:1,minWidth:280}}>
+      <div style={{background:C.hi,padding:"9px 12px",display:"flex",alignItems:"baseline",gap:8,
+        borderBottom:`1px solid ${C.bdr}`}}>
+        <span style={{fontWeight:700,fontSize:14,color:C.tx}}>{name||"Player"}</span>
+        {Number.isFinite(age)&&<span style={{fontSize:13,color:C.txD}}>age: <b style={{color:C.tx}}>{age}</b></span>}
+        {title&&<span style={{marginLeft:"auto",fontSize:10,fontWeight:700,letterSpacing:0.6,
+          color:C.txD,textTransform:"uppercase"}}>{title}</span>}
+      </div>
+      {Number.isFinite(value)&&(
+        <div style={{padding:"7px 12px",borderBottom:`1px solid ${C.bdr}55`,fontSize:13}}>
+          <span style={{color:C.txD}}>value{valueLabel?` (${valueLabel})`:""}: </span>
+          <b style={{color:C.red}}>{Math.round(value).toLocaleString("pl-PL").replace(/,/g," ")} zł</b>
+        </div>
+      )}
+      {Number.isFinite(form)&&(
+        <div style={{padding:"7px 12px",borderBottom:`1px solid ${C.bdr}55`,fontSize:13}}>
+          <span style={{fontWeight:700,color:form<=5?C.red:form>=11?C.pop:C.tx}}>
+            {LEVEL_NAMES[Math.max(0,Math.min(18,form))]} [{form}]</span>
+          <span style={{color:C.txD}}> form</span>
+        </div>
+      )}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr"}}>
+        {CARD_GRID.map(row=>row.map(([sk,label])=>cell(sk,label)))}
+      </div>
+      {footnote&&(
+        <div style={{padding:"6px 12px",fontSize:10,color:C.txM,lineHeight:1.35}}>{footnote}</div>
+      )}
+    </div>
+  );
+}
+
 function SkillEditor({skills,setSkills,subs,setSubs,age,setAge,pos,name,warnings,editable=true,talentEstimate}){
   const prof=POS[pos];
   // v13: small badge showing the gap-based talent estimate next to the age,
@@ -1970,6 +2187,27 @@ export default function App(){
   const[selStrats,setSelStrats]=useState(["round_robin","closest_to_pop","sale_optimizer"]);
   const[results,setResults]=useState(null);
   const[showLog,setShowLog]=useState(null);
+  // v15: which strategy drives the Projected card. Set to best weighted
+  // score on each run (initial state only — user overrides by clicking a
+  // strategy column header in the comparison table).
+  const[projStrat,setProjStrat]=useState(null);
+  // v16: demo-player session flag (suppresses corpus, shows the banner)
+  const[demoMode,setDemoMode]=useState(false);
+  // v16: hybrid auto-run — key of the params the current results were
+  // computed from; mismatch with the live params marks results stale.
+  const[lastRunKey,setLastRunKey]=useState(null);
+  // v16: simple/advanced split + export panel collapse
+  const[advOpen,setAdvOpen]=useState(false);
+  const[exportOpen,setExportOpen]=useState(false);
+  // v16: viewport width — below 720px the tab strip docks to the bottom
+  // (thumb-reachable) and the page gains bottom padding to clear it.
+  const[winW,setWinW]=useState(typeof window!=="undefined"?window.innerWidth:1280);
+  useEffect(()=>{
+    const f=()=>setWinW(window.innerWidth);
+    window.addEventListener("resize",f);
+    return()=>window.removeEventListener("resize",f);
+  },[]);
+  const isMobile=winW<720;
   // v8.3: which plans the user has selected to include in the export bundle
   // (independent of the share-to-corpus flow, which always includes everything)
   const[planExportSel,setPlanExportSel]=useState({});
@@ -2015,6 +2253,22 @@ export default function App(){
     return Object.keys(m).length?m:null;
   },[results,manualResult]);
 
+  // v15: non-simulated card fields (stamina, keeper, form, actual value)
+  // pulled from whichever load path supplied them — paste card first, then
+  // the last training report. All optional; SokkerCard renders "?" / omits
+  // rows when absent.
+  const cardMeta=useMemo(()=>{
+    const lastRep=historyReports?.length?historyReports[historyReports.length-1]:null;
+    const num=v=>{const n=parseInt(v,10);return isFinite(n)?n:null;};
+    return{
+      stamina:num(parsed?.skills?.stamina)??num(lastRep?.skills?.stamina),
+      keeper:num(parsed?.skills?.keeper)??num(lastRep?.skills?.keeper),
+      form:num(parsed?.form)??num(lastRep?.skills?.form),
+      actualValue:(parsed?.value&&parsed.value>0)?parsed.value
+        :(lastRep?.playerValue?.value&&lastRep.playerValue.value>0)?lastRep.playerValue.value:null,
+    };
+  },[parsed,historyReports]);
+
   // Keep planExportSel.manual in sync with manual existence
   useEffect(()=>{
     if(manualResult&&!(("manual" in planExportSel))){
@@ -2026,7 +2280,11 @@ export default function App(){
   const handleParse=useCallback(()=>{
     if(!paste.trim())return;
     const p=parsePaste(paste);setParsed(p);
+    setDemoMode(false); // v16: pasting a real card leaves demo mode
     if(p.age)setAge(p.age);
+    // v15: default horizon = end of age 27 (paste path uses the current
+    // ssw — unknown from a card paste). Older players keep the 52 default.
+    if(p.age&&p.age<=27){const w=_weeksUntil(p.age,ssw,27,_SL);if(w)setWeeks(w);}
     const sk={};for(const s of OS)sk[s]=p.skills[s]??0;
     setSkills(sk);
     // v7.1: estimate subskills from card value (Mikoos uniform anchor)
@@ -2045,15 +2303,20 @@ export default function App(){
     }
     setPlayerName(p.name||"");setPlayerWarnings(p.warnings||[]);
     setHasPlayerData(true);
-  },[paste]);
+  },[paste,ssw]); // v15: ssw feeds the end-of-27 default horizon
 
-  const handleLoadHistory=useCallback(()=>{
+  // v16: shared load core. handleLoadHistory feeds it the textarea; the
+  // demo-player button feeds it the embedded synthetic history. opts.demo
+  // suppresses the corpus submission (synthetic data must NEVER reach
+  // Supabase) and labels the session as a demo.
+  const applyHistoryText=useCallback((text,opts={})=>{
     setHistoryError("");
-    if(!historyText.trim()){setHistoryError("Paste training history first.");return;}
+    if(!text.trim()){setHistoryError("Paste training history first.");return;}
     let reports;
-    try{reports=parseTrainingData(historyText);}
+    try{reports=parseTrainingData(text);}
     catch(ex){setHistoryError(ex.message||"Parse failed.");return;}
-    const meta=historyText.trim().startsWith("<")?detectPlayerMeta(historyText):{};
+    const meta=text.trim().startsWith("<")?detectPlayerMeta(text):{};
+    setDemoMode(!!opts.demo);
     setHistoryReports(reports);setHistoryMeta(meta);
     const last=reports[reports.length-1];
     if(last){
@@ -2066,6 +2329,14 @@ export default function App(){
         else if(d.ssw!=null)setSeasonNote(`Season week auto-set to ${d.ssw} from the report stream.`);
         else setSeasonNote("");
       }else if(last.age)setAge(last.age);
+      // v15: default horizon = end of age 27, from the derived (age, ssw)
+      // when the rollover derivation resolved them, else last-report age +
+      // current ssw. Older players keep the existing horizon.
+      {
+        const hA=d?.age??(last.age?parseInt(last.age,10):null);
+        const hS=d?.ssw??ssw;
+        if(hA&&hA<=27){const w=_weeksUntil(hA,hS,27,_SL);if(w)setWeeks(w);}
+      }
       const sk={};for(const s of OS)sk[s]=last.skills?.[s]??0;
       setSkills(sk);
       // v7.2: full forward simulation per skill (replaces uniform Mikoos)
@@ -2097,7 +2368,7 @@ export default function App(){
       // CRITICAL: fold in PID from the form field — Sokker's JSON endpoint
       // doesn't carry the PID inside the response, only in the URL the user
       // requested. Without this, every JSON-loaded bundle is anonymous.
-      if(shareEnabled){
+      if(shareEnabled&&!opts.demo){
         setShareStatus(""); // clear any previous status
         const pidNum=pid&&/^\d+$/.test(pid)?parseInt(pid,10):null;
         const subsForBundle={};
@@ -2115,7 +2386,7 @@ export default function App(){
         }
         const bundle=buildBundle({
           reports,
-          rawText:historyText,
+          rawText:text,
           playerMeta:{...meta,player_id:meta?.player_id||pidNum},
           skills:sk,
           subs:subsForBundle,
@@ -2131,7 +2402,24 @@ export default function App(){
         });
       }
     }
-  },[historyText,playerName,ysTalent,shareEnabled,pos,weeks,ssw,pid,results]);
+  },[playerName,ysTalent,shareEnabled,pos,weeks,ssw,pid,results]);
+  const handleLoadHistory=useCallback(()=>applyHistoryText(historyText),[applyHistoryText,historyText]);
+
+  // v16: demo player — one-click first experience. Loads the embedded
+  // synthetic history through the exact same path as a real paste.
+  const loadDemo=useCallback(()=>{
+    setPid("");setPlayerName(DEMO_PLAYER_NAME);
+    setTilesOn({card:false,history:true,manual:false});
+    setHistoryText(DEMO_HISTORY_JSON);
+    applyHistoryText(DEMO_HISTORY_JSON,{demo:true});
+    setStage("player");
+  },[applyHistoryText]);
+
+  // v16: hybrid auto-run. The sim-parameter fingerprint the results were
+  // computed against; any live mismatch renders the stale ribbon.
+  const paramKey=useMemo(()=>JSON.stringify([skills,subs,age,ssw,pos,weeks,ysTalent,[...selStrats].sort()]),
+    [skills,subs,age,ssw,pos,weeks,ysTalent,selStrats]);
+  const resultsStale=!!results&&lastRunKey!==null&&paramKey!==lastRunKey;
 
   // v8.1: load a previously-exported calibration bundle from disk.
   // Restores the same state Load History would produce, but skips corpus
@@ -2139,6 +2427,7 @@ export default function App(){
   const handleLoadBundle=useCallback((file)=>{
     if(!file)return;
     setHistoryError("");
+    setDemoMode(false); // v16: loading a real bundle leaves demo mode
     const reader=new FileReader();
     reader.onerror=()=>setHistoryError("Could not read file.");
     reader.onload=()=>{
@@ -2299,7 +2588,19 @@ export default function App(){
     // v8.3: default-select all newly-computed plans for export
     const sel={};for(const k of Object.keys(res))sel[k]=true;
     setPlanExportSel(sel);
-  },[skills,td,age,ssw,pos,weeks,selStrats,subsFloat]);
+    // v15: initial projection = best weighted score of this run
+    const rk=Object.keys(res);
+    if(rk.length)setProjStrat(rk.reduce((a,b)=>wScore(res[a])>=wScore(res[b])?a:b));
+    // v16: fingerprint the params these results answer (staleness ribbon)
+    setLastRunKey(paramKey);
+  },[skills,td,age,ssw,pos,weeks,selStrats,subsFloat,paramKey]);
+
+  // v16: hybrid auto-run — run once when a player first loads (kills the
+  // empty results panel). Parameter edits afterwards only mark results
+  // stale; the user reruns explicitly.
+  useEffect(()=>{
+    if(hasPlayerData&&!results&&selStrats.length)runSim();
+  },[hasPlayerData,results,selStrats,runSim]);
 
   // v8.4: Manual Schedule mutation handlers — each snapshots before mutating
   // so Undo can step back through any number of changes.
@@ -2374,8 +2675,10 @@ export default function App(){
   }
 
   // ─── Shared styles ─────────────────────────────────────────────────────
-  const sC={background:C.card,border:`1px solid ${C.bdr}`,borderRadius:8,padding:"16px 20px",marginBottom:12};
-  const sL={fontSize:11,fontFamily:_fs,color:C.txD,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:4};
+  // v16: visual pass — cards distinguish by background contrast instead
+  // of borders; labels recede; one accent color for actions.
+  const sC={background:C.card,borderRadius:10,padding:"16px 20px",marginBottom:12};
+  const sL={fontSize:10,fontFamily:_fs,color:C.txM,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:4};
   const sI={background:C.bg,border:`1px solid ${C.bdr}`,borderRadius:6,color:C.tx,fontFamily:_ft,fontSize:13,padding:"8px 10px",width:"100%",outline:"none",boxSizing:"border-box"};
   const sSel={...sI,cursor:"pointer",appearance:"none",paddingRight:28,backgroundImage:`url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%238a96a8' stroke-width='1.5'/%3E%3C/svg%3E")`,backgroundRepeat:"no-repeat",backgroundPosition:"right 10px center"};
   const sB={background:C.acc,color:"#fff",border:"none",borderRadius:6,padding:"10px 20px",fontFamily:_fs,fontWeight:600,fontSize:14,cursor:"pointer"};
@@ -2435,7 +2738,8 @@ export default function App(){
   // RENDER
   // ═══════════════════════════════════════════════════════════════════════
   return(
-    <div style={{background:C.bg,minHeight:"100vh",color:C.tx,fontFamily:_fs,padding:"20px 24px"}}>
+    <div style={{background:C.bg,minHeight:"100vh",color:C.tx,fontFamily:_fs,
+      padding:isMobile?"16px 14px 84px":"20px 24px"}}>
       {/* ── Header ───────────────────────────────────────────────────── */}
       <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:4}}>
         <span style={{fontSize:22,fontWeight:700,color:C.acc,fontFamily:_ft}}>⚽ Sokker Training Planner</span>
@@ -2445,14 +2749,25 @@ export default function App(){
         Load a player, plan their training, export a calibration bundle.
       </div>
 
+      {/* v16: demo-mode banner — visible on every stage while active */}
+      {demoMode&&(
+        <div style={{background:C.warn+"18",border:`1px solid ${C.warn}66`,borderRadius:8,
+          padding:"8px 14px",marginBottom:12,fontSize:12,color:C.warn,display:"flex",alignItems:"center",gap:10}}>
+          <span>🧪 <b>Demo player</b> — a synthetic history generated by the engine (not a real Sokker player). Nothing is submitted to the corpus. Load your own player on the Player tab any time.</span>
+        </div>
+      )}
+
       {/* ── Stage tabs (freely navigable) ────────────────────────────── */}
       {/* v13: added "How" tab (Stage 0). Numbered 0 to keep Player/Plan/
           Export at their familiar positions. */}
-      <div style={{display:"flex",gap:8,maxWidth:1300,marginBottom:20}}>
+      <div style={isMobile?{
+        position:"fixed",bottom:0,left:0,right:0,zIndex:50,display:"flex",gap:0,
+        background:C.card,borderTop:`1px solid ${C.bdr}`,padding:"6px 8px",
+        paddingBottom:"calc(6px + env(safe-area-inset-bottom))"}
+        :{display:"flex",gap:8,maxWidth:1300,marginBottom:20}}>
         {stageTab("intro","How",0)}
         {stageTab("player","Player",1)}
         {stageTab("plan","Plan",2)}
-        {stageTab("export","Export",3)}
       </div>
 
       {/* ═════════════════════════════════════════════════════════════════ */}
@@ -2556,6 +2871,11 @@ export default function App(){
               style={{...sB,fontSize:14,padding:"12px 28px"}}>
               Get started — load a player →
             </button>
+            <button onClick={loadDemo}
+              style={{...sBs,marginLeft:10,padding:"12px 22px",fontSize:14,borderColor:C.pop+"88",color:C.pop}}
+              title="Loads a synthetic engine-generated player — see the whole tool working in one click">
+              🧪 Try a demo player
+            </button>
           </div>
         </div>
       )}
@@ -2609,6 +2929,16 @@ export default function App(){
           <div style={{display:"grid",gridTemplateColumns:"minmax(0,1fr) minmax(0,1fr)",gap:16}}
             className="player-stage-grid">
             {/* LEFT: input tiles + their active blocks */}
+            {/* v16: one-click demo entry point */}
+            {!hasPlayerData&&(
+              <div style={{gridColumn:"1 / -1",display:"flex",alignItems:"center",gap:10,
+                background:C.card,borderRadius:8,padding:"10px 14px",marginBottom:4}}>
+                <span style={{fontSize:12,color:C.txD}}>No player at hand?</span>
+                <button onClick={loadDemo} style={{...sBs,padding:"6px 14px",fontSize:12,borderColor:C.pop+"88",color:C.pop}}>
+                  🧪 Try a demo player
+                </button>
+              </div>
+            )}
             <div>
               <div style={sC}>
                 <div style={sL}>How are you loading this player?</div>
@@ -2790,12 +3120,12 @@ export default function App(){
             {/* LEFT: parameters + strategies + run */}
             <div>
               <div style={sC}>
-                <div style={sL}>YS Talent</div>
+                <div style={sL}>Talent</div>
                 <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6}}>
                   <input type="text" value={ysTalent}
                     onChange={e=>{const v=e.target.value;if(/^\d*\.?\d*$/.test(v))setYsTalent(v);}}
                     style={{...sI,width:80,textAlign:"center",fontSize:16,fontWeight:700}}/>
-                  <span style={{fontSize:12,color:C.txM}}>Lower = better (3.00 = max)</span>
+                  <span style={{fontSize:12,color:C.txM}}>YS scale — 3.00 = best, lower is better</span>
                 </div>
                 <div style={{display:"flex",flexWrap:"wrap",gap:3,marginBottom:12}}>
                   {YS_PRESETS.map(p=>(
@@ -2850,9 +3180,9 @@ export default function App(){
                                 ({ysLo.toFixed(2)}–{ysHi.toFixed(2)})
                               </span>
                             )}
-                            <span style={{
+                            <span title={CONF_EXPLAIN[e.confidence]||""} style={{
                               padding:"1px 6px",borderRadius:3,fontSize:10,fontWeight:600,
-                              background:cBd,color:"#fff",letterSpacing:0.3,
+                              background:cBd,color:"#fff",letterSpacing:0.3,cursor:"help",
                             }}>{e.confidence}</span>
                             <span style={{color:C.txM}}>
                               · {isBal?`balance · ${e.balance.nEvents} event${e.balance.nEvents===1?"":"s"}`:`gaps · ${e.nGaps}`}
@@ -2890,79 +3220,149 @@ export default function App(){
                     </div>
                   );
                 })()}
-                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-                  <div>
-                    <div style={sL}>Position</div>
-                    <select value={pos} onChange={e=>setPos(e.target.value)} style={sSel}>
-                      {Object.entries(POS).map(([k,v])=><option key={k} value={k}>{v.name} — {v.d}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <div style={sL}>Start Season Week</div>
-                    <input type="number" min={1} max={13} value={ssw}
-                      onChange={e=>setSsw(Math.max(1,Math.min(13,parseInt(e.target.value)||1)))}
-                      style={{...sI,width:60}}/>
-                    {seasonNote&&(
-                      <div style={{fontSize:9,color:C.warn,marginTop:3,maxWidth:180,lineHeight:1.3}}>
-                        🗓 auto-derived from history
+                <div>
+                  <div style={sL}>Position</div>
+                  <select value={pos} onChange={e=>setPos(e.target.value)} style={sSel}>
+                    {Object.entries(POS).map(([k,v])=><option key={k} value={k}>{v.name} — {v.d}</option>)}
+                  </select>
+                </div>
+                <div style={{...sL,marginTop:10}}>Training horizon</div>
+                {/* v16: simple mode shows only the age/week picker (v15's
+                    two-way view of `weeks`) and the 27yo default chip; the
+                    raw weeks input and season chips live under Advanced. */}
+                {(()=>{
+                  const end=_horizonEnd(age,ssw,weeks);
+                  const w27=_weeksUntil(age,ssw,27,_SL);
+                  const setTarget=(tA,tW)=>{
+                    const w=_weeksUntil(age,ssw,tA,tW);
+                    if(w)setWeeks(w);
+                  };
+                  return(
+                    <>
+                      <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                        <span style={{fontSize:11,color:C.txD}}>until age</span>
+                        <input type="number" min={age} max={40} value={end.age}
+                          onChange={e=>{const v=parseInt(e.target.value,10);
+                            if(isFinite(v))setTarget(Math.max(age,Math.min(40,v)),end.week);}}
+                          style={{...sI,width:52,textAlign:"center"}}/>
+                        <span style={{fontSize:11,color:C.txD}}>week</span>
+                        <select value={end.week}
+                          onChange={e=>setTarget(end.age,parseInt(e.target.value,10))}
+                          style={{...sSel,width:60}}>
+                          {Array.from({length:_SL},(_,i)=>i+1).map(w=>(
+                            <option key={w} value={w} disabled={end.age===age&&w<ssw}>{w}</option>
+                          ))}
+                        </select>
+                        <span style={{fontSize:11,color:C.txM}}>
+                          = {weeks} wk ({(weeks/13).toFixed(1)}s)
+                        </span>
+                        {w27&&(
+                          <button onClick={()=>setWeeks(w27)} title="Train until the last week before he turns 28 — the default" style={{
+                            ...sBs,padding:"2px 8px",fontSize:10,fontWeight:700,
+                            ...(weeks===w27?{background:C.pop,color:"#fff",borderColor:C.pop}:{borderColor:C.pop+"88",color:C.pop}),
+                          }}>end of 27</button>
+                        )}
                       </div>
-                    )}
-                  </div>
-                </div>
-                <div style={{...sL,marginTop:10}}>Training Horizon (weeks)</div>
-                <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-                  <input type="number" min={1} max={500} value={weeks}
-                    onChange={e=>setWeeks(Math.max(1,parseInt(e.target.value)||1))}
-                    style={{...sI,width:80}}/>
-                  <span style={{fontSize:11,color:C.txM}}>= {(weeks/13).toFixed(1)} seasons</span>
-                  <div style={{display:"flex",gap:3,marginLeft:8}}>
-                    {[13,26,39,52,78,104].map(w=>(
-                      <button key={w} onClick={()=>setWeeks(w)} style={{
-                        ...sBs,padding:"2px 8px",fontSize:10,...(weeks===w?{background:C.acc,color:"#fff",borderColor:C.acc}:{}),
-                      }}>{w/13}s</button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-
-              <div style={sC}>
-                <div style={sL}>Compare Strategies</div>
-                <div style={{display:"flex",flexDirection:"column",gap:4,marginTop:4}}>
-                  {Object.entries(validStrats).map(([k,v])=>{
-                    const sel=selStrats.includes(k);const isSale=k==="sale_optimizer";
-                    return(
-                      <button key={k} onClick={()=>setSelStrats(p=>sel?p.filter(s=>s!==k):[...p,k])} style={{
-                        ...sBs,textAlign:"left",fontSize:12,display:"flex",justifyContent:"space-between",alignItems:"center",
-                        ...(sel?{background:(isSale?C.warn:C.acc)+"22",borderColor:isSale?C.warn:C.acc,color:isSale?C.warn:C.acc}:{}),
-                      }}>
-                        <span>{sel?"✓ ":"  "}{v.name} {isSale&&"💰"}</span>
-                        <span style={{fontSize:10,color:C.txM,fontWeight:400}}>{v.desc}</span>
-                      </button>
-                    );
-                  })}
-                </div>
+                      {seasonNote&&(
+                        <div style={{fontSize:10,color:C.warn,marginTop:5,lineHeight:1.35}}>🗓 {seasonNote}</div>
+                      )}
+                    </>
+                  );
+                })()}
               </div>
 
               <button onClick={runSim} disabled={selStrats.length===0||!hasPlayerData}
                 style={{...sB,width:"100%",fontSize:16,padding:"14px 20px",
+                  background:resultsStale?C.warn:C.acc,
                   opacity:(selStrats.length===0||!hasPlayerData)?0.4:1,
                   cursor:(selStrats.length===0||!hasPlayerData)?"not-allowed":"pointer"}}>
-                ▶ Run Simulation
+                {resultsStale?"↻ Rerun — parameters changed":results?"↻ Rerun Simulation":"▶ Run Simulation"}
               </button>
+              {!advOpen&&(
+                <div style={{fontSize:10,color:C.txM,marginTop:6,lineHeight:1.4}}>
+                  Comparing: {selStrats.map(k=>allStrats[k]?.name||k).join(", ")||"—"}
+                  {manualEnabled?" · manual schedule active":""} — change under Advanced.
+                </div>
+              )}
 
-              {/* v8.4: Manual Schedule toggle */}
-              <button onClick={manualToggle} disabled={!hasPlayerData}
-                style={{...sB,width:"100%",fontSize:13,padding:"10px 16px",marginTop:8,
-                  background:manualEnabled?C.warn:C.hi,
-                  color:manualEnabled?"#fff":C.txD,
-                  border:manualEnabled?"none":`1px solid ${C.bdr}`,
-                  opacity:hasPlayerData?1:0.4,cursor:hasPlayerData?"pointer":"not-allowed"}}>
-                {manualEnabled?"✓ Manual Schedule active — editor below":"✏️ Build Manual Schedule"}
-              </button>
+              {/* v16: Advanced expander — season week, raw horizon input,
+                  strategy set, manual schedule. Nothing removed from v15,
+                  only deferred. */}
+              <div style={{...sC,marginTop:12,padding:advOpen?"14px 20px":"0"}}>
+                <button onClick={()=>setAdvOpen(o=>!o)} style={{
+                  background:"transparent",border:"none",color:C.txD,fontFamily:_fs,
+                  fontWeight:600,fontSize:12,cursor:"pointer",width:"100%",textAlign:"left",
+                  padding:advOpen?"0 0 10px":"12px 20px",letterSpacing:0.3}}>
+                  {advOpen?"▾":"▸"} Advanced
+                </button>
+                {advOpen&&(
+                  <>
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
+                      <div>
+                        <div style={sL}>Start season week</div>
+                        <input type="number" min={1} max={13} value={ssw}
+                          onChange={e=>setSsw(Math.max(1,Math.min(13,parseInt(e.target.value)||1)))}
+                          style={{...sI,width:60}}/>
+                        {seasonNote&&(
+                          <div style={{fontSize:9,color:C.warn,marginTop:3,lineHeight:1.3}}>
+                            🗓 auto-derived from history
+                          </div>
+                        )}
+                      </div>
+                      <div>
+                        <div style={sL}>Horizon (weeks)</div>
+                        <input type="number" min={1} max={500} value={weeks}
+                          onChange={e=>setWeeks(Math.max(1,parseInt(e.target.value)||1))}
+                          style={{...sI,width:80}}/>
+                      </div>
+                    </div>
+                    <div style={{display:"flex",gap:3,flexWrap:"wrap",marginBottom:14}}>
+                      {[13,26,39,52,78,104].map(w=>(
+                        <button key={w} onClick={()=>setWeeks(w)} style={{
+                          ...sBs,padding:"2px 8px",fontSize:10,...(weeks===w?{background:C.acc,color:"#fff",borderColor:C.acc}:{}),
+                        }}>{w/13}s</button>
+                      ))}
+                    </div>
+                    <div style={sL}>Compare strategies</div>
+                    <div style={{display:"flex",flexDirection:"column",gap:4,marginTop:4,marginBottom:12}}>
+                      {Object.entries(validStrats).map(([k,v])=>{
+                        const sel=selStrats.includes(k);const isSale=k==="sale_optimizer";
+                        return(
+                          <button key={k} onClick={()=>setSelStrats(p=>sel?p.filter(x=>x!==k):[...p,k])} style={{
+                            ...sBs,textAlign:"left",fontSize:12,display:"flex",justifyContent:"space-between",alignItems:"center",
+                            ...(sel?{background:(isSale?C.warn:C.acc)+"22",borderColor:isSale?C.warn:C.acc,color:isSale?C.warn:C.acc}:{}),
+                          }}>
+                            <span>{sel?"✓ ":"  "}{v.name} {isSale&&"💰"}</span>
+                            <span style={{fontSize:10,color:C.txM,fontWeight:400}}>{v.desc}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {/* v8.4: Manual Schedule toggle */}
+                    <button onClick={manualToggle} disabled={!hasPlayerData}
+                      style={{...sB,width:"100%",fontSize:13,padding:"10px 16px",
+                        background:manualEnabled?C.warn:C.hi,
+                        color:manualEnabled?"#fff":C.txD,
+                        border:manualEnabled?"none":`1px solid ${C.bdr}`,
+                        opacity:hasPlayerData?1:0.4,cursor:hasPlayerData?"pointer":"not-allowed"}}>
+                      {manualEnabled?"✓ Manual Schedule active — editor below":"✏️ Build Manual Schedule"}
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
 
             {/* RIGHT: results */}
             <div>
+              {/* v16: hybrid staleness — parameter edits after a run dim
+                  the results and surface a rerun ribbon; nothing recomputes
+                  behind the user's back. */}
+              {resultsStale&&(
+                <div style={{...sC,borderLeft:`3px solid ${C.warn}`,display:"flex",alignItems:"center",gap:12,padding:"10px 16px"}}>
+                  <span style={{color:C.warn,fontSize:12,fontWeight:600}}>Parameters changed — results below show the previous run.</span>
+                  <button onClick={runSim} style={{...sB,marginLeft:"auto",padding:"6px 16px",fontSize:12,background:C.warn}}>↻ Rerun</button>
+                </div>
+              )}
               {!displayResults&&(
                 <div style={{...sC,textAlign:"center",padding:60,color:C.txM}}>
                   <div style={{fontSize:40,marginBottom:8,opacity:0.4}}>📊</div>
@@ -2972,19 +3372,39 @@ export default function App(){
 
               {displayResults&&(()=>{
                 const keys=Object.keys(displayResults);const first=displayResults[keys[0]];
-                return(<div>
-                  <div style={{...sC,borderLeft:`3px solid ${C.acc}`}}>
-                    <div style={{fontSize:13,color:C.txD,marginBottom:4}}>
-                      {prof.d} · YS {ysNum.toFixed(2)} · Age {first.startAge} · {weeks} weeks ({(weeks/13).toFixed(1)}s)
-                    </div>
-                    <div style={{display:"flex",gap:14,fontSize:12,fontFamily:_ft,flexWrap:"wrap"}}>
-                      {OS.map(sk=>(
-                        <span key={sk} style={{color:prof.w[sk]===1?C.acc:prof.w[sk]>0?C.txD:C.txM}}>
-                          {SN[sk]}:{first.startSkills[sk]}.{(subs[sk]??25).toString().padStart(2,"0")}
-                          {prof.w[sk]===1&&" ★"}
-                        </span>
-                      ))}
-                    </div>
+                // v15: Projected card follows the user-selected strategy
+                // (clickable column headers); safe fallback to the first key.
+                const projKey=displayResults[projStrat]?projStrat:keys[0];
+                const proj=displayResults[projKey];
+                const projLast=proj.log.length?proj.log[proj.log.length-1]:null;
+                const deltas={};for(const sk of OS)deltas[sk]=proj.finalSkills[sk]-proj.startSkills[sk];
+                const nowSk={...first.startSkills};
+                const projSk={...proj.finalSkills};
+                if(cardMeta.stamina!=null){nowSk.stamina=cardMeta.stamina;projSk.stamina=cardMeta.stamina;}
+                if(cardMeta.keeper!=null){nowSk.keeper=cardMeta.keeper;projSk.keeper=cardMeta.keeper;}
+                // Value rows: model estimate needs a form level. Current card
+                // prefers the actual card value when the paste supplied one.
+                let nowVal=null,nowValLabel=null,projVal=null;
+                if(cardMeta.form!=null){
+                  nowVal=_computeValue(nowSk,cardMeta.form,subsFloat);nowValLabel="est.";
+                  projVal=_computeValue(projSk,cardMeta.form,projLast?projLast.subs:subsFloat);
+                }
+                if(cardMeta.actualValue!=null){nowVal=cardMeta.actualValue;nowValLabel="card";}
+                return(<div style={resultsStale?{opacity:0.55}:undefined}>
+                  <div style={{fontSize:12,color:C.txD,marginBottom:8}}>
+                    {prof.d} · YS {ysNum.toFixed(2)} · {weeks} weeks ({(weeks/13).toFixed(1)}s)
+                    <span style={{color:C.txM}}> · projected: </span>
+                    <b style={{color:proj.isSale?C.warn:C.acc}}>{allStrats[projKey]?.name||projKey}</b>
+                    {keys.length>1&&<span style={{color:C.txM,fontSize:11}}> (click a column header below to switch)</span>}
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",gap:12,marginBottom:12}}>
+                    <SokkerCard title="Now" name={playerName} age={first.startAge}
+                      skills={nowSk} form={cardMeta.form} value={nowVal} valueLabel={nowValLabel}/>
+                    <SokkerCard title={`Projected · ${allStrats[projKey]?.name||projKey}`}
+                      name={playerName} age={projLast?projLast.age:first.startAge}
+                      skills={projSk} value={projVal} valueLabel={projVal!=null?"est.":null} deltas={deltas}
+                      footnote={projVal!=null?"value: model estimate — assumes form, stamina and keeper unchanged":
+                        "stamina/keeper are not simulated — shown unchanged"}/>
                   </div>
 
                   <div style={{...sC,overflow:"auto"}}>
@@ -2993,10 +3413,19 @@ export default function App(){
                         <tr style={{borderBottom:`2px solid ${C.bdr}`}}>
                           <th style={{textAlign:"left",padding:"6px 8px",color:C.txD}}>Skill</th>
                           <th style={{textAlign:"center",padding:"6px 4px",color:C.txD,width:50}}>Start</th>
-                          {keys.map(k=>(
-                            <th key={k} style={{textAlign:"center",padding:"6px 8px",fontWeight:600,borderLeft:`1px solid ${C.bdr}`,
-                              color:displayResults[k].isSale?C.warn:C.acc}}>{allStrats[k]?.name||k}</th>
-                          ))}
+                          {keys.map(k=>{
+                            const selP=k===projKey;const cl=displayResults[k].isSale?C.warn:C.acc;
+                            return(
+                              <th key={k} onClick={()=>setProjStrat(k)}
+                                title="Click to show this strategy on the Projected card"
+                                style={{textAlign:"center",padding:"6px 8px",fontWeight:600,cursor:"pointer",
+                                  borderLeft:`1px solid ${C.bdr}`,color:cl,userSelect:"none",
+                                  background:selP?cl+"1a":"transparent",
+                                  borderBottom:selP?`2px solid ${cl}`:"2px solid transparent"}}>
+                                {selP?"▸ ":""}{allStrats[k]?.name||k}
+                              </th>
+                            );
+                          })}
                         </tr>
                       </thead>
                       <tbody>
@@ -3039,9 +3468,11 @@ export default function App(){
                   {(()=>{
                     const best=keys.reduce((a,b)=>wScore(displayResults[a])>wScore(displayResults[b])?a:b);
                     return(
-                      <div style={{...sC,background:C.pop+"11",borderLeft:`3px solid ${C.pop}`}}>
-                        <span style={{fontWeight:700,color:C.pop}}>★ Best: {allStrats[best]?.name||best}</span>
-                        <span style={{color:C.txD,marginLeft:8}}>(score {wScore(displayResults[best]).toFixed(1)})</span>
+                      <div style={{...sC,background:C.pop+"11",borderLeft:`3px solid ${C.pop}`,
+                        display:"flex",alignItems:"baseline",gap:10,flexWrap:"wrap"}}>
+                        <span style={{fontWeight:700,color:C.pop,fontSize:17}}>★ Best: {allStrats[best]?.name||best}</span>
+                        <span style={{color:C.tx,fontSize:15,fontWeight:700,fontFamily:_ft}}>{wScore(displayResults[best]).toFixed(1)}</span>
+                        <span style={{color:C.txM,fontSize:11}}>weighted score</span>
                       </div>
                     );
                   })()}
@@ -3166,9 +3597,7 @@ export default function App(){
                   </div>
 
                   <div style={{display:"flex",justifyContent:"flex-end",marginTop:8}}>
-                    <button onClick={()=>setStage("export")} style={{...sB,fontSize:14,padding:"12px 28px"}}>
-                      Continue to export →
-                    </button>
+                    
                   </div>
                 </div>);
               })()}
@@ -3308,26 +3737,21 @@ export default function App(){
               )}
             </div>
           )}
-        </div>
-      )}
 
-      {/* ═════════════════════════════════════════════════════════════════ */}
-      {/* STAGE 3 — EXPORT                                                  */}
-      {/* ═════════════════════════════════════════════════════════════════ */}
-      {stage==="export"&&(
-        <div style={{maxWidth:900}}>
-          {!hasPlayerData&&(
-            <div style={{...sC,borderLeft:`3px solid ${C.warn}`}}>
-              <div style={{color:C.warn,fontWeight:600,marginBottom:4}}>Nothing to export yet</div>
-              <div style={{fontSize:12,color:C.txD}}>
-                Load a player on <button onClick={()=>setStage("player")} style={{...sBs,padding:"2px 10px",fontSize:11,marginLeft:4,marginRight:4}}>1 · Player</button>
-                first.
-              </div>
-            </div>
-          )}
-
+          {/* v16: Export merged into Plan (Stage 3 removed) — collapsible
+              bundle card at the bottom of the results flow. Content is the
+              former export stage verbatim. */}
           {hasPlayerData&&(
-            <>
+            <div style={{...sC,marginTop:4,padding:exportOpen?"16px 20px":"0"}}>
+              <button onClick={()=>setExportOpen(o=>!o)} style={{
+                background:"transparent",border:"none",color:C.txD,fontFamily:_fs,
+                fontWeight:600,fontSize:12,cursor:"pointer",width:"100%",textAlign:"left",
+                padding:exportOpen?"0 0 10px":"12px 20px",letterSpacing:0.3}}>
+                {exportOpen?"▾":"▸"} 💾 Save / export calibration bundle
+              </button>
+              {exportOpen&&(
+                <>
+
               <div style={sC}>
                 <div style={sL}>What's in the bundle</div>
                 <div style={{fontSize:13,color:C.tx,lineHeight:1.6,marginTop:8}}>
@@ -3420,13 +3844,15 @@ export default function App(){
                   })()}
                 </div>
               </div>
-            </>
+                </>
+              )}
+            </div>
           )}
         </div>
       )}
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v13 · v25 threshold · coach 91 · talent estimator · Four-stage interface · Calibration corpus enabled
+        Sokker Training Planner v16 · coupled engine K16 · coach 93 · balance-v1 talent · Calibration corpus enabled
       </div>
 
       {/* Mobile responsiveness — collapse 2-col grids below 720px */}
