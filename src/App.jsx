@@ -1,6 +1,56 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SOKKER TRAINING PLANNER v18 — target-build block-order optimizer
+//
+// v18 (Jul 2026): port of desktop planner v6 optimize_block_order,
+// plus two field-report fixes (D@ni email 2026-07-06 + wonsky90 forum
+// topic 3690134) folded in before commit:
+//
+//  F1 — MAX-LEVEL CEILING CLAMP (engine).  _applyXp discards the residual
+//  when a pop reaches level 18 and _sub returns 0 at _MX.  Pre-fix the
+//  leftover carry rendered as phantom subskill above the cap (17.99 →
+//  "18.40" in one pop week; frozen 18.02–18.07 rows drifting with age as
+//  the nonexistent level-18 threshold moved under the carry ratio).
+//  Display-only artifact — no XP beyond the cap was ever simulated — but
+//  it directly fed the wonsky90 confusion about when skills "really"
+//  reach 18.
+//
+//  F2 — SUBSKILL SLIDER CONTRAST (D@ni).  The percent numeral used a
+//  value>60 → background-colored-text heuristic, but the numeral sits at
+//  the right edge while the fill grows from the left: for values ~60–95
+//  the dark text sat on the dark unfilled background and vanished.  Now
+//  bright text with a dark halo, readable over both.
+//
+//  ENGINE — optimizeBlockOrder(skills, td, age, ssw, targets, subs):
+//  exhaustively simulates every permutation of the target skills as
+//  sequential training blocks (train skill #1 to its target level, then
+//  #2, …) and ranks the orders by weeks-to-complete.  Exact within the
+//  model (≤6 targets → ≤720 cheap sims).  Uses a DEDICATED literal
+//  simulator (_simOrderToTargets) rather than runPlan: runPlan's _gwm
+//  fallback silently swaps a pick predicted to max within the horizon —
+//  correct for open-ended strategies, corrupting for a fixed block order
+//  (the same class of silent swap the v14 manual-schedule fix removed).
+//  Horizon cap: end of age 27 (mirrors the desktop default); orders that
+//  miss a target by then rank last with weeks=null.
+//
+//  WHY ORDER MATTERS — the age factor is a common exponent, so the
+//  ABSOLUTE cost of delaying a unit scales with base × level: pace
+//  (B=99) loses the most XP per delayed year at equal level ("pace
+//  first, striker next, tech last"), while a skill sitting several
+//  levels higher overtakes pace despite a lower base.  Desktop reference
+//  (age 19, td 85, pace 14 / striker 14 / tech 13): pace-early 62 weeks,
+//  pace-last 64–65.  A greedy cost-of-delay PRESET was prototyped on
+//  desktop and rejected — without targets it degenerates into
+//  most-expensive-first and loses on open-ended development, where
+//  cheapest-first is genuinely correct; order only matters when a target
+//  set must be bought regardless.  Hence an optimizer, not a preset.
+//
+//  UI — "🎯 Target build order" card at the bottom of the Plan stage:
+//  per-skill target inputs (left at current level = excluded), Rank
+//  button, ranked table, fastest order highlighted.  STRATS unchanged.
+//
+// ═══════════════════════════════════════════════════════════════════════════
 // SOKKER TRAINING PLANNER v17 — estimator soundness + interval-first talent
 //
 // v17 (Jul 2026): estimator fixes driven by field reports (forum pg 9–10,
@@ -372,9 +422,16 @@ function _mkSub(lv,sub,sk,a,te){
 function _applyXp(s,xp,sk,a,te){
   s.xp+=xp;const p=[];
   while(s.lv<_MX){const c=_duc(sk,s.lv,a,te);if(s.xp<c)break;s.xp-=c;s.du++;
-    if(s.du>=_U){s.du=0;s.lv++;p.push(s.lv);}}return p;
+    if(s.du>=_U){s.du=0;s.lv++;p.push(s.lv);}}
+  // v18: 18 is the game's hard ceiling — a pop into _MX discards the
+  // residual.  Pre-fix, the leftover carry displayed as phantom subskill
+  // ABOVE the cap (17.99 → "18.40" in one week; 18.02–18.07 rows that
+  // drifted as the age-dependent level-18 threshold — a bracket that does
+  // not exist — moved under the ratio).  Reported by D@ni + wonsky90.
+  if(s.lv>=_MX){s.du=0;s.xp=0;}
+  return p;
 }
-function _sub(s,sk,a,te){const f=_dt(sk,s.lv,a,te);if(f<=0)return 1;return(s.du*(f/_U)+s.xp)/f;}
+function _sub(s,sk,a,te){if(s.lv>=_MX)return 0;const f=_dt(sk,s.lv,a,te);if(f<=0)return 1;return(s.du*(f/_U)+s.xp)/f;}
 function _tdb(s,sk,a,te){
   const i=s.lv*_R+s.du*(_R/_U);if(!sk)return i;
   const c=_duc(sk,s.lv,a,te);return c<=0?i:i+(s.xp/c)*(_R/_U);
@@ -668,6 +725,71 @@ function runSaleOpt(skills,td,age,deadWeeks,pos,subs,ssw,maxExt=3){
   return{log,finalSkills:fsk,finalDb:fdb,totalWeeks:best.length,maxedAt:{},
     startSkills:Object.fromEntries(OS.map(sk=>[sk,skills[sk]||0])),startAge:age,
     isSale:true,schedule:best,carryPct,extensions:extUsed,swaps:totSwaps};
+}
+
+// ─── Target-build block-order optimizer (v18; desktop planner v6 port) ────
+function _permutations(arr){
+  if(arr.length<=1)return[arr.slice()];
+  const out=[];
+  for(let i=0;i<arr.length;i++){
+    const rest=arr.slice(0,i).concat(arr.slice(i+1));
+    for(const p of _permutations(rest))out.push([arr[i],...p]);
+  }
+  return out;
+}
+
+// Literal fixed-order simulator: trains order[k] until its target level,
+// then advances; stops when every target is met or the cap is reached.
+// No _gwm swap by design — the order is honored literally (v14 manual-
+// schedule semantics).  Returns {weeks, finalDb, finalSkills, endAge};
+// weeks=null when the cap ran out before all targets were met.
+function _simOrderToTargets(order,targets,skills,td,age,ssw,subs,capWeeks){
+  const te=_te(td);
+  const st=_initSt(skills,age,te,subs);
+  let sw=ssw,ca=age,wk=0;
+  const done=()=>order.every(sk=>st[sk].lv>=targets[sk]);
+  while(wk<capWeeks&&!done()){
+    let tr=null;
+    for(const sk of order){if(st[sk].lv<targets[sk]){tr=sk;break;}}
+    if(!tr)break;
+    wk++;
+    for(const sk of OS){
+      if(st[sk].lv>=_MX)continue;
+      _applyXp(st[sk],sk===tr?_XD:_XG,sk,ca,te);
+    }
+    sw++;if(sw>_SL){sw=1;ca++;}
+  }
+  const finalDb={},finalSkills={};
+  for(const sk of OS){finalSkills[sk]=st[sk].lv;finalDb[sk]=_tdb(st[sk],sk,ca,te);}
+  return{weeks:done()?wk:null,finalDb,finalSkills,endAge:ca};
+}
+
+// Exhaustive ranking of every block order.  targets: {skill: displayLevel};
+// entries at/below the current level (or >18) are dropped.  Returns
+// {targets, orders:[{order,weeks,finalDb,finalSkills,endAge}…] fastest
+// first (infeasible last), best: fastest feasible entry or null}.
+function optimizeBlockOrder(skills,td,age,ssw,targets,subs){
+  const eff={};
+  for(const sk of OS){
+    const t=Math.round(targets?.[sk]??0);
+    if(t>(skills[sk]||0)&&t<=_MX)eff[sk]=t;
+  }
+  const keys=Object.keys(eff).sort();
+  const out={targets:eff,orders:[],best:null};
+  if(!keys.length)return out;
+  const capWeeks=Math.max(_SL,(28-age)*_SL);   // mirror desktop age-27 horizon
+  for(const perm of _permutations(keys)){
+    const r=_simOrderToTargets(perm,eff,skills,td,age,ssw,subs,capWeeks);
+    out.orders.push({order:perm,...r});
+  }
+  out.orders.sort((a,b)=>{
+    if(a.weeks==null&&b.weeks==null)return 0;
+    if(a.weeks==null)return 1;
+    if(b.weeks==null)return -1;
+    return a.weeks-b.weeks;
+  });
+  if(out.orders.length&&out.orders[0].weeks!=null)out.best=out.orders[0];
+  return out;
 }
 
 // ─── XML History Parser (port of xml_history_parser.py, DOMParser-based) ──
@@ -2059,8 +2181,13 @@ function SubBar({value,onChange,color}){
     <div ref={ref} onMouseDown={onDown} onTouchStart={onTouch} onTouchMove={onTouch}
       style={{position:"relative",height:20,background:C.bg,borderRadius:4,cursor:"pointer",overflow:"hidden",userSelect:"none",touchAction:"none"}}>
       <div style={{position:"absolute",left:0,top:0,bottom:0,width:`${value/99*100}%`,background:color,borderRadius:4,transition:dragging.current?"none":"width 0.1s"}}/>
+      {/* v18 (D@ni report): the numeral sits at the RIGHT edge but the fill
+          grows from the LEFT — the old value>60→dark-text heuristic painted
+          it background-black over the still-unfilled right side for every
+          value in ~60–95 ("czarna czcionka gubi się na czarnym tle").
+          Bright text + dark halo is readable over both fill and bg. */}
       <div style={{position:"absolute",right:6,top:"50%",transform:"translateY(-50%)",fontSize:10,fontFamily:_ft,fontWeight:600,
-        color:value>60?C.bg:C.txD,zIndex:1}}>.{value.toString().padStart(2,"0")}</div>
+        color:C.tx,textShadow:"0 0 3px rgba(0,0,0,0.9),0 0 2px rgba(0,0,0,0.9)",zIndex:1}}>.{value.toString().padStart(2,"0")}</div>
     </div>
   );
 }
@@ -2242,6 +2369,94 @@ function SkillEditor({skills,setSkills,subs,setSubs,age,setAge,pos,name,warnings
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ─── Target Build Order card (v18) ─────────────────────────────────────────
+function TargetBuildOrder({skills,td,age,ssw,subsFloat}){
+  const[tg,setTg]=useState({});
+  const[res,setRes]=useState(null);
+  const cardS={background:C.card,borderRadius:10,padding:"16px 20px",marginTop:12,
+    borderLeft:`3px solid ${C.acc}`};
+  const labS={fontSize:10,fontFamily:_fs,color:C.txM,textTransform:"uppercase",
+    letterSpacing:"0.1em",marginBottom:4};
+  const inpS={background:C.bg,border:`1px solid ${C.bdr}`,borderRadius:6,color:C.tx,
+    fontFamily:_ft,fontSize:13,padding:"6px 8px",width:"100%",outline:"none",
+    boxSizing:"border-box",textAlign:"center"};
+  const eff={};
+  for(const sk of OS){
+    const cur=skills[sk]||0;
+    const t=Math.round(tg[sk]??cur);
+    if(t>cur&&t<=_MX)eff[sk]=t;
+  }
+  const n=Object.keys(eff).length;
+  const run=()=>setRes(optimizeBlockOrder(skills,td,age,ssw,eff,subsFloat));
+  return(
+    <div style={cardS}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,flexWrap:"wrap"}}>
+        <div style={{...labS,color:C.acc,marginBottom:0}}>🎯 Target build order — which skill first?</div>
+      </div>
+      <div style={{fontSize:11,color:C.txM,lineHeight:1.5,marginBottom:12}}>
+        Pick target levels (a skill left at its current level is excluded). Every
+        block order is simulated exactly — the age factor makes expensive skills
+        (pace) cheaper to buy early, so the ranking replaces the rule of thumb.
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:8,marginBottom:12}}>
+        {OS.map(sk=>{
+          const cur=skills[sk]||0;
+          return(
+            <div key={sk}>
+              <div style={{...labS,color:SK_COLORS[sk]}}>{SN[sk]} <span style={{color:C.txM}}>(now {cur})</span></div>
+              <input type="number" min={cur} max={_MX} step={1}
+                value={tg[sk]??cur}
+                onChange={e=>{const v=parseInt(e.target.value,10);
+                  setTg(o=>({...o,[sk]:isNaN(v)?cur:Math.min(_MX,Math.max(cur,v))}));setRes(null);}}
+                style={inpS}/>
+            </div>
+          );
+        })}
+      </div>
+      <button onClick={run} disabled={n===0} style={{
+        padding:"8px 18px",fontSize:12,fontFamily:_ft,fontWeight:700,borderRadius:6,
+        cursor:n===0?"not-allowed":"pointer",
+        background:n===0?C.hi:C.acc+"22",color:n===0?C.txM:C.acc,
+        border:`1px solid ${n===0?C.bdr:C.acc}`,
+      }}>Rank block orders{n>0?` (${Array.from({length:n},(_,i)=>i+1).reduce((a,b)=>a*b,1)} sims)`:""}</button>
+      {res&&res.orders.length>0&&(
+        <div style={{marginTop:14}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,fontFamily:_ft}}>
+            <thead>
+              <tr style={{color:C.txM,textAlign:"left"}}>
+                <th style={{padding:"4px 8px"}}>Order</th>
+                <th style={{padding:"4px 8px"}}>Weeks</th>
+                <th style={{padding:"4px 8px"}}>Done</th>
+              </tr>
+            </thead>
+            <tbody>
+              {res.orders.map((o,i)=>{
+                const isBest=res.best&&o===res.best;
+                return(
+                  <tr key={i} style={{borderTop:`1px solid ${C.bdr}55`,
+                    color:o.weeks==null?C.txM:isBest?C.pop:C.tx,
+                    fontWeight:isBest?700:400}}>
+                    <td style={{padding:"5px 8px"}}>{o.order.map(sk=>SN[sk]).join(" → ")}</td>
+                    <td style={{padding:"5px 8px"}}>{o.weeks==null?"—":o.weeks}</td>
+                    <td style={{padding:"5px 8px"}}>{o.weeks==null
+                      ?"✗ not before age 28"
+                      :`age ${o.endAge}${isBest?"  ← fastest":""}`}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          {!res.best&&(
+            <div style={{marginTop:8,fontSize:11,color:C.warn}}>
+              No order reaches every target before age 28 — lower a target.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // MAIN APP
 // ═══════════════════════════════════════════════════════════════════════════
 export default function App(){
@@ -3737,6 +3952,9 @@ export default function App(){
                   </div>
                 </div>);
               })()}
+              {/* v18: target-build block-order optimizer */}
+              <TargetBuildOrder skills={skills} td={td} age={age} ssw={ssw} subsFloat={subsFloat}/>
+
             </div>
           </div>
 
