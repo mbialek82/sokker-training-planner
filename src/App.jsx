@@ -1,13 +1,18 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOKKER TRAINING PLANNER v24 — convergence programs
+// SOKKER TRAINING PLANNER v25 — convergence programs (derived targets)
 //
 // v24 (Aug 2026): port of planner.py v8 — six target-ceilinged strategies
-//   (converge_13/15/17, def/att/mid_anchored) plus the _xtl / _gwl helpers
-//   they need.  Pre-v24 every strategy ran to the ceiling, so "5x15" was
-//   inexpressible.  Rationale and the two measured facts behind the pick
-//   rule are in sokker_19.
+//   plus the _xtl / _gwl helpers they need.  Pre-v24 every strategy ran to
+//   the ceiling, so an even build was inexpressible.  Rationale and the two
+//   measured facts behind the pick rule are in sokker_19.
+//   SUPERSEDED BY v25: v24 shipped FIXED targets (converge_13/15/17) and
+//   hardcoded key pairs (def/att/mid_anchored).  Both were wrong.  A fixed
+//   level is arbitrary — too low for a talent who could hold 17, unreachable
+//   for one who tops out at 13 — and the ATT pair "striker+pace" omitted
+//   technique, which makes it useless for a striker.  v25 derives the target
+//   and reads the key skills off the position profile.
 //
 // v23 (Aug 2026): desktop parity pass
 //
@@ -687,37 +692,77 @@ function _gwl(s,sk,a,te,w,tgt){
   return w*_XG>=_xtl(s,sk,a,te,tgt);
 }
 
-// Allrounder: every weighted skill UP TO tgt, then stop.  A skill at or above
-// the ceiling takes no further direct slots — it still gains from GT, which is
-// why the profile keeps converging rather than drifting apart.
-function _cv(tgt,gtAware){
-  return function(st,a,p,ctx,te,rem){
-    const T=Math.min(tgt,_MX);
-    const short=OS.filter(sk=>(p.w[sk]||0)>0&&st[sk].lv<T);
-    if(!short.length)return null;              // target met — no slot needed
-    let pool=short;
-    if(gtAware!==false&&short.length>1){
-      const un=short.filter(sk=>!_gwl(st[sk],sk,a,te,rem||0,T));
-      if(un.length)pool=un;                    // spend the week where GT can't reach
+// Largest common display level every skill in `keys` can still reach inside
+// `rem` weeks.  This is the number the plan should aim at: a build is only
+// "even" relative to what the player can actually get to, so a fixed 15 is
+// wrong for a talent who could hold 17 and wrong again for one who tops out
+// at 13.  Aiming at the achievable common level is what avoids 18-12-16.
+//
+// Budget test per candidate L: every skill collects free GT all horizon, so
+// it needs DIRECT xp only for the shortfall; the plan is feasible if the
+// shortfalls fit in the direct weeks available.  Slightly OPTIMISTIC, because
+// per-DB cost rises with both db and age as the walk proceeds — deliberately
+// so: if the target proves a level too high the converge picker simply keeps
+// running maximin to the horizon, which is the right fallback, whereas a
+// pessimistic estimate would leave achievable levels on the table.
+function _maxCommonLv(st,keys,a,te,rem){
+  if(!keys.length)return 0;
+  let lo=_MX;for(const k of keys)if(st[k].lv<lo)lo=st[k].lv;
+  let best=lo;
+  for(let L=lo+1;L<=_MX;L++){
+    let need=0;
+    for(const k of keys){
+      const req=_xtl(st[k],k,a,te,L)-(rem||0)*_XG;
+      if(req>0)need+=req;
     }
+    if(need<=(rem||0)*_XD)best=L;else break;
+  }
+  return best;
+}
+
+// Even build: bring the position's KEY skills to the highest level they can
+// ALL reach, then stop.  The target is derived once, on the first week, from
+// the player's own talent/age/horizon — not a preset number.  A skill at or
+// above the ceiling takes no further direct slots; it keeps gaining from GT,
+// which is why the profile converges rather than drifts apart.
+function _cvAuto(useAllWeighted){
+  return function(st,a,p,ctx,te,rem){
+    const keys=useAllWeighted?OS.filter(sk=>(p.w[sk]||0)>0):_crit(p);
+    if(!keys.length)return null;
+    if(ctx.cvTgt==null)ctx.cvTgt=_maxCommonLv(st,keys,a,te,rem||0);
+    const T=Math.min(ctx.cvTgt,_MX);
+    const short=keys.filter(sk=>st[sk].lv<T);
+    if(!short.length)return null;                 // target met
+    let pool=short;
+    if(short.length>1){
+      const un=short.filter(sk=>!_gwl(st[sk],sk,a,te,rem||0,T));
+      if(un.length)pool=un;                       // spend the week where GT can't reach
+    }
+    // Maximin: completion is a makespan, set by the LAST skill to arrive, so
+    // pull up the laggard.  (Measured: lowest-first 46w vs highest-DB-first
+    // 64w on a six-skill L15 convergence.)
     return pool.reduce((x,y)=>_tdb(st[x],x,a,te)<=_tdb(st[y],y,a,te)?x:y);
   };
 }
 
-// Positional: `prim` to `cap`, everything else to a common `floor` and no
-// further.  Priority is explicit rather than a weight ratio — a secondary in
-// danger of missing the floor OUTRANKS a primary, because the floor is what
-// makes the player usable at all while the last level of a primary is a
-// refinement.  Maximin within each tier, for the makespan reason above.
-function _anc(prim,cap,floor){
+// Positional: the profile's KEY skills (weight 1) pushed as high as they go,
+// every other weighted skill lifted to `floor` and no further.
+//
+// The keys come from the position profile rather than a hardcoded pair — ATT
+// is pace + technique + striker, and an "striker+pace" plan that ignores
+// technique is useless for a striker.  A secondary in danger of missing the
+// floor OUTRANKS a key skill, because the floor is what makes the player
+// usable at all while the last level of a key skill is a refinement.
+function _ancAuto(floor){
   return function(st,a,p,ctx,te,rem){
-    const C=Math.min(cap,_MX),F=Math.min(floor,_MX);
+    const keys=_crit(p);
+    const F=Math.min(floor,_MX);
     const lo=(arr)=>arr.reduce((x,y)=>_tdb(st[x],x,a,te)<=_tdb(st[y],y,a,te)?x:y);
-    const secShort=OS.filter(sk=>prim.indexOf(sk)<0&&(p.w[sk]||0)>0&&st[sk].lv<F);
+    const secShort=OS.filter(sk=>keys.indexOf(sk)<0&&(p.w[sk]||0)>0&&st[sk].lv<F);
     const atRisk=secShort.filter(sk=>!_gwl(st[sk],sk,a,te,rem||0,F));
     if(atRisk.length)return lo(atRisk);
-    const priShort=prim.filter(sk=>st[sk].lv<C);
-    if(priShort.length)return lo(priShort);
+    const keyShort=keys.filter(sk=>st[sk].lv<_MX);
+    if(keyShort.length)return lo(keyShort);
     if(secShort.length)return lo(secShort);
     return null;
   };
@@ -733,15 +778,15 @@ const STRATS={
   pick_lowest:{name:"Pick Lowest",fn:_ll,desc:"Always train lowest-level weighted skill (pure maximin)",validPos:null},
   balanced:{name:"Balanced (2:1)",fn:_bal,desc:"Primaries 2× slots vs secondaries; maximin within each tier",validPos:["DEF","ATT","WING"]},
   positional_balanced:{name:"Positional→Balanced",fn:_pb,desc:"Primaries via GT-will-max (lowest-first), then secondaries self-level",validPos:["DEF","ATT","WING"]},
-  // v24: convergence builds (target-ceilinged).  Cheaper than they look —
-  // per-DB cost is convex in DB, so the same total DB costs less spread evenly
-  // than concentrated, and free GT covers the cheap low end for nothing.
-  converge_13:{name:"Allrounder → 13",fn:_cv(13),desc:"Every weighted skill up to 13, then stop — short-horizon centre build"},
-  converge_15:{name:"Allrounder → 15",fn:_cv(15),desc:"Every weighted skill up to 15, then stop — the 5×15 centre build"},
-  converge_17:{name:"Allrounder → 17",fn:_cv(17),desc:"Every weighted skill up to 17 — long horizon, needs a young player"},
-  def_anchored:{name:"DEF: def+pace cap, rest → 12",fn:_anc(["defending","pace"],17,12),desc:"Defending and pace to 17, every other weighted skill to 12 and no further",validPos:["DEF"]},
-  att_anchored:{name:"ATT: str+pace cap, rest → 12",fn:_anc(["striker","pace"],17,12),desc:"Striker and pace to 17, every other weighted skill to 12 and no further",validPos:["ATT"]},
-  mid_anchored:{name:"MID: pm+pass cap, rest → 13",fn:_anc(["playmaking","passing"],17,13),desc:"Playmaking and passing to 17, every other weighted skill to 13 and no further",validPos:["MID"]},
+  // v25: convergence builds.  Targets are DERIVED, not preset — see
+  // _maxCommonLv.  Aiming at a fixed level is wrong in both directions: too
+  // low for a talent who could hold 17, unreachable for one who tops out at
+  // 13.  What the user wants is the highest level the KEY skills can all
+  // reach, so the build lands 16-16-16 rather than 18-12-16.
+  converge_auto:{name:"Even build (key skills)",fn:_cvAuto(false),desc:"Bring the position's key skills to the highest level they can ALL reach, then stop — target derived from talent, age and horizon"},
+  converge_auto_all:{name:"Even build (all weighted)",fn:_cvAuto(true),desc:"As above but levels every weighted skill, secondaries included"},
+  anchored_12:{name:"Key skills max, rest → 12",fn:_ancAuto(12),desc:"Position's key skills as high as they go; every other weighted skill to 12 and no further"},
+  anchored_14:{name:"Key skills max, rest → 14",fn:_ancAuto(14),desc:"Position's key skills as high as they go; every other weighted skill to 14 and no further"},
 };
 
 // ─── Core Simulation ───────────────────────────────────────────────────────
