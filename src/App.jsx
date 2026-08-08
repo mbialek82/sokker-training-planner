@@ -1,7 +1,15 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOKKER TRAINING PLANNER v23 — desktop parity pass
+// SOKKER TRAINING PLANNER v24 — convergence programs
+//
+// v24 (Aug 2026): port of planner.py v8 — six target-ceilinged strategies
+//   (converge_13/15/17, def/att/mid_anchored) plus the _xtl / _gwl helpers
+//   they need.  Pre-v24 every strategy ran to the ceiling, so "5x15" was
+//   inexpressible.  Rationale and the two measured facts behind the pick
+//   rule are in sokker_19.
+//
+// v23 (Aug 2026): desktop parity pass
 //
 // v23 (Aug 2026): four corrections carried over from the desktop audit.
 //   FIX 1  KEEPER IN THE ESTIMATOR POOL (goalkeepers).  `skillsToProcess` was
@@ -641,6 +649,80 @@ function _pb(st,a,p,ctx,te,rem){
   return null;
 }
 
+// ─── v24: convergence programs (port of planner.py v8) ─────────────────────
+//
+// Every strategy above is UNBOUNDED — it names a skill and has no notion of
+// "far enough", so the most common ask (an allrounder at 5x15 rather than
+// 17 pace / 12 defending) could not be expressed.  Two measured facts from
+// the desktop simulation shape these; see sokker_19.
+//
+//  1. MAXIMIN IS RIGHT FOR A COMMON TARGET.  Six skills converging on L15
+//     from a spread start at 17 with GT running: lowest-first 46w,
+//     highest-DB-first 64w.  Completion is a MAKESPAN — set by the last skill
+//     to arrive — so pulling up the laggard is what shortens it.  (Age sits
+//     in the cost exponent, which makes high-DB work more delay-sensitive and
+//     tempts you toward highest-first; that instinct loses 40% here and only
+//     applies to an uncoupled block list.)
+//  2. FREE GT DOES MORE THAN EXPECTED.  ~5.1 DB/season at L6 down to ~2.4 at
+//     L17 — about a level per season low down.  In the same run playmaking
+//     started at L14 and reached target on GT alone, taking ZERO slots.  A
+//     skill GT will carry in time should never be given a week.
+
+// XP needed to reach display level `tgt` — generalises _xtm (which is this
+// with tgt = _MX).
+function _xtl(s,sk,a,te,tgt){
+  if(s.lv>=tgt)return 0;
+  let n=_duc(sk,s.lv,a,te)-s.xp;
+  for(let d=s.du+1;d<_U;d++)n+=_duc(sk,s.lv,a,te);
+  for(let l=s.lv+1;l<tgt;l++)n+=_dt(sk,l,a,te);
+  return n;
+}
+// Will free GT alone reach `tgt` within w weeks?  Conservative: costs are
+// evaluated at today's db and age, both of which rise as the walk proceeds,
+// so this under-states the requirement and only skips a slot when GT clears
+// the bar comfortably.
+function _gwl(s,sk,a,te,w,tgt){
+  if(s.lv>=tgt)return true;
+  if(w<=0)return false;
+  return w*_XG>=_xtl(s,sk,a,te,tgt);
+}
+
+// Allrounder: every weighted skill UP TO tgt, then stop.  A skill at or above
+// the ceiling takes no further direct slots — it still gains from GT, which is
+// why the profile keeps converging rather than drifting apart.
+function _cv(tgt,gtAware){
+  return function(st,a,p,ctx,te,rem){
+    const T=Math.min(tgt,_MX);
+    const short=OS.filter(sk=>(p.w[sk]||0)>0&&st[sk].lv<T);
+    if(!short.length)return null;              // target met — no slot needed
+    let pool=short;
+    if(gtAware!==false&&short.length>1){
+      const un=short.filter(sk=>!_gwl(st[sk],sk,a,te,rem||0,T));
+      if(un.length)pool=un;                    // spend the week where GT can't reach
+    }
+    return pool.reduce((x,y)=>_tdb(st[x],x,a,te)<=_tdb(st[y],y,a,te)?x:y);
+  };
+}
+
+// Positional: `prim` to `cap`, everything else to a common `floor` and no
+// further.  Priority is explicit rather than a weight ratio — a secondary in
+// danger of missing the floor OUTRANKS a primary, because the floor is what
+// makes the player usable at all while the last level of a primary is a
+// refinement.  Maximin within each tier, for the makespan reason above.
+function _anc(prim,cap,floor){
+  return function(st,a,p,ctx,te,rem){
+    const C=Math.min(cap,_MX),F=Math.min(floor,_MX);
+    const lo=(arr)=>arr.reduce((x,y)=>_tdb(st[x],x,a,te)<=_tdb(st[y],y,a,te)?x:y);
+    const secShort=OS.filter(sk=>prim.indexOf(sk)<0&&(p.w[sk]||0)>0&&st[sk].lv<F);
+    const atRisk=secShort.filter(sk=>!_gwl(st[sk],sk,a,te,rem||0,F));
+    if(atRisk.length)return lo(atRisk);
+    const priShort=prim.filter(sk=>st[sk].lv<C);
+    if(priShort.length)return lo(priShort);
+    if(secShort.length)return lo(secShort);
+    return null;
+  };
+}
+
 const STRATS={
   round_robin:{name:"Round-Robin",fn:_rr,desc:"Rotate critical skills evenly"},
   cheapest_first:{name:"Cheapest First",fn:_ch,desc:"Train easiest skill to pop next"},
@@ -651,6 +733,15 @@ const STRATS={
   pick_lowest:{name:"Pick Lowest",fn:_ll,desc:"Always train lowest-level weighted skill (pure maximin)",validPos:null},
   balanced:{name:"Balanced (2:1)",fn:_bal,desc:"Primaries 2× slots vs secondaries; maximin within each tier",validPos:["DEF","ATT","WING"]},
   positional_balanced:{name:"Positional→Balanced",fn:_pb,desc:"Primaries via GT-will-max (lowest-first), then secondaries self-level",validPos:["DEF","ATT","WING"]},
+  // v24: convergence builds (target-ceilinged).  Cheaper than they look —
+  // per-DB cost is convex in DB, so the same total DB costs less spread evenly
+  // than concentrated, and free GT covers the cheap low end for nothing.
+  converge_13:{name:"Allrounder → 13",fn:_cv(13),desc:"Every weighted skill up to 13, then stop — short-horizon centre build"},
+  converge_15:{name:"Allrounder → 15",fn:_cv(15),desc:"Every weighted skill up to 15, then stop — the 5×15 centre build"},
+  converge_17:{name:"Allrounder → 17",fn:_cv(17),desc:"Every weighted skill up to 17 — long horizon, needs a young player"},
+  def_anchored:{name:"DEF: def+pace cap, rest → 12",fn:_anc(["defending","pace"],17,12),desc:"Defending and pace to 17, every other weighted skill to 12 and no further",validPos:["DEF"]},
+  att_anchored:{name:"ATT: str+pace cap, rest → 12",fn:_anc(["striker","pace"],17,12),desc:"Striker and pace to 17, every other weighted skill to 12 and no further",validPos:["ATT"]},
+  mid_anchored:{name:"MID: pm+pass cap, rest → 13",fn:_anc(["playmaking","passing"],17,13),desc:"Playmaking and passing to 17, every other weighted skill to 13 and no further",validPos:["MID"]},
 };
 
 // ─── Core Simulation ───────────────────────────────────────────────────────
