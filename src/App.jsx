@@ -1,7 +1,91 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOKKER TRAINING PLANNER v25 — convergence programs (derived targets)
+// SOKKER TRAINING PLANNER v26 — keeper GT lock + desktop talent parity
+//
+// v26 (Aug 2026) part 2: AGREEMENT GATE ON TALENT CONFIDENCE (talent.py v16).
+//   Confidence was decided by evidence VOLUME (count of informative gaps by
+//   type).  Volume is necessary but not sufficient — four hard gaps that
+//   contradict each other are not four confirmations.  A read is reliable
+//   only when independent pops AGREE, so the label is now capped by the
+//   number of hard bounds whose own range contains the adopted verdict:
+//   >= 2 concurring allows the base label, 1 caps at 'indicative', 0 caps at
+//   'unreliable'.  Hard bounds are collected structurally (floats, at the
+//   point of computation) rather than re-parsed from formatted strings.
+//   Exposed as `nHardGaps` / `nConcurringGaps` / `boundOnly` on the result.
+//
+//   TWO DELIBERATE DIVERGENCES FROM THE DESKTOP, both because this file has
+//   no soft-anchor layer (`_estimateGapBounds` takes no carry-in):
+//     1. The gate CLAMPS BY RANK instead of assigning.  Copying the desktop
+//        branch literally promoted no_data -> unreliable on 3 players, since
+//        "no_data" ranks below "unreliable" here but not there.
+//     2. Bound-only reporting is LABEL-ONLY; the band is left alone.  The
+//        desktop rewrites lo/hi to strip a floor its soft anchor fabricated.
+//        Nothing fabricates a floor here (all 4 no-hard-gap squad players
+//        already read tdLo = 1.0), so the rewrite would only have deleted
+//        four real, assumption-free ceilings: 55.2, 87.4, 62.6, 61.5 -> 100.
+//   Both were caught by A/B against the pre-v26 build, not by inspection.
+//
+// v26 (Aug 2026) part 3: DESKTOP PARITY ON THE TALENT VERDICT.  Part 2 left
+//   the labels agreeing on 31 of 42 players but the POINT estimate on only
+//   2 of 42 within 2 DB.  Five gaps closed, in the order they were found:
+//     a. v12 C1a CARRY MODEL — denom_lo is xpTotal + the PREVIOUS gap's
+//        pop-week XP, not + this gap's own first week.  Threaded through
+//        _extractMixedGaps -> _finaliseMixedGap as carryXpMax.
+//     b. v12 C1b + v13 A2 AGE-EQUIVALENCE — weekly XP re-priced to the
+//        pop-week age, in BOTH the closed and open gap paths (this file had
+//        it in neither, so every gap spanning a birthday was mis-priced by
+//        the ~10%/yr age factor).
+//     c. _effToTd CLAMP — symmetric floor at 1.0, matching constants v12.
+//        The old form returned 0.0 at eff = 0.40 and went negative below,
+//        manufacturing inverted intervals the estimator reads as evidence.
+//     d. RELIABILITY-WEIGHTED COVERAGE — the whole layer was absent; it owns
+//        the point (depth-weighted centroid) and the label (peak's share of
+//        weight).  See the section above `estimateTalent`.
+//     e. FORMATION SKILL READ FROM THE WRONG FIELD — a genuine online bug,
+//        not a parity nicety.  `formation.code` is the team's TARGET GROUP
+//        (GK/DEF/MID/ATT); the trained skill is `type.name`.  The app was
+//        crediting the FT bonus to the group's default skill, so on 39117069
+//        two formation weeks landed on defending instead of technique.
+//   Result: confidence labels 42/42, point estimate 17/17 within 2 DB,
+//   median Δ 0.0, max |Δ| 0.5 DB.
+//
+//   With coverage supplying the base label the agreement gate becomes LIVE:
+//   8 demotions, 0 promotions, five of them players with zero hard gaps whom
+//   coverage alone rates "reliable".  Coverage without the gate would have
+//   imported the sokker_20 artefact wholesale.
+//
+//   One deliberate wart: coverage rows round their bounds to integer DB,
+//   because the desktop recovers those rows by regex-parsing its own '%.0f'
+//   display strings.  Exact floats are more principled and move 7 of 17
+//   verdicts (worst 7.9 DB), so parity wins — but a sub-DB rounding change
+//   moving a verdict 8 DB means that verdict was never evidence-determined.
+//   Logged in sokker_20 as an open item, not silently absorbed.
+//
+// v26 (Aug 2026) part 1: RESTORE THE LOCKED-SKILL RULE IN THE SUBSKILL SIMULATOR.
+//   An outfield player never accumulates keeper XP — individual OR general.
+//   Every keeper path in this file already enforced that (`_gtXp`,
+//   `_weekXpContribution`, both isGk-gated) EXCEPT the one that actually
+//   walks the history: `_weekGain` had no guard and `simulateSubskills` took
+//   no isGk at all, so on an outfielder keeper drew general training every
+//   single week.  Not a v23-v25 regression — the guard was never present in
+//   this file; it is a long-standing online/desktop parity gap, since
+//   subskill.py `_compose_intensity` has always had it.
+//
+//   Measured on the 26 outfielders of the reference squad: keeper subskill
+//   rose a mean +0.357 of a level above its seed (max +0.691) and 21 of 26
+//   finished at >= 0.85 — the model had them about to pop a keeper level
+//   from GT.  After the fix keeper accrues exactly 0 DB (verified to 0e0
+//   against the seed on all 26) and the >= 0.85 count is 0.
+//
+//   Scope, stated honestly: the drift reached `valueResidualPct` (keeper
+//   carries the x4 Mikoos weight) but only by 0.03-0.08 pp, because an
+//   outfielder's keeper sits at L0-L3.  Mean |residual| moves 6.11% ->
+//   6.35%, 9 of 26 improving.  This is a physics fix, NOT a value-accuracy
+//   fix.  The OS subskills the planner consumes are untouched — each skill's
+//   state is independent, so no plan output changes.
+//
+// v25 (Aug 2026): convergence programs (derived targets)
 //
 // v24 (Aug 2026): port of planner.py v8 — six target-ceilinged strategies
 //   plus the _xtl / _gwl helpers they need.  Pre-v24 every strategy ran to
@@ -1215,6 +1299,11 @@ const _STAM_THR=80; // _B_NORM retired in v14 (normaliser folded into _pdc)
 // v14: the v25 product-slope constants (_THR_BASE, _PROD_SLOPE*, _AGE_OFF,
 // _AGE_PIVOT) are removed — the coupled model above is the only engine.
 const _FORM_CODE_TO_SK={0:"keeper",1:"defending",2:"playmaking",3:"striker"};
+// v26: mirrors training_week._VALID_FORMATION_SKILLS (= constants.ALL_SKILLS).
+// Used to reject 'general'/empty/junk in a formation week's `type.name`
+// before trusting it as the FT target skill.
+const _VALID_FORM_SK=new Set(["pace","technique","passing","defending",
+  "playmaking","striker","keeper","stamina"]);
 const _GT_THR=93,_W_CL_OFF=93,_W_CL_FRI=70,_W_NT_OFF=70;
 // Value formula — Mikoos-faithful port (constants.py v9: corrected
 // cumulative table + VALUE_FORM_PENALTY 1/40 → 1/39). Replaces the old
@@ -1286,8 +1375,25 @@ function _parseRecord(rec){
   const isFormation=kindName==="formation";
   let formationSkill=null,advInt=0.0,fInt=0.0;
   if(isFormation){
-    const code=(rec.formation||{}).code;
-    if(code!=null)formationSkill=_FORM_CODE_TO_SK[code]||null;
+    // v26: prefer the EXPLICIT `type.name`, exactly as training_week.py does.
+    // On a formation week `formation.code`/`.name` is the team's TARGET GROUP
+    // (GK/DEF/MID/ATT); it governs FT eligibility but NOT which skill is
+    // trained.  The trained skill is in `type.name`, same as an individual
+    // week — a player can be formation-trained in technique while the group
+    // reads DEF.  Reading only the code therefore put the FT bonus on the
+    // WRONG SKILL for every live API record.  Observed on 39117069 week 1183:
+    // type.name='technique', formation.name='DEF' — the online app credited
+    // defending.  His technique gap read [3D+44G+0F] 73-78 against the
+    // desktop's [3D+42G+2F] 69-74, and that single gap was the largest
+    // remaining talent divergence in the squad (75.2 vs 63.6).
+    // The code path stays as the documented fallback for legacy XML-sourced
+    // records that pre-date `type` being captured on formation weeks.
+    const typeName=(rec.type||{}).name;
+    if(typeName&&_VALID_FORM_SK.has(typeName))formationSkill=typeName;
+    else{
+      const code=(rec.formation||{}).code;
+      if(code!=null)formationSkill=_FORM_CODE_TO_SK[code]||null;
+    }
     const g=rec.games||{};
     const co=g.minutesOfficial||0,cf=g.minutesFriendly||0,no=g.minutesNtOfficial||g.minutesNational||0;
     advInt=_advIntensity(co,cf,no);
@@ -1368,8 +1474,33 @@ function _stateAddGain(s,gain){
 }
 
 // Compute DB gain for one skill in one week, given context
-function _weekGain(state,tw,td,coachEff,formSk){
+function _weekGain(state,tw,td,coachEff,formSk,isGk){
   const sk=state.skill,level=state.level,age=tw.age;
+  // v26: LOCKED-SKILL GUARD.  An outfield player never accumulates keeper XP —
+  // not from individual training, not from general training.  The game
+  // prevents the combination outright.  Every other keeper path in this file
+  // already enforced it (_gtXp, _weekXpContribution), but the SUBSKILL
+  // SIMULATOR did not, so on an outfielder keeper drew GT every single week.
+  // Measured on the 26 outfielders of the reference squad: keeper subskill
+  // rose a mean +0.357 of a level above the anchor it was seeded at (max
+  // +0.691), and 21 of the 26 ended at >= 0.85 — i.e. the model had them
+  // about to pop a keeper level from general training, which cannot happen.
+  // With the guard, keeper accrues EXACTLY zero DB across the walk (verified
+  // to 0e0 against the seed on all 26) and the >= 0.85 count is 0.
+  //
+  // Honest note on the blast radius: keeper carries the x4 weight in the
+  // Mikoos value formula, so the drift did reach `valueResidualPct` — but by
+  // only 0.03-0.08 pp, because an outfielder's keeper sits at L0-L3 where the
+  // absolute value contribution is small.  Mean |residual| moves 6.11% ->
+  // 6.35% and 9 of 26 improve, so this is NOT a value-accuracy fix and must
+  // not be sold as one; the residual was mildly better before by accident.
+  // It is a physics fix: the simulator was modelling XP the game never grants.
+  //
+  // Mirrors subskill.py `_compose_intensity`, which has always had this guard,
+  // and TrainingWeek.gt_xp's `is_gk=False` default: when the flag is unknown,
+  // freeze keeper — right for the outfielders who are the large majority, and
+  // merely conservative for the rest.
+  if(sk==="keeper"&&!isGk)return 0.0;
   const max=sk==="stamina"?_LEVELS_STAM:_LEVELS_STD;
   if(level>=max)return 0.0;
   if(sk==="stamina")return _DB_PER_STAM/52.0; // fixed: ~1 level/season
@@ -1414,14 +1545,14 @@ function _initStates(skills,form,realValue){
 }
 
 // Process one week's update on the states
-function _updateStates(states,tw,td,coachEff,formationFallback){
+function _updateStates(states,tw,td,coachEff,formationFallback,isGk){
   if(tw.severeInjury)return; // no XP this week
   const formSk=tw.isFormation?(tw.formationSkill||formationFallback):null;
   for(const sk in states){
     const state=states[sk];
     const newLevel=tw.skills[sk]??state.level;
     const popped=(tw.skillsChange[sk]||0)>0||newLevel>state.level;
-    const gain=_weekGain(state,tw,td,coachEff,formSk);
+    const gain=_weekGain(state,tw,td,coachEff,formSk,isGk);
     if(popped){
       const earned=_stateAddGain(state,gain);
       const totalAccum=state.dbAccum+earned;
@@ -1444,12 +1575,17 @@ function _updateStates(states,tw,td,coachEff,formationFallback){
 // Top-level driver: full forward simulation over a sorted history
 // Returns per-skill subskills (0–1 fractions) at the latest report.
 // `td` is talent_db (0–100, NOT YS talent). Pass NaN to use td=70 default.
-function simulateSubskills(reports,td,coachEff){
+function simulateSubskills(reports,td,coachEff,isGk){
   if(!reports||reports.length===0)return null;
   if(coachEff==null)coachEff=1.0;
   if(!isFinite(td))td=70.0;
   // Sort ascending just to be safe
   const hist=[...reports].sort((a,b)=>(a.week||0)-(b.week||0));
+  // v26: resolve isGk HERE rather than making it the caller's job.  Both
+  // existing call sites pass a raw report list and have no flag to hand, and
+  // a locked-skill rule that depends on every caller remembering to thread a
+  // parameter is the rule that goes missing.  Explicit override still wins.
+  const _isGk=isGk!=null?isGk:_detectIsGk(hist[hist.length-1].skills||{},hist);
   // First report = anchor
   const first=hist[0];
   const anchorSkills=first.skills||{};
@@ -1461,7 +1597,7 @@ function simulateSubskills(reports,td,coachEff){
   // Walk forward from the SECOND report (first is anchor, no update)
   for(let i=1;i<hist.length;i++){
     const tw=_parseRecord(hist[i]);
-    _updateStates(states,tw,td,coachEff,formationFallback);
+    _updateStates(states,tw,td,coachEff,formationFallback,_isGk);
   }
   // Extract subskills (0–1 fractions)
   const subs={};
@@ -1483,6 +1619,7 @@ function simulateSubskills(reports,td,coachEff){
     weeksProcessed:hist.length,
     formationFallback,
     talentUsed:td,
+    isGk:_isGk,   // v26: which way the keeper lock resolved, for the UI
   };
 }
 
@@ -1716,12 +1853,20 @@ function _weekXpContribution(tw,skill,coachDb,isGk){
 // Build a closed gap from accumulated week records.
 // Returns [gap, dropBad]. dropBad=true means any week was drop-eligible
 // for this skill — caller must discard the gap and increment nDrop.
-function _finaliseMixedGap(skill,levelBefore,weekStart,weekEnd,weekRecords,hasKnownStart){
+// v26: `carryXpRaw` / `carryAge` are the PREVIOUS gap's pop-week XP for this
+// skill and the age it was earned at — the carry ceiling for chained gaps
+// (talent.py v12 C1a).  Weekly XP is age-equivalenced to the pop-week age
+// (v12 C1b) so that both sides of the threshold comparison are denominated
+// at the same age.
+function _finaliseMixedGap(skill,levelBefore,weekStart,weekEnd,weekRecords,hasKnownStart,
+                           carryXpRaw,carryAge){
   if(!weekRecords.length)return[null,true];
-  const xps=weekRecords.map(w=>w.xp);
+  const agePop=weekRecords[weekRecords.length-1].age;
+  const xps=weekRecords.map(w=>_ageEq(skill,levelBefore,agePop,w.age,w.xp));
   const xpTotal=xps.reduce((a,b)=>a+b,0);
   const xpFirst=xps[0],xpLast=xps[xps.length-1];
-  const agePop=weekRecords[weekRecords.length-1].age;
+  const carryXpMax=(hasKnownStart&&carryXpRaw>0)
+    ?_ageEq(skill,levelBefore,agePop,carryAge,carryXpRaw):0.0;
   const thr=_canonThr(skill,levelBefore,agePop);
   let dropBad=false;
   for(const w of weekRecords)if(_dropEligible(skill,w.age)){dropBad=true;break;}
@@ -1730,7 +1875,7 @@ function _finaliseMixedGap(skill,levelBefore,weekStart,weekEnd,weekRecords,hasKn
   const gtWeeks=weekRecords.filter(w=>w.kind==="gt").length;
   const gap={skill,levelBefore,weekStart,weekEnd,
     weeksElapsed:weekRecords.length,
-    xpTotal,xpFirst,xpLast,thresholdRaw:thr,hasKnownStart,
+    xpTotal,xpFirst,xpLast,carryXpMax,thresholdRaw:thr,hasKnownStart,
     ageMid:agePop,directWeeks,formationWeeks,gtWeeks};
   return[gap,dropBad];
 }
@@ -1743,6 +1888,7 @@ function _extractMixedGaps(history,skill,coachDb,isGk){
   const gaps=[];
   let nDrop=0,isFirst=true;
   let gapStartWeek=null,gapLevel=null,weekRecords=[];
+  let prevPopXp=0.0,prevPopAge=null;   // v26 (v12 C1a): previous pop's week XP
   for(const rec of history){
     const tw=_parseRecord(rec);
     const currLv=tw.skills[skill]??0;
@@ -1757,7 +1903,12 @@ function _extractMixedGaps(history,skill,coachDb,isGk){
     weekRecords.push({age:tw.age,xp,kind});
     if(popped){
       const hasKnownStart=!isFirst;
-      const[gap,dropBad]=_finaliseMixedGap(skill,gapLevel,gapStartWeek,tw.week,weekRecords,hasKnownStart);
+      const[gap,dropBad]=_finaliseMixedGap(skill,gapLevel,gapStartWeek,tw.week,weekRecords,hasKnownStart,
+                                           prevPopXp,prevPopAge);
+      // Set AFTER finalising (this pop is the NEXT gap's carry) and BEFORE the
+      // drop check, so a discarded gap still hands its carry on — matches
+      // talent.py extract_mixed_gaps exactly.
+      prevPopXp=xp;prevPopAge=tw.age;
       if(dropBad)nDrop+=1;
       else if(gap)gaps.push(gap);
       gapStartWeek=tw.week;
@@ -1785,10 +1936,17 @@ function _extractOpenMixedGap(history,skill,coachDb,isGk){
     weekRecords.push({age:tw.age,xp,kind});
   }
   if(!weekRecords.length||gapLevel===null)return null;
-  const xps=weekRecords.map(w=>w.xp);
+  // v26 (talent.py v13 A2): age-equivalence the weekly XP here too.  The
+  // threshold below is priced at ageEnd, so the XP compared against it must
+  // be priced at ageEnd as well; v12 added this to the closed-gap path and
+  // left the open one summing raw XP, mis-pricing any gap spanning a birthday
+  // by the ~10%/yr age factor.  Every multiplier is >= 1, so the sum GROWS
+  // and the no-pop cap thr/sum gets TIGHTER — the raw sum was a valid but
+  // weaker bound, so this recovers evidence rather than fixing unsoundness.
+  const ageEnd=weekRecords[weekRecords.length-1].age;
+  const xps=weekRecords.map(w=>_ageEq(skill,gapLevel,ageEnd,w.age,w.xp));
   const xpTotal=xps.reduce((a,b)=>a+b,0);
   const xpFirst=xps[0];
-  const ageEnd=weekRecords[weekRecords.length-1].age;
   const thr=_canonThr(skill,gapLevel,ageEnd);
   const directWeeks=weekRecords.filter(w=>w.kind==="direct").length;
   const formationWeeks=weekRecords.filter(w=>w.kind==="formation").length;
@@ -1798,11 +1956,41 @@ function _extractOpenMixedGap(history,skill,coachDb,isGk){
     directWeeks,formationWeeks,gtWeeks};
 }
 
-// eff → talent_db, bounds-aware (talent.py _eff_to_td).
-// eff > 1.0 means "no constraint": hi-bound returns 100, lo-bound returns 1.
+// eff → talent_db, bounds-aware (constants.py `talent_db_from_eff_senior`).
+// v26: exact parity with the desktop clamp, which this had drifted from at
+// both ends.  Desktop:
+//     eff_pct >= 100  ->  hi: 100.0   lo: 1.0
+//     eff_pct <=  40  ->  1.0  on BOTH bounds  (constants v12 symmetric floor)
+//     otherwise       ->  (eff_pct - 40) / 0.6
+// The old form returned (eff-0.40)/0.60*100 for every eff <= 1.0, so at
+// eff = 0.40 it produced 0.0 where the desktop produces 1.0, and below 0.40
+// it went NEGATIVE.  constants v12 made that floor symmetric precisely
+// because the asymmetric version handed callers the INVERTED interval
+// [1.0, 0.0], which `estimateTalent` cannot tell from a real contradiction
+// and would route into the contradictory branch as if it were evidence.
+// Callers filter eff < 0.40 first, so this is an exact-boundary fix rather
+// than a common path — but it is the boundary that fabricates contradictions.
 function _effToTd(eff,bound){
-  if(eff<=1.0)return(eff-0.40)/0.60*100.0;
-  return bound==="hi"?100.0:1.0;
+  const p=eff*100.0;
+  if(p>=100.0)return bound==="hi"?100.0:1.0;
+  if(p<=40.0)return 1.0;
+  return(p-40.0)/0.6;
+}
+
+// v26: express one week's XP in pop-age equivalents (talent.py `_age_eq`,
+// v12 C1b).  The gap's threshold is priced at the pop-week age, but XP earned
+// younger bought DB at that younger age's cheaper rate, so the same XP earned
+// younger is worth MORE against a pop-age threshold:
+//     xp_eq = xp * thr(age_pop) / thr(age_w)
+// Pricing every week at pop age under-credits younger weeks by up to ~10%/yr
+// in the steep bands.  Weeks are chronological so age_w <= age_pop and every
+// multiplier is >= 1.
+function _ageEq(skill,level,agePop,ageW,xp){
+  if(ageW==null||ageW===agePop)return xp;
+  const tPop=_canonThr(skill,level,agePop);
+  const tW=_canonThr(skill,level,ageW);
+  if(!isFinite(tPop)||!isFinite(tW)||tW<=0)return xp;
+  return xp*(tPop/tW);
 }
 
 // Closed-gap [td_lo, td_hi] (talent.py estimate_gap_bounds, use_subskill=False).
@@ -1820,11 +2008,18 @@ function _estimateGapBounds(gap){
     if(effHi<0.40)return[null,null];
     tdHi=_effToTd(effHi,"hi");
   }
-  // Lower bound — known-start: denom = total + first (carry-in bounded
-  // by xp_first); partial: no informative lower bound.
+  // Lower bound — known-start: denom = total + carry ceiling.
+  // v26 (talent.py v12 C1a): the carry allowance is the PREVIOUS gap's
+  // pop-week XP (the residual db_accum - thr that crossed into this level),
+  // NOT this gap's own first week.  xp_first was a wrong-week proxy: after a
+  // GT pop week it over-allowed little, but it also MISSED real direct-week
+  // carry and smeared the bound with an unrelated week.  Partial gaps have no
+  // previous pop, so carryXpMax is 0 and they get no informative lower bound
+  // anyway.  `|| 0` guards shapes without the field (e.g. an OpenGap, which
+  // never declares it) rather than yielding NaN.
   let tdLo;
   if(gap.hasKnownStart){
-    const denomLo=gap.xpTotal+gap.xpFirst;
+    const denomLo=gap.xpTotal+(gap.carryXpMax||0);
     const effLo=thr/denomLo;
     if(effLo<0.40)return[null,null];
     tdLo=_effToTd(effLo,"lo");
@@ -1893,6 +2088,83 @@ function _detectIsGk(latestSkills,history){
   return kp>maxOf;
 }
 
+// ─── Reliability-weighted coverage (port of talent_weighting.py v5) ───────
+// v26: the layer this file was missing entirely, and the single dominant
+// cause of the remaining desktop divergence — it decides BOTH the verdict
+// (depth-weighted centroid, replacing the intersection midpoint) and the
+// confidence label (peak's share of total weight, replacing the count rule).
+//
+//     depth(td) = Σ weight_g · 1[td ∈ [lo_g, hi_g]]
+//     region    = {td : depth(td) >= max_depth − PEAK_TOL · total}
+//     point     = Σ_region depth·td / Σ_region depth
+//
+// weight = c_comp · c_signal · c_accuracy:
+//   c_comp     trust by composition — a pure-GT gap floors at GT_TRUST_GAMMA,
+//              pure-direct reaches 1.0 (direct weeks are the cleaner signal).
+//   c_signal   inverse bound width; a one-sided bound is charged the full
+//              ONE_SIDED_W so it counts but cannot dominate.
+//   c_accuracy engine scatter by level band, (pooled/band)^1.5 — low levels
+//              scatter ~2x more (small thresholds, one-week carry is a large
+//              fraction), so they are de-emphasised, never discarded.
+//
+// One deliberate improvement over the desktop: it recovers WeightedGaps by
+// REGEX-PARSING its own formatted per-gap log strings.  Here the rows are
+// built structurally at the point the bounds are computed, so there is no
+// format/parser coupling to drift.  Selection matches `parse_per_gap`
+// exactly: every closed gap that produced bounds (INCLUDING ones the
+// consensus tagged OUTLIER — the weighting subsumes that flag rather than
+// honouring a hard drop) plus every no-pop cap as [1, ub].
+const _TW_GAMMA=0.25;      // c_comp floor for a pure-GT gap
+const _TW_XP_DIRECT=89.0;  // direct-week XP at I=96, C=93 (trust proxy only)
+const _TW_XP_GT=13.0;      // GT-week XP at I=96, C=93
+const _TW_ONE_SIDED_W=100.0;
+const _TW_ACC_EXP=1.5;
+const _TW_PEAK_TOL=0.05;
+const _TW_BAND_RMSE={pooled:0.232,"L0-5":0.313,"L6-8":0.255,
+                     "L9-11":0.173,"L12-14":0.153,"L15-17":0.143}; // coupled
+function _twBand(lv){
+  return lv<=5?"L0-5":lv<=8?"L6-8":lv<=11?"L9-11":lv<=14?"L12-14":"L15-17";
+}
+function _twWeight(g){
+  const direct=_TW_XP_DIRECT*g.D, gt=_TW_XP_GT*(g.G+g.F);
+  const share=(direct+gt)>0?direct/(direct+gt):0.0;
+  const cComp=_TW_GAMMA+(1.0-_TW_GAMMA)*share;
+  const oneSided=(g.lo<=1.0)||(g.hi>=100.0);
+  const cSignal=oneSided?(1.0/_TW_ONE_SIDED_W):(1.0/Math.max(g.hi-g.lo,1.0));
+  const rmse=_TW_BAND_RMSE[_twBand(g.level)]??_TW_BAND_RMSE.pooled;
+  const cAcc=rmse>0?Math.pow(_TW_BAND_RMSE.pooled/rmse,_TW_ACC_EXP):1.0;
+  return cComp*cSignal*cAcc;
+}
+// Returns null when there is no weight to work with (caller keeps the
+// intersection verdict), else {point, lo, hi, frac, rho, total}.
+function _weightedCoverage(gaps,step,peakTol){
+  step=step||0.5; peakTol=peakTol==null?_TW_PEAK_TOL:peakTol;
+  let total=0;
+  for(const g of gaps){g.w=_twWeight(g);total+=g.w;}
+  if(!(total>0))return null;
+  const xs=[],deps=[];
+  for(let td=1.0;td<=100.0+1e-9;td+=step){
+    let d=0;
+    for(const g of gaps)if(g.lo<=td&&td<=g.hi)d+=g.w;
+    xs.push(td);deps.push(d);
+  }
+  const best=Math.max(...deps);
+  const thresh=best-peakTol*total;
+  let lo=Infinity,hi=-Infinity,wsum=0,acc=0;
+  for(let i=0;i<xs.length;i++){
+    if(deps[i]>=thresh){
+      if(xs[i]<lo)lo=xs[i];
+      if(xs[i]>hi)hi=xs[i];
+      wsum+=deps[i];acc+=deps[i]*xs[i];
+    }
+  }
+  if(!isFinite(lo))return null;
+  const point=wsum>0?acc/wsum:(lo+hi)/2.0;
+  let rhoW=0;
+  for(const g of gaps)if(g.hi>=100.0&&g.lo>1.0)rhoW+=g.w;
+  return{point,lo,hi,frac:best/total,rho:rhoW/total,total};
+}
+
 // ─── Main estimator ──────────────────────────────────────────────────────
 // Returns:
 //   {td, tdLo, tdHi, confidence, nGaps, nGtGaps, nDirectGaps, nNoPopBounds,
@@ -1907,7 +2179,8 @@ function estimateTalent(history,options){
   const empty={td:NaN,tdLo:NaN,tdHi:NaN,confidence:"no_data",
     nGaps:0,nGtGaps:0,nDirectGaps:0,nNoPopBounds:0,nNoPopSkills:0,
     nExclDrop:0,nExclRange:0,excludedSkills:[],perGap:[],notes:["no history"],
-    isGk:false,contradictory:false,balanceEvents:[]};
+    isGk:false,contradictory:false,balanceEvents:[],
+    nHardGaps:0,nConcurringGaps:0,boundOnly:false};
   if(!history||!history.length)return empty;
   // Sort ascending defensively (parser already does this, but cheap to repeat)
   const hist=[...history].sort((a,b)=>(a.week||0)-(b.week||0));
@@ -1928,6 +2201,18 @@ function estimateTalent(history,options){
 
   const allLo=[],allHi=[],allPgIdx=[];
   const perGapLog=[];
+  // v26: HARD bounds, collected structurally where lo/hi are still numbers
+  // rather than re-parsed out of the formatted per-gap strings later.
+  // Entries are {skill, level, lo, hi}.  Mirrors talent.py v16 `_hard_bounds`.
+  // HARD = known-start, i.e. it rests on no assumed carry-in.  (In this file
+  // that is the ONLY condition: `_estimateGapBounds` takes no subskill
+  // carry-in, so there is no soft-anchored gap to exclude — the desktop's
+  // `is_soft_derived` test is vacuously false here.)
+  // INFORMATIVE = constrains at least one side.  A gap like 79-100 pins only
+  // from below, but that bound is real and assumption-free, so it counts;
+  // requiring BOTH sides would discard most genuine pop evidence.
+  const _hardBounds=[];
+  const _wGaps=[];  // v26: rows for the reliability-weighted coverage verdict
   const balanceEvents=[]; // v14: feed for the balance-v1 estimator
   let gtGapCount=0,directGapCount=0;
   let nExclDrop=0,nExclRange=0,nNoPopSkills=0;
@@ -1947,6 +2232,29 @@ function estimateTalent(history,options){
       // td-consistent interval, so at candidate td: td<lo ⇒ under (model
       // late — raise talent), td>hi ⇒ over. Level keys the band weight.
       if(g.hasKnownStart)balanceEvents.push({lo,hi,level:g.levelBefore,skill:g.skill});
+      // v26: hard + informative-on-at-least-one-side → an agreement vote
+      if(g.hasKnownStart&&(lo>1.0||hi<100.0)){
+        _hardBounds.push({skill:g.skill,level:g.levelBefore,lo,hi});
+      }
+      // v26: every bounded gap is a coverage row, outlier tag or not.
+      // Bounds are ROUNDED to integer DB deliberately.  The desktop recovers
+      // these rows by regex-parsing its own display strings, which are
+      // formatted '%.0f', so its weighting silently runs on rounded bounds.
+      // Feeding exact floats here is more principled AND measurably diverges:
+      // 7 of 17 squad verdicts move, worst 7.9 DB on 39117069.  Parity with
+      // the reference implementation wins over local correctness, because the
+      // desktop number is what the rest of the pipeline is calibrated against
+      // — but see the note this leaves in the KB: a sub-DB rounding change
+      // moving a verdict 8 DB means that verdict was never determined by the
+      // evidence in the first place.  On 39117069 two contradictory hard gaps
+      // (playmaking L11 [51-56] w=0.190, technique L14 [69-74] w=0.182) carry
+      // 68% of the weight between them and do not overlap; which one wins the
+      // near-peak region is decided by the third decimal.  That is the
+      // Tabaczynski contradiction again, and it wants a real resolution
+      // rather than a tie-break.
+      _wGaps.push({lo:lo>1?Math.round(lo):1.0,hi:hi<100?Math.round(hi):100.0,
+                   level:g.levelBefore,
+                   D:g.directWeeks,G:g.gtWeeks,F:g.formationWeeks});
       if(g.hasKnownStart){
         if(!(skill in skillKsRanges))skillKsRanges[skill]={los:[],his:[]};
         if(lo>1.0)skillKsRanges[skill].los.push(lo);
@@ -1980,6 +2288,9 @@ function estimateTalent(history,options){
     if(ub>=100)continue;
     const pgIdx=perGapLog.length;
     nopopHiCaps.push({ub,skill:og.skill,level:og.level,nWeeks:og.nWeeks,pgIdx});
+    // v26: no-pop cap as [1, ub]; rounded for the same parity reason as above
+    _wGaps.push({lo:1.0,hi:Math.round(ub),level:og.level,
+                 D:og.directWeeks,G:og.gtWeeks,F:og.formationWeeks});
     nNoPopBounds+=1;
     perGapLog.push(["OpenGap",og.skill,og.level,
       `${_compositionTag(og)} <${Math.round(ub)} (${og.nWeeks}w no pop)`]);
@@ -2098,6 +2409,103 @@ function estimateTalent(history,options){
   else confidence="no_data";
 
   const notes=[];
+
+  // v26: the weighted-coverage verdict SUPERSEDES the intersection above.
+  // The intersection block still runs, because its consensus exclusions and
+  // flat-vs-consensus notes are diagnostics worth keeping; but where coverage
+  // fires it owns the point, the band and the label.  Mirrors talent.py: the
+  // label comes from the peak's SHARE of total evidence weight, not from
+  // counting gaps by type — 0.80 / 0.55 are the desktop's thresholds.
+  let _wcovUsed=false,_frac=null;
+  const _res=_weightedCoverage(_wGaps);
+  if(_res&&isFinite(_res.point)&&_res.total>0){
+    point=_res.point;loFinal=_res.lo;hiFinal=_res.hi;
+    _frac=_res.frac;
+    confidence=_frac>=0.80?"reliable":(_frac>=0.55?"indicative":"unreliable");
+    _wcovUsed=true;
+    notes.push(`weighted coverage: ${(_frac*100).toFixed(0)}% of evidence weight on [${_res.lo.toFixed(0)}-${_res.hi.toFixed(0)}], centroid point ${_res.point.toFixed(1)} (ρ=${_res.rho.toFixed(2)})`);
+  }
+
+  // ── v26: AGREEMENT GATE (port of talent.py v16) ───────────────────────────
+  // The rule above counts evidence VOLUME by type.  Volume is necessary but
+  // not sufficient: Tabaczyński (31) has four hard gaps whose ranges do not
+  // overlap at all — defending 73-100, defending 32-41, pace 46-68, passing
+  // 52-59 — and four mutually contradictory readings are not four
+  // confirmations.  One of them is contaminated (a drop, a missed week, a
+  // wrong carry), and averaging through the contradiction is not a
+  // resolution.  A read is reliable only when independent pops AGREE.
+  //
+  // So count CONCURRING gaps — hard bounds whose own range contains the
+  // adopted verdict — and let that CAP the label:
+  //     >= 2 concurring  ->  the count rule above stands
+  //        1 concurring  ->  at most 'indicative'
+  //        0 concurring  ->  'unreliable'
+  // The gate only ever DEMOTES; it never promotes a label the count rule
+  // withheld.  Zero hard gaps lands in the last case, so "no hard evidence"
+  // is the degenerate instance of the stricter rule rather than a special
+  // case.  Deliberately layered ON TOP of the existing rule rather than
+  // replacing it, because the two codebases reach a base label by different
+  // routes (desktop via weighted coverage, here by type counts) and the
+  // desktop applies its gate the same way — as a cap.
+  const _nHard=_hardBounds.length;
+  const _nConc=_hardBounds.filter(b=>b.lo-1e-9<=point&&point<=b.hi+1e-9).length;
+  // Expressed as a CEILING the base label is clamped to, not as an assignment.
+  // Writing it as `else if(_nConc===0) confidence="unreliable"` — the literal
+  // shape of the desktop code — silently PROMOTES: here "no_data" ranks BELOW
+  // "unreliable" and means "no evidence at all", so a player with zero hard
+  // gaps got upgraded from no_data to unreliable by a rule meant to restrict.
+  // Measured on the squad before this was caught: 3 promotions, 0 demotions —
+  // the gate was doing the exact opposite of its purpose.  The desktop is not
+  // wrong there because its base label comes from weighted coverage and never
+  // sits at no_data by that point; the difference is in the base rule, so the
+  // port has to clamp by rank rather than copy the branch.
+  //
+  // Measured effect on the reference squad: the gate DEMOTES 8 of 42 and
+  // promotes none.  (It was inert while the old count rule supplied the base
+  // label — that rule demanded >= 2 pure-GT gaps and was already stricter
+  // than the gate.  Weighted coverage is far more permissive, so the gate now
+  // does the work it was written for.)  Five of the eight have ZERO hard gaps
+  // and read bound-only bands — [1,55], [1,80], [1,74], [1,56], [1,86] —
+  // which coverage alone labels "reliable" purely because concentrated weight
+  // sits on a single unopposed interval.
+  //
+  // Ages 32/31/31/28/28/24/22/18: this is the sokker_20 old-player artefact
+  // reproducing online, and it is why coverage and this gate had to ship
+  // together.  Porting weighted coverage on its own would have imported
+  // exactly the defect talent.py v15/v16 was written to fix.
+  const _RANK={no_data:0,unreliable:1,indicative:2,reliable:3};
+  const _CEIL=_nConc>=2?"reliable":(_nConc===1?"indicative":"unreliable");
+  if(_RANK[confidence]>_RANK[_CEIL])confidence=_CEIL;
+
+  // ── v26: BOUND-ONLY REPORTING — LABEL ONLY, BOUNDS UNTOUCHED ─────────────
+  // The desktop (talent.py v16) also REWRITES the band here: lo:=1 and
+  // hi:=min(no-pop caps, hard gaps' own upper bounds).  That is right THERE
+  // and wrong HERE, and the difference is worth stating because it is the
+  // whole reason this is not a copy.
+  //
+  // Desktop runs with a SOFT ANCHOR: a partial gap's bounds come from
+  // thr_eff = thr x (1 - s) for an assumed carry-in s nobody measured, which
+  // manufactures a floor (Romano's honest [1, 80] printed as [38, 44]).
+  // Rewriting the band there DISCARDS A FABRICATION.
+  //
+  // This file has no soft anchor at all — `_estimateGapBounds` takes no
+  // carry-in, so a partial gap gets lo = 1.0 and an upper bound derived from
+  // xpTotal - xpLast alone.  That ceiling is exactly as assumption-free as a
+  // no-pop cap.  Two consequences: (a) no floor is ever fabricated, so there
+  // is nothing to undo — verified on the squad, all 4 no-hard-gap players
+  // already had tdLo === 1.0 before this branch; (b) restricting the ceiling
+  // to hard gaps would THROW AWAY REAL EVIDENCE, which is the one thing this
+  // project does not do — measured cost when I first ported it literally:
+  // 55.2 -> 100, 87.4 -> 100, 62.6 -> 100, 61.5 -> 100, i.e. four genuine
+  // upper bounds deleted to solve a problem this codebase does not have.
+  //
+  // So the port keeps the HONEST LABEL and drops the band surgery.
+  const _hasFloor=_hardBounds.some(b=>b.lo>1.0);
+  const _boundOnly=!_hasFloor;
+  if(_boundOnly&&isFinite(hiFinal)){
+    notes.push(`UPPER BOUND ONLY — no hard gap pins talent from below; the evidence excludes talent above ${hiFinal.toFixed(0)} and says nothing below it. Point ${point.toFixed(1)} is a best guess, not a measurement.`);
+  }
+  notes.push(`hard gaps: ${_nHard}, concurring with the verdict: ${_nConc} (confidence requires AGREEMENT across pops, not just evidence volume)`);
   if(contradictory)notes.push(`contradictory bounds (lo=${loFinal.toFixed(0)} > hi=${hiFinal.toFixed(0)}) — model/carry-in approximation error`);
   if(excludedSkills.length)notes.push(`consensus excluded: ${excludedSkills.join(", ")}`);
   if(loFlat!==loFinal||hiFlat!==hiFinal)notes.push(`flat intersection [${loFlat.toFixed(0)}-${hiFlat.toFixed(0)}]`+(loFlat>hiFlat?" ⚠":""));
@@ -2114,6 +2522,7 @@ function estimateTalent(history,options){
     nNoPopBounds,nNoPopSkills,nExclDrop,nExclRange,
     excludedSkills,perGap:perGapLog,notes,isGk,contradictory,
     balanceEvents,
+    nHardGaps:_nHard,nConcurringGaps:_nConc,boundOnly:_boundOnly, // v26
   };
 }
 
