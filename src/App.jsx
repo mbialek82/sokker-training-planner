@@ -9,6 +9,62 @@ import React, { useState, useMemo, useCallback, useEffect, useRef } from "react"
 //   desktop tree; the ESTIMATOR still differs (see sokker_37).
 //   Corpus 7 half-split: MAE 1.48 -> see sokker_37 for the v29 figure.
 //
+// SOKKER TRAINING PLANNER v31 — ONE DB/LEVEL AXIS, ONE K
+//
+// v31 (Aug 2026) finishes what v30 started.  Three things:
+//
+//  1. ONE DB/LEVEL CONVERSION.  Until now the engine priced a level two
+//     ways: thresholds integrated per_db_cost over the UNIFORM span
+//     100/18 = 5.5556 DB, while the accumulation axis used the INTEGER
+//     LEVEL_WIDTHS (5 or 6, alternating).  _DBPL = 100/18 is now the
+//     single conversion — db gain, _dbFloor, _dbThresh and the planner's
+//     level->DB map all read it.  _LW / _LDS survive ONLY as the legacy
+//     integer THRESHOLD geometry (_SPAN==='integer').
+//     HONEST RESULT: on the desktop ESTIMATOR this change is a measured
+//     NO-OP — byte-identical benchmark at matched K.  The level-fraction
+//     arithmetic cancels (db_gain/width == xp/thr whatever the width), and
+//     since the live clamp is a FRACTION of the level, it cancels too.
+//     Where it is not a no-op is the ABSOLUTE DB position: db_floor was
+//     ceil(100L/18), up to 0.889 DB above the true boundary (worst at L2
+//     and L11), and that is what the UI and the planner display.
+//
+//  2. THE CLAMP — a v30 BUG, fixed.  v30 ported `db_accum <= threshold-1`
+//     from subskill._update_drop_eligible, which is the DROP-ELIGIBLE
+//     path: it logs no over/under events and is outside calibration scope.
+//     The live clamp is CEIL_CONSERVE_FRAC = 0.99 of the level, whose own
+//     changelog says the thresh-1 pin "shed ~1 real DB per crossing,
+//     starving the next interval and manufacturing a phantom downstream
+//     under-event that pinned talent_balance's coupled verdict at the 100
+//     cap".  Correcting it moved parity 1.37 -> 1.14 DB mean absolute.
+//
+//  3. ONE K.  15.2 in BOTH engines, re-anchored to implied-efficiency
+//     ratio = 1.000 on corpus 7 (sweep: 15.4 -> 1.006, 15.2 -> 1.000,
+//     15.0 -> 0.994, 14.8 -> 0.992).  The 14.4/15.4 split existed only to
+//     compensate for two different estimators and is retired.
+//
+// Measured, 118 matched players, against constants.py v14:
+//                       v29        v30       v31     desktop v14
+//   mean |dtd|         7.88 DB   1.37 DB   1.16 DB       —
+//   median dtd        -4.70 DB   0.00 DB   0.00 DB       —
+//   within 2 DB          11%       84%       83%         —
+//   within 5 DB          31%       89%       97%         —
+//   players at ceiling     8         2         2         0
+//   players >= 95         17        11         7         6
+//   pop-timing MAE      0.90      1.00      1.01       1.01
+//   implied-eff ratio   0.955     1.001     1.000      1.005
+//
+// Desktop v14 also gained from the K re-anchor alone: band coverage
+// 64.4% -> 66.4%, open-gap false positives 2.0% -> 1.7%, half-vs-half
+// mean |dtd| 10.46 -> 10.19.
+//
+// STILL OPEN: ~1.16 DB residual, concentrated above td 95 — the tracker's
+// under-event bookkeeping (desktop keeps whole DB in db_accum with the
+// fraction in a separate _gain_buf).  And the surplus-redistribution
+// question: an overshoot the anchor could absorb is currently spent as a
+// talent vote instead.  anchor_refiner.py already implements that
+// ("no overshoot can stay") but only on the DISPLAY path, not here.
+//
+// ─────────────────────────────────────────────────────────────────────
 // SOKKER TRAINING PLANNER v30 — ENGINE PARITY WITH THE DESKTOP TREE
 //
 // v30 (Aug 2026) closes the online<->desktop estimator gap.  Measured on
@@ -703,7 +759,7 @@ function _setCoach(c){
 // (18*d+9)//100 is reverted to the plain floor (18*d)//100, so boundaries
 // sit at ceil(100*L/18).  MUST stay byte-identical to constants.py's
 // LEVEL_WIDTHS; if you touch one, bump and touch the other.
-const _CK=15.4,_CX=50.0,_CA=0.10,_CAGE0=16;
+const _CK=15.2,_CX=50.0,_CA=0.10,_CAGE0=16;
 // ── v29: calibration parity with constants.py v13.2 ────────────────────
 // These three MUST stay in lockstep with the desktop tree:
 //   _CK    <-> COUPLED_K_DEFAULT   — DELIBERATELY DIFFERENT: 14.4 here,
@@ -729,6 +785,13 @@ function _ageF(a){
   if(!isFinite(_AT))return 1;
   const dy=Math.max(0,a-_CAGE0);return Math.exp(Math.pow(dy/_AT,3));
 }
+// v31: ONE DB/LEVEL CONVERSION (constants.py v14 parity).
+// _LW / _LDS are RETAINED as the legacy integer THRESHOLD geometry
+// (_SPAN==='integer', the v28 comparison path) — do not delete them.
+// Everything on the ACCUMULATION axis now uses _DBPL = 100/18 instead,
+// so XP->DB and the threshold finally agree on what a DB is.
+const _DBPL=100/18;               // 5.5556 DB — the one conversion
+const _DB_AXIS='uniform';         // 'uniform' | 'integer' (legacy)
 const _LW=[6,6,5,6,5,6,5,6,5,6,6,5,6,5,6,5,6,5,1];
 const _LDS=(()=>{const a=[0];for(let i=0;i<_LW.length-1;i++)a.push(a[a.length-1]+_LW[i]);return a;})();
 // _LDS = [0,6,12,17,23,28,34,39,45,50,56,62,67,73,78,84,89,95,100]
@@ -792,12 +855,17 @@ function _applyXp(s,xp,sk,a,te){
 }
 function _sub(s,sk,a,te){if(s.lv>=_MX)return 0;const f=_dt(sk,s.lv,a,te);if(f<=0)return 1;return(s.du*(f/_U)+s.xp)/f;}
 function _tdb(s,sk,a,te){
-  // v23 FIX 3: map level->DB through the CANONICAL tables, not the uniform
-  // 100/18 average.  `s.lv*_R` puts L11 at 61.11 where the real floor is 62
-  // (error -0.56 to -0.89 DB across the range) — the same averaging desktop
-  // planner.py v3.1 abandoned.  Widths alternate 5/6 because 100/18 is not an
-  // integer, so a single average cannot be right at more than one level.
-  const _b=_LDS[Math.min(s.lv,_LDS.length-1)],_w=_LW[Math.min(s.lv,_LW.length-1)];
+  // v31: level->DB now goes through the AXIS, not the legacy tables.  The
+  // v23 note below argued the opposite — that 100/18 "puts L11 at 61.11
+  // where the real floor is 62".  That was true while the tables WERE the
+  // axis; since constants.py v14 the 100/18 boundary IS the real floor and
+  // the ceil()'d table is the thing that is off (by up to 0.889 DB).  The
+  // legacy branch is preserved behind _DB_AXIS==='integer'.
+  //   [v23 FIX 3, kept as history] map level->DB through the CANONICAL
+  //   tables, not the uniform 100/18 average ... widths alternate 5/6
+  //   because 100/18 is not an integer.
+  const _b=_dbFloor(Math.min(s.lv,18),false);
+  const _w=_dbThresh(Math.min(s.lv,18),false);
   const i=_b+(s.du/_U)*_w;if(!sk)return i;
   const c=_duc(sk,s.lv,a,te);return c<=0?i:i+(s.xp/c)*(_w/_U);
 }
@@ -1574,6 +1642,7 @@ const _LEVELS_STD=18,_LEVELS_STAM=11;
 const _DB_PER_LV=100/18,_DB_PER_STAM=100/11;
 const _GT_RATE=15,_COACH_DB=93;
 const _B_INT={pace:99,striker:90,technique:82,defending:82,playmaking:75,passing:75,keeper:75,stamina:null};
+const _CEIL_CONSERVE=0.99;        // v31: subskill.CEIL_CONSERVE_FRAC
 const _UNDER_POP_CARRY_FRAC=0.5;   // v30: subskill.UNDER_POP_CARRY_FRAC
 const _STAM_PER_DB_XP=15.0;   // v30: subskill.STAMINA_PER_DB_XP
 const _STAM_THR=80; // _B_NORM retired in v14 (normaliser folded into _pdc)
@@ -1605,8 +1674,20 @@ const _VAL_TBL=(()=>{
 })();
 
 // DB geometry (subskill.py)
-function _dbFloor(lv,isStam){const d=isStam?11:18;return Math.ceil(lv*100/d);}
-function _dbThresh(lv,isStam){return _dbFloor(lv+1,isStam)-_dbFloor(lv,isStam);}
+// v31: on the uniform axis the boundary is the EXACT 100L/18, not the
+// ceil() of it — the ceil sat up to 0.889 DB above the true boundary
+// (worst at L2 and L11), which is where the absolute DB position and the
+// threshold span disagreed.  Stamina keeps its flat training axis.
+// subskill.py v14 db_floor / db_threshold parity.
+function _dbFloor(lv,isStam){
+  const d=isStam?11:18;
+  if(_DB_AXIS==='uniform'&&!isStam)return lv*100/18;
+  return Math.ceil(lv*100/d);
+}
+function _dbThresh(lv,isStam){
+  if(_DB_AXIS==='uniform'&&!isStam)return lv>=18?1:_DBPL;
+  return _dbFloor(lv+1,isStam)-_dbFloor(lv,isStam);
+}
 
 // Talent eff (constants.py)
 function _talEffSenior(td){return 40.0+60.0*(td/100.0);}
@@ -1648,7 +1729,7 @@ function _dbGainPerWeek(td,skill,level,age,intensity,coachEff){
   if(!(thr>0)||!isFinite(thr))return 0.0;
   const xp=Math.round(intensity*coachEff*_COACH_DB/100.0);   // integer XP
   if(xp<=0)return 0.0;
-  const width=_LW[level];
+  const width=(_DB_AXIS==='uniform')?(level>=18?1:_DBPL):_LW[level];
   return width*xp/thr;
 }
 
@@ -3096,33 +3177,38 @@ function _mkReplayNetFn(reports,coachDb,isGk,refTd){
           //   • the surplus is carried as DB and re-expressed in the NEW
           //     level's XP scale.  v29 carried raw XP across a level boundary
           //     whose threshold had changed, i.e. it changed value in transit.
-          const wOld=_LW[lv]||1;
+          const wOld=_dbThresh(lv,false)||1;   // v31: axis width
           const gainDb=thr>0?wOld*earned/thr:0;
           const realDb=(thr>0?wOld*carry/thr:0)+gainDb;
           const carryDb=(realDb>=wOld)?(realDb-wOld)
                                       :_UNDER_POP_CARRY_FRAC*Math.max(0,gainDb);
           lv=actual;                       // multi-level pops: leftover only
           thr=_dtRaw(sk,lv,tw.age)/eff;
-          const wNew=_LW[lv]||1;
+          const wNew=_dbThresh(lv,false)||1;   // v31: axis width
           carry=Math.max(0,carryDb*thr/wNew);
           if(carry>=thr)carry=thr*0.999;   // guard leftover >= new threshold
           continue;
         }
         // no pop this week
         carry+=earned;
-        // v30: desktop TRIGGERS the over event when the integer DB count
-        // would reach the full width (carry >= thr), but STORES only
-        // `threshold - 1` DB — the SubskillState clamp invariant, which
-        // discards the surplus.  Online stored the whole threshold, so a
-        // pinned skill sat a full DB high and every subsequent pop landed
-        // early.  Trigger and store are different quantities; conflating
-        // them (either way) moves the balance verdict several DB.
-        const satXp=thr*Math.max(0,(_LW[lv]-1))/Math.max(1,_LW[lv]);
+        // v31 CORRECTION: v30 ported the WRONG clamp.  `db_accum <=
+        // threshold - 1` lives in subskill._update_drop_eligible — the
+        // drop-eligible path, which logs no over/under events and is
+        // outside calibration scope.  The LIVE clamp on the calibration
+        // path is subskill.py v5.18's
+        //     cap_db = min(real, CEIL_CONSERVE_FRAC * thresh)   (0.99)
+        // whose own changelog says the old thresh-1 pin "shed ~1 real DB
+        // per crossing, starving the next interval and manufacturing a
+        // phantom downstream under-event that pinned talent_balance's
+        // coupled verdict at the 100 cap".  The surplus logged is the
+        // PER-WEEK marginal amount above the cap, not the cumulative
+        // excess over the threshold.
         if(carry>=thr&&thr>0){
+          const cap=Math.min(carry,_CEIL_CONSERVE*thr);
           if(!ep)ep={surplus:0,earnedSum:0,weeks:0};
-          ep.surplus+=carry-thr;
+          ep.surplus+=Math.max(0,carry-cap);
           ep.earnedSum+=earned;ep.weeks++;
-          carry=satXp;                     // clamp (desktop saturated_at)
+          carry=cap;
         }else if(ep){                      // aged threshold rose above carry —
           ep.earnedSum+=earned;ep.weeks++; // episode continues accounting
         }
@@ -6036,7 +6122,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v30 · coupled engine K15.4 · desktop-parity estimator (two fixed points + replay balance) · auto current-week · Calibration corpus enabled
+        Sokker Training Planner v31 · coupled engine K15.2 · unified 100/18 DB axis · desktop-parity estimator (two fixed points + replay balance) · auto current-week · Calibration corpus enabled
       </div>
 
       {/* Mobile responsiveness — collapse 2-col grids below 720px */}
