@@ -9,6 +9,61 @@ import React, { useState, useMemo, useCallback, useEffect, useRef } from "react"
 //   desktop tree; the ESTIMATOR still differs (see sokker_37).
 //   Corpus 7 half-split: MAE 1.48 -> see sokker_37 for the v29 figure.
 //
+// SOKKER TRAINING PLANNER v30 — ENGINE PARITY WITH THE DESKTOP TREE
+//
+// v30 (Aug 2026) closes the online<->desktop estimator gap.  Measured on
+// corpus 7, 118 matched players, against constants.py v13.2:
+//
+//                       v29        v30      desktop v13.2
+//   mean |dtd|         7.88 DB    1.37 DB       —
+//   median dtd        -4.70 DB    0.00 DB       —
+//   within 1 DB           3%        75%         —
+//   within 2 DB          11%        84%         —
+//   players at ceiling     8         2          1
+//   players >= 95         17        11          8
+//   pop-timing MAE      0.90       1.00       1.01
+//   implied-eff ratio   0.955      1.001      1.006
+//
+// The v29 ratio of 0.955 was a 4.5% scale bias; it is gone.  What changed,
+// in order of how much it was worth:
+//
+//   1. FIXED POINTS (sokker_37 correction).  Desktop runs TWO own-fixed-
+//      points — coverage and balance — each re-deriving the pop-derived
+//      carry pins at the current iterate.  Online ran neither.  NOTE: the
+//      sokker_37 recommendation "turn the replay balance off online" was
+//      wrong.  Desktop's balance IS replay-based (balance_fixed_point
+//      calls tracker.replay); turning it off made the NUMBERS converge by
+//      deleting a component the local app has.  Replay stays ON here.
+//   2. THE DB AXIS.  _dbGainPerWeek used 100/18 = 5.5556 as the level
+//      width and continuous XP; desktop uses LEVEL_WIDTHS[level] (5 or 6)
+//      and INTEGER XP.  Measured +14.6% overstatement at intensity 96.
+//   3. POST-POP CARRY.  An under-pop no longer snaps the carry to zero —
+//      subskill.py carries UNDER_POP_CARRY_FRAC (0.5) of the week's gain
+//      into the new level.  The surplus is now carried as DB and
+//      re-expressed in the new level's XP scale (v29 carried raw XP across
+//      a boundary whose threshold had changed).
+//   4. MAGNITUDE REFINEMENT (talent_balance v3) — the per-event magnitude
+//      statistic that picks the point INSIDE the count plateau, plus the
+//      'anchor_suspect' flags.  Online computed perEvent and discarded it.
+//   5. SOFT-ANCHOR CARRY-IN in the gap bounds, with the spent-first-gap
+//      rule and the soft-bound conflict filter (talent.py v10/v12).
+//   6. _CK 14.4 -> 15.4.  The compensation constant is retired: with the
+//      estimators aligned, one K serves both engines.
+//   7. Confidence: LOW_CONF_RANGE_DB is 12, not the implicit 25, and a
+//      non-converged fixed point or an 'anchor_suspect' balance demotes.
+//
+// KNOWN REMAINING DIVERGENCE (~1.4 DB mean, concentrated above td 95):
+// the tracker's under-event bookkeeping.  Desktop keeps whole DB in
+// db_accum with the fraction in a separate _gain_buf; online carries one
+// continuous quantity.  The residual is localised there and nowhere else.
+//
+// KNOWN INCONSISTENCY IN BOTH ENGINES: the DB axis pairs an INTEGER level
+// width (LEVEL_WIDTHS, 5/6) with the now-UNIFORM 100/18 threshold span.
+// v30 matches desktop deliberately, because desktop is what the pipeline
+// is calibrated against — but the pairing is wrong on both sides and
+// wants resolving together, with a K re-anchor.  See sokker_38 / sokker_41.
+//
+// ─────────────────────────────────────────────────────────────────────
 // SOKKER TRAINING PLANNER v28 — v21 recovery: fusion · coach · prior · forecast · replay
 //
 // v28 (Aug 2026): RECOVERY OF THE CLOBBERED v21 RELEASE, re-integrated on
@@ -648,7 +703,7 @@ function _setCoach(c){
 // (18*d+9)//100 is reverted to the plain floor (18*d)//100, so boundaries
 // sit at ceil(100*L/18).  MUST stay byte-identical to constants.py's
 // LEVEL_WIDTHS; if you touch one, bump and touch the other.
-const _CK=14.4,_CX=50.0,_CA=0.10,_CAGE0=16;
+const _CK=15.4,_CX=50.0,_CA=0.10,_CAGE0=16;
 // ── v29: calibration parity with constants.py v13.2 ────────────────────
 // These three MUST stay in lockstep with the desktop tree:
 //   _CK    <-> COUPLED_K_DEFAULT   — DELIBERATELY DIFFERENT: 14.4 here,
@@ -1519,6 +1574,8 @@ const _LEVELS_STD=18,_LEVELS_STAM=11;
 const _DB_PER_LV=100/18,_DB_PER_STAM=100/11;
 const _GT_RATE=15,_COACH_DB=93;
 const _B_INT={pace:99,striker:90,technique:82,defending:82,playmaking:75,passing:75,keeper:75,stamina:null};
+const _UNDER_POP_CARRY_FRAC=0.5;   // v30: subskill.UNDER_POP_CARRY_FRAC
+const _STAM_PER_DB_XP=15.0;   // v30: subskill.STAMINA_PER_DB_XP
 const _STAM_THR=80; // _B_NORM retired in v14 (normaliser folded into _pdc)
 // v14: the v25 product-slope constants (_THR_BASE, _PROD_SLOPE*, _AGE_OFF,
 // _AGE_PIVOT) are removed — the coupled model above is the only engine.
@@ -1566,13 +1623,33 @@ function _canonThr(skill,level,age){
 // (_XD = round(_K2*_K1/100)). Previously omitted the coach_db factor,
 // effectively running the simulator at coach=100 while the rest of
 // the engine ran at coach=_K1. Mirrors desktop subskill v13 fix.
+// v30: DB-AXIS PARITY with subskill.db_gain_per_week.  Two divergences
+// are corrected here; both were invisible while the replay did not drive
+// the verdict, and both inflated the online balance point by ~10 DB once
+// the fixed points made it matter.
+//
+//   1. WIDTH.  Desktop uses LEVEL_WIDTHS[level] (the level's actual
+//      integer span, 5 or 6), not the fractional 100/18 = 5.5556 average.
+//      At L2 (width 5) that alone is a +11.1% online overstatement.
+//   2. XP ROUNDING.  Desktop earns INTEGER XP per week
+//      (senior_xp_per_week = round(intensity x coach / 100)); online used
+//      the continuous product.  Combined with (1) the measured gap on a
+//      real week was +14.6% at intensity 96 and +8.4% at 98.
+//
+// NOTE for the KB: desktop pairs an INTEGER width with the now-UNIFORM
+// 100/18 threshold span, which is internally inconsistent (sokker_38 open
+// item).  Matching it here is deliberate — the desktop numbers are what
+// the rest of the pipeline is calibrated against — but the inconsistency
+// is real and wants resolving on BOTH sides, not silently on one.
 function _dbGainPerWeek(td,skill,level,age,intensity,coachEff){
   if(skill==="stamina")return 0.0;
   if(level>=_LEVELS_STD)return 0.0;
-  const thr=_canonThr(skill,level,age);
-  if(thr<=0||thr===Infinity)return 0.0;
-  const eff=_talEffSenior(td);
-  return _DB_PER_LV*intensity*coachEff*(_COACH_DB/100.0)*(eff/100.0)/thr;
+  const thr=_canonThr(skill,level,age)/(_talEffSenior(td)/100.0);
+  if(!(thr>0)||!isFinite(thr))return 0.0;
+  const xp=Math.round(intensity*coachEff*_COACH_DB/100.0);   // integer XP
+  if(xp<=0)return 0.0;
+  const width=_LW[level];
+  return width*xp/thr;
 }
 
 // Geston intensity estimators
@@ -1727,7 +1804,15 @@ function _weekGain(state,tw,td,coachEff,formSk,isGk){
   if(sk==="keeper"&&!isGk)return 0.0;
   const max=sk==="stamina"?_LEVELS_STAM:_LEVELS_STD;
   if(level>=max)return 0.0;
-  if(sk==="stamina")return _DB_PER_STAM/52.0; // fixed: ~1 level/season
+  // v30: desktop db_gain_per_week — stamina is integer XP / 15 DB,
+  // talent-independent.  The old fixed ~1 level/season rate was a
+  // planner-side approximation that does not belong on the estimator path.
+  if(sk==="stamina"){
+    const gtF=_GT_RATE/100.0;
+    const si=(sk===tw.trainedSkill)?tw.intensity:tw.intensity*gtF;
+    const xp=Math.round(si*coachEff*_COACH_DB/100.0);
+    return xp>0?xp/_STAM_PER_DB_XP:0.0;
+  }
   const gtFactor=_GT_RATE/100.0; // 0.15
   let effInt;
   if(sk===tw.trainedSkill){
@@ -2222,7 +2307,13 @@ function _ageEq(skill,level,agePop,ageW,xp){
 // Closed-gap [td_lo, td_hi] (talent.py estimate_gap_bounds, use_subskill=False).
 // Returns [null, null] for impossible/contaminated gaps (XP exceeds even
 // minimum-talent threshold). Partial gaps (no known start) get td_lo=1.0.
-function _estimateGapBounds(gap){
+function _estimateGapBounds(gap,subCarry){
+  // v30: `subCarry` ∈ [0,1) is the soft-anchor carry-in (talent.py
+  // estimate_gap_bounds `subskill_carry_in`).  It applies ONLY to partial
+  // gaps (no known start), converting them from upper-bound-only into
+  // two-sided soft bounds via thr_eff = thr·(1−s).  Omitted / 0 reproduces
+  // v29 behaviour exactly.
+  subCarry=subCarry||0;
   if(gap.xpTotal<=0||!isFinite(gap.thresholdRaw))return[null,null];
   const thr=gap.thresholdRaw;
   // Upper bound — denom = total - last (carry-out bounded by xp_last)
@@ -2250,6 +2341,20 @@ function _estimateGapBounds(gap){
     if(effLo<0.40)return[null,null];
     tdLo=_effToTd(effLo,"lo");
   }else tdLo=1.0;
+  // ── v30: subskill soft anchor (partial gaps only) ───────────────────
+  if(subCarry>0&&!gap.hasKnownStart){
+    const sfrac=Math.min(Math.max(subCarry,0),0.99);
+    const thrEff=thr*(1.0-sfrac);
+    const denomSoftLo=gap.xpTotal+gap.xpFirst;
+    const effSoftLo=denomSoftLo>0?thrEff/denomSoftLo:999.0;
+    const denomSoftHi=gap.xpTotal-gap.xpLast;
+    const effSoftHi=denomSoftHi>0?thrEff/denomSoftHi:999.0;
+    const tdLoSoft=effSoftLo<0.40?1.0:_effToTd(effSoftLo,"lo");
+    if(effSoftHi<0.40)return[null,null];
+    const tdHiSoft=_effToTd(effSoftHi,"hi");
+    tdLo=Math.max(tdLo,tdLoSoft);
+    tdHi=Math.min(tdHi,tdHiSoft);
+  }
   return[tdLo,tdHi];
 }
 
@@ -2414,6 +2519,19 @@ function estimateTalent(history,options){
   const latestSkills=latest.skills||{};
   const latestAge=parseInt(latest.age||21,10);
   const isGk=options.isGk!=null?options.isGk:_detectIsGk(latestSkills,hist);
+  // ── v30: soft-anchor configuration (talent.py estimate v10/v12) ──────
+  // `useSubskill` is the master toggle; `perSkillSubskills` pins a carry-in
+  // per skill; `subskillWeek1` is the uniform fallback; `spentFirstGapSkills`
+  // marks skills whose first partial gap was already consumed to BACK-SOLVE
+  // the carry-in, so re-applying the anchor there would feed the solved
+  // value back in as independent evidence (the v10 tautology) — those gaps
+  // fall back to the plain one-sided bound.
+  const _useSub=options.useSubskill===true;
+  const _subUniform=(_useSub&&options.subskillWeek1>0)?options.subskillWeek1:0;
+  const _subPerSkill=(_useSub&&options.perSkillSubskills)?options.perSkillSubskills:null;
+  const _spent=options.spentFirstGapSkills||null;
+  const _getSub=(sk)=>(_subPerSkill&&sk in _subPerSkill)?_subPerSkill[sk]:_subUniform;
+  let nSoftAnchored=0,nSoftSpent=0;
   // Skip max-level skills — no further pops are possible
   // v23 FIX 1: keeper belongs in the pool for a GOALKEEPER.  `OS` is
   // outfield-only, so before this no gap was ever extracted from keeper for
@@ -2425,7 +2543,7 @@ function estimateTalent(history,options){
   const _pool=isGk?OS.concat(["keeper"]):OS;
   const skillsToProcess=_pool.filter(s=>(latestSkills[s]??0)<_LEVELS_STD).sort();
 
-  const allLo=[],allHi=[],allPgIdx=[];
+  const allLo=[],allHi=[],allPgIdx=[],allSoft=[];
   const perGapLog=[];
   // v26: HARD bounds, collected structurally where lo/hi are still numbers
   // rather than re-parsed out of the formatted per-gap strings later.
@@ -2448,18 +2566,24 @@ function estimateTalent(history,options){
   const skillKsRanges={};
 
   function processGaps(gaps,skill){
+    const _sub=_getSub(skill);
     for(const g of gaps){
       const isPureGt=(g.directWeeks===0);
-      const[lo,hi]=_estimateGapBounds(g);
+      let subCorr=g.hasKnownStart?0:_sub;
+      if(_spent&&subCorr>0&&!g.hasKnownStart
+         &&(_spent.has?_spent.has(skill):_spent[skill])){subCorr=0;nSoftSpent+=1;}
+      const[lo,hi]=_estimateGapBounds(g,subCorr);
       if(lo===null){nExclRange+=1;continue;}
+      const isSoft=(subCorr>0&&!g.hasKnownStart);
+      if(isSoft)nSoftAnchored+=1;
       const pgIdx=perGapLog.length;
-      allLo.push(lo);allHi.push(hi);allPgIdx.push(pgIdx);
+      allLo.push(lo);allHi.push(hi);allPgIdx.push(pgIdx);allSoft.push(isSoft);
       // v14: known-start gaps double as balance events — [lo,hi] is the
       // td-consistent interval, so at candidate td: td<lo ⇒ under (model
       // late — raise talent), td>hi ⇒ over. Level keys the band weight.
-      if(g.hasKnownStart)balanceEvents.push({lo,hi,level:g.levelBefore,skill:g.skill});
+      if(g.hasKnownStart&&!isSoft)balanceEvents.push({lo,hi,level:g.levelBefore,skill:g.skill});
       // v26: hard + informative-on-at-least-one-side → an agreement vote
-      if(g.hasKnownStart&&(lo>1.0||hi<100.0)){
+      if(g.hasKnownStart&&!isSoft&&(lo>1.0||hi<100.0)){
         _hardBounds.push({skill:g.skill,level:g.levelBefore,lo,hi});
       }
       // v26: every bounded gap is a coverage row, outlier tag or not.
@@ -2522,11 +2646,43 @@ function estimateTalent(history,options){
       `${_compositionTag(og)} <${Math.round(ub)} (${og.nWeeks}w no pop)`]);
   }
 
-  // Flat intersection (use_subskill=False → all bounds are hard)
-  let loFinal=allLo.length?Math.max(...allLo):1.0;
-  let hiFinal=allHi.length?Math.min(...allHi):100.0;
-  for(const e of nopopHiCaps)hiFinal=Math.min(hiFinal,e.ub);
+  // ── v30: flat intersection WITH the soft-bound conflict filter ──────
+  // talent.py v10: a soft-anchored bound rests on an assumed carry-in, so
+  // it must never override hard, assumption-free evidence.  Any soft bound
+  // that lies entirely outside the hard range is dropped (and tagged
+  // REJECTED in the per-gap log) rather than allowed to move the verdict.
+  // No-pop caps are ALWAYS treated as soft here — the desktop marks them
+  // `is_soft_np=True` unconditionally.
+  const _hardLo=allLo.filter((_,i)=>!allSoft[i]);
+  const _hardHi=allHi.filter((_,i)=>!allSoft[i]);
+  const loHard=_hardLo.length?Math.max(..._hardLo):1.0;
+  const hiHard=_hardHi.length?Math.min(..._hardHi):100.0;
+  const loReject=allLo.length?Math.max(...allLo):1.0;
+  const hiReject=hiHard;
+  const filtLo=[],filtHi=[];
+  let nSoftRejected=0;
+  for(let i=0;i<allLo.length;i++){
+    const lo=allLo[i],hi=allHi[i],soft=allSoft[i];
+    let reject=false;
+    if(soft&&hi<loReject&&loReject>1.0)reject=true;
+    if(soft&&lo>hiReject&&hiReject<100.0&&lo>1.0)reject=true;
+    if(reject){
+      nSoftRejected+=1;
+      const r=perGapLog[allPgIdx[i]];
+      if(r)perGapLog[allPgIdx[i]]=[r[0],r[1],r[2],"REJECTED:"+r[3]];
+    }else{filtLo.push(lo);filtHi.push(hi);}
+  }
+  let loFinal=filtLo.length?Math.max(...filtLo):1.0;
+  let hiFinal=filtHi.length?Math.min(...filtHi):100.0;
+  for(const e of nopopHiCaps){
+    if(e.ub<loReject&&loReject>1.0){
+      nSoftRejected+=1;
+      const r=perGapLog[e.pgIdx];
+      if(r)perGapLog[e.pgIdx]=[r[0],r[1],r[2],"REJECTED:"+r[3]];
+    }else hiFinal=Math.min(hiFinal,e.ub);
+  }
   hiFinal=Math.min(100.0,hiFinal);
+  void loHard;
 
   if(loFinal===1.0&&hiFinal===100.0){
     return{...empty,perGap:perGapLog,nNoPopSkills,nExclDrop,nExclRange,
@@ -2821,16 +2977,37 @@ function _balBandWeight(level){
 // Stage B (fixed points) needs it for the GAP-estimator carries, which is
 // where desktop actually consumes it.
 const _POP_SEED_REF_TD=82.0;
-const _REPLAY_POP_SEEDS=false;   // v21.1: measured regression — off
-function _popDerivedAnchorFractions(hist,tws,coachDb,isGk){
+const _UNCONSTRAINED_CARRY=0.5;   // v30: subskill.py UNCONSTRAINED_CARRY_DEFAULT
+// v30: ON.  Desktop's balance replay seeds carry-ins from
+// pop_derived_anchor_subskills at INNER_SEED_REF_TD with the gate ON
+// (subskill.py replay, seed_from_pops=True).  v21.1 measured this as a
+// regression and switched it off — but that measurement was taken WITHOUT
+// the fixed points, i.e. against a different engine.  It is back on as
+// part of matching the local app.
+const _REPLAY_POP_SEEDS=true;
+// v30: `refTd` and `omitGate` are now parameters (subskill.py
+// pop_derived_anchor_subskills signature).  The BALANCE replay seeds at
+// _POP_SEED_REF_TD with the gate ON (a slow pop is ambiguous — low carry
+// + high talent or the reverse — so it rides the uniform anchor); the two
+// FIXED POINTS re-derive at the current iterate with the gate OFF, where a
+// req<=0 skill is pinned at the max-entropy _UNCONSTRAINED_CARRY default
+// instead of being omitted.
+function _popDerivedAnchorFractions(hist,tws,coachDb,isGk,refTd,omitGate){
+  const _ref=(refTd!=null&&isFinite(refTd))?refTd:_POP_SEED_REF_TD;
+  const _gate=omitGate!==false;
   const out={};
   const fsk=hist[0].skills||{};
   const coachEff=coachDb/93.0;
   const formFallback=_inferFormationSkill(hist);
-  for(const sk of OS){
+  for(const sk of OS.concat(["stamina"])){
+    const isStam=(sk==="stamina");
+    const maxLv=isStam?_LEVELS_STAM:_LEVELS_STD;
     const aLv=fsk[sk];
-    if(aLv==null||aLv>=_MX-1)continue;
-    const width=_dbThresh(aLv,false);
+    // v30: was `>=_MX-1`, which silently dropped the LAST poppable level.
+    // A skill at display 17 can still pop to 18; only a skill AT the cap
+    // has no pop to back-solve.  Mirrors subskill.py v11.
+    if(aLv==null||aLv>=maxLv)continue;
+    const width=_dbThresh(aLv,isStam);
     if(width<=0)continue;
     let gain=0,popped=false,contaminated=false,prevLv=aLv;
     for(let i=1;i<hist.length;i++){
@@ -2839,20 +3016,28 @@ function _popDerivedAnchorFractions(hist,tws,coachDb,isGk){
       if(lvNow<aLv||_dropEligible(sk,tw.age)){contaminated=true;break;}
       if(!tw.severeInjury){
         const formSk=tw.isFormation?(tw.formationSkill||formFallback):null;
-        gain+=_weekGain({skill:sk,level:aLv},tw,_POP_SEED_REF_TD,coachEff,formSk,isGk);
+        gain+=_weekGain({skill:sk,level:aLv},tw,_ref,coachEff,formSk,isGk);
       }
       if(((tw.skillsChange||{})[sk]||0)>0||lvNow>prevLv){popped=true;break;}
       prevLv=lvNow;
     }
     if(popped&&!contaminated){
       const req=width-gain;
-      if(req>0)out[sk]=Math.min(0.99,req/width);   // omit-gate (v5.10)
+      // v30: stamina is EXEMPT from the omit gate — being talent-free its
+      // gain-to-pop is exact, so req<=0 genuinely means a floor start
+      // rather than the outfield low-carry/high-talent ambiguity.
+      if(isStam)out[sk]=Math.max(0,Math.min(0.99,req/width));
+      else if(req>0)out[sk]=Math.min(0.99,req/width);
+      else if(!_gate)out[sk]=_UNCONSTRAINED_CARRY;
     }
   }
   return out;
 }
 
-function _mkReplayNetFn(reports,coachDb,isGk){
+// v30: `refTd` is the reference talent for the pop-derived carry seeds
+// (desktop's replay(seed_ref_talent=...)); the seeds themselves are now ON,
+// matching subskill.py replay(seed_from_pops=True) with the gate ON.
+function _mkReplayNetFn(reports,coachDb,isGk,refTd){
   const hist=[...reports].sort((a,b)=>(a.week||0)-(b.week||0));
   const tws=hist.map(_parseRecord);
   const f0=hist[0],fsk=f0.skills||{};
@@ -2865,7 +3050,8 @@ function _mkReplayNetFn(reports,coachDb,isGk){
     }catch(e){}
   }
   const seedFracs=_REPLAY_POP_SEEDS
-    ?_popDerivedAnchorFractions(hist,tws,coachDb,isGk):{};  // v21.1: off
+    ?_popDerivedAnchorFractions(hist,tws,coachDb,isGk,
+        (refTd!=null&&isFinite(refTd))?refTd:_POP_SEED_REF_TD,true):{};  // v21.1: off
   const SKS=(isGk?[...OS,"keeper"]:OS);   // stamina/form talent-free; keeper GK-only
   return function netFn(td){
     const eff=(40+60*td/100)/100;
@@ -2898,22 +3084,45 @@ function _mkReplayNetFn(reports,coachDb,isGk){
             const deficit=requiredMin-carry;
             const w=_balBandWeight(lv);sw2+=w*w;nu++;wu+=w;
             pe.push([sk,+(deficit/Math.max(earned,1))]);
-            carry=0;                       // pop-exact: forced, empty bracket
-          }else{
-            carry=Math.max(0,carry+earned-thr);
           }
+          // v30: POST-POP CARRY, in DB, matching subskill.py v5.19/v12.
+          // Two corrections over v29:
+          //   • an UNDER-pop no longer snaps the carry to ZERO.  The pop DID
+          //     cross the boundary mid-week, so the expected landing is
+          //     UNDER_POP_CARRY_FRAC (0.5) of this week's gain into the new
+          //     level — a uniform crossing-time prior.  Snapping to zero made
+          //     every subsequent gap start empty, which manufactured extra
+          //     'under' events and pushed the balance verdict up.
+          //   • the surplus is carried as DB and re-expressed in the NEW
+          //     level's XP scale.  v29 carried raw XP across a level boundary
+          //     whose threshold had changed, i.e. it changed value in transit.
+          const wOld=_LW[lv]||1;
+          const gainDb=thr>0?wOld*earned/thr:0;
+          const realDb=(thr>0?wOld*carry/thr:0)+gainDb;
+          const carryDb=(realDb>=wOld)?(realDb-wOld)
+                                      :_UNDER_POP_CARRY_FRAC*Math.max(0,gainDb);
           lv=actual;                       // multi-level pops: leftover only
           thr=_dtRaw(sk,lv,tw.age)/eff;
-          if(carry>=thr)carry=thr*0.999;   // guard leftover ≥ new threshold
+          const wNew=_LW[lv]||1;
+          carry=Math.max(0,carryDb*thr/wNew);
+          if(carry>=thr)carry=thr*0.999;   // guard leftover >= new threshold
           continue;
         }
         // no pop this week
         carry+=earned;
+        // v30: desktop TRIGGERS the over event when the integer DB count
+        // would reach the full width (carry >= thr), but STORES only
+        // `threshold - 1` DB — the SubskillState clamp invariant, which
+        // discards the surplus.  Online stored the whole threshold, so a
+        // pinned skill sat a full DB high and every subsequent pop landed
+        // early.  Trigger and store are different quantities; conflating
+        // them (either way) moves the balance verdict several DB.
+        const satXp=thr*Math.max(0,(_LW[lv]-1))/Math.max(1,_LW[lv]);
         if(carry>=thr&&thr>0){
           if(!ep)ep={surplus:0,earnedSum:0,weeks:0};
           ep.surplus+=carry-thr;
           ep.earnedSum+=earned;ep.weeks++;
-          carry=thr;                       // clamp (desktop closed_ceiling)
+          carry=satXp;                     // clamp (desktop saturated_at)
         }else if(ep){                      // aged threshold rose above carry —
           ep.earnedSum+=earned;ep.weeks++; // episode continues accounting
         }
@@ -2987,13 +3196,66 @@ function _balSymBand(fn,vTd,epsW){
 
 // LATE clamp: band symmetric around the UNCAPPED virtual point; only the
 // operative talent_db is clamped.
-function _balFinalize(vTd,half,epsW,confidence,oneSided,countNet,nEvents,tdFloor){
+// ── v30: magnitude refinement (talent_balance.py v3) ──────────────────
+// The count signal C is an integer step function, so {C=0} is generically
+// a PLATEAU.  v29 took its centre and stopped.  Desktop then asks the
+// per-event MAGNITUDES where inside that plateau the truth sits, and flags
+// the case where magnitude and direction disagree.  This is the component
+// that was still leaving the online upper tail ~6 DB above desktop.
+const _MAG_MIN_SKILLS=3;     // skills-with-events needed to trust magnitudes
+const _MAG_SIG_WEEKS=0.75;   // |M| below this is timing noise, not evidence
+
+// Hierarchical robust statistic: per-skill NET (sum) first, then the
+// CROSS-SKILL MEDIAN.  Summing within a skill makes the two episode kinds
+// commensurate — an 'under' logs one cumulative weeks-behind at the pop,
+// an 'over' episode logs ~1 week-equivalent per pinned week.  A median
+// over raw events would be biased positive and would false-positive
+// 'anchor_suspect' on clean data.
+function _hierMedian(perEvent){
+  if(!perEvent||!perEvent.length)return[NaN,{}];
+  const bySkill={};
+  for(const e of perEvent){
+    const sk=e[0],g=e[1];
+    if(isFinite(g))(bySkill[sk]=bySkill[sk]||[]).push(g);
+  }
+  const med={};
+  for(const sk in bySkill)med[sk]=bySkill[sk].reduce((a,b)=>a+b,0);
+  const keys=Object.keys(med);
+  if(keys.length<_MAG_MIN_SKILLS)return[NaN,med];
+  const vals=keys.map(k=>med[k]).sort((a,b)=>a-b);
+  const n=vals.length;
+  const M=n%2?vals[(n-1)/2]:0.5*(vals[n/2-1]+vals[n/2]);
+  return[M,med];
+}
+
+// Desktop _count_root: returns [centre, a, b] where a = upper edge of
+// {C>0} and b = upper edge of {C>=0}.  One event flipping over<->under
+// moves ONE edge, so the verdict moves by half the edge shift rather than
+// the full plateau width.
+function _balEdge(fn,lo,hi,pred){
+  let a=lo,b=hi;
+  for(let i=0;i<_BAL_MAX_IT&&(b-a)>_BAL_TOL;i++){
+    const m=0.5*(a+b);
+    if(pred(fn(m).countNet))a=m;else b=m;
+  }
+  return 0.5*(a+b);
+}
+function _balCountRootTriple(fn,lo,hi){
+  const cLo=fn(lo).countNet,cHi=fn(hi).countNet;
+  if(cLo<0)return[lo,lo,lo];
+  if(cHi>0)return[hi,hi,hi];
+  const a=cLo===0?lo:_balEdge(fn,lo,hi,c=>c>0);
+  const b=cHi===0?hi:_balEdge(fn,Math.max(a,lo),hi,c=>c>=0);
+  return[0.5*(a+b),a,b];
+}
+
+function _balFinalize(vTd,half,epsW,confidence,oneSided,countNet,nEvents,tdFloor,flags){
   const lo=Math.max(vTd-half,tdFloor);
   const hi=vTd+half; // left uncapped on purpose
   const operative=Math.min(Math.max(vTd,tdFloor),_BAL_CAP);
   return{talentDb:operative,talentDbLo:lo,talentDbHi:hi,
     confidence,oneSided,epsilon:epsW,countNetAtPoint:countNet,
-    nEvents,virtualTalentDb:vTd,capped:vTd>_BAL_CAP};
+    nEvents,virtualTalentDb:vTd,capped:vTd>_BAL_CAP,flags:flags||[]};
 }
 
 // estimate_balance port. gapBand ([lo,hi] from the v12 flat intersection)
@@ -3042,10 +3304,52 @@ function _estimateBalanceCore(fn,tdFloor,tdCeil,gapBand,nTwoSided){
   // band — the ε-band at a bisection edge is an artifact. The plateau
   // center is the point; Case-4 flat handling (gap-band narrowing, F2
   // confidence rules) applies downstream unchanged.
-  const[z0,z1]=_balZeroPlateau(fn,tdFloor,searchHi);
-  const plateauW=z1-z0;
-  const root=plateauW>_BAL_WIDE_BAND?0.5*(z0+z1):_balCountRoot(fn,tdFloor,searchHi);
-  let half=plateauW>_BAL_WIDE_BAND?0.5*plateauW:_balSymBand(fn,root,epsW);
+  // v30: desktop shape — plateau edges from _count_root, then the v3
+  // MAGNITUDE refinement decides where inside [pa,pb] the point sits, then
+  // the band is always the validated eps_w/|slope| symmetric band.  v29
+  // used the plateau itself as the band when it was wide (the v17 F1b
+  // deviation); desktop does not, and that deviation was part of why the
+  // online upper tail sat above desktop's.
+  const[centre,pa,pb]=_balCountRootTriple(fn,tdFloor,searchHi);
+  let root=centre;
+  const balFlags=[];
+  const sA=fn(pa),sB=fn(pb);
+  const[Ma]=_hierMedian(sA.perEvent),[Mb]=_hierMedian(sB.perEvent);
+  if(isFinite(Ma)&&isFinite(Mb)&&(pb-pa)>_BAL_TOL){
+    if(Ma*Mb>0&&Math.max(Math.abs(Ma),Math.abs(Mb))<_MAG_SIG_WEEKS){
+      // same-signed but inside the noise floor: the magnitude statistic is
+      // exhausted, not disagreeing.  Keep the centre, no clamp, no flag —
+      // an ungated clamp biases the outer fixed point toward the edge.
+    }else if(Ma>0&&Mb>0){root=pb;balFlags.push("anchor_suspect");}
+    else if(Ma<0&&Mb<0){root=pa;balFlags.push("anchor_suspect");}
+    else{
+      let xLo=pa,xHi=pb;
+      for(let i=0;i<6;i++){
+        if((xHi-xLo)<=_BAL_TOL)break;
+        const m=0.5*(xLo+xHi);
+        const[Mm]=_hierMedian(fn(m).perEvent);
+        if(!isFinite(Mm))break;
+        if(Mm>0)xLo=m;else xHi=m;
+      }
+      root=0.5*(xLo+xHi);
+    }
+    // Cross-skill dispersion: DIAGNOSTIC ONLY.  A sigma derived from
+    // MAD/|dM/dtd| was built and rejected — the slope is a finite
+    // difference over a sub-DB plateau, i.e. noise.
+    const[Mr,medR]=_hierMedian(fn(root).perEvent);
+    const keysR=Object.keys(medR);
+    if(isFinite(Mr)&&keysR.length>=_MAG_MIN_SKILLS){
+      const devs=keysR.map(k=>Math.abs(medR[k]-Mr)).sort((a,b)=>a-b);
+      const n=devs.length;
+      const mad=n%2?devs[(n-1)/2]:0.5*(devs[n/2-1]+devs[n/2]);
+      if(mad>1e-9){
+        for(const k of keysR){
+          if(Math.abs(medR[k]-Mr)>3.0*1.4826*mad)balFlags.push("anchor_suspect:"+k);
+        }
+      }
+    }
+  }
+  let half=_balSymBand(fn,root,epsW);
   const sRoot=fn(root);
   const bandW=2.0*half;
   if(bandW>_BAL_WIDE_BAND){
@@ -3065,11 +3369,11 @@ function _estimateBalanceCore(fn,tdFloor,tdCeil,gapBand,nTwoSided){
       }
     }
     return _balFinalize(vPt,half,epsW,conf,null,
-      sRoot.countNet,sRoot.nEvents,tdFloor);
+      sRoot.countNet,sRoot.nEvents,tdFloor,balFlags);
   }
   // Case 1: clean crossing — residual accepted as noise.
   return _balFinalize(root,half,epsW,"reliable",null,
-    sRoot.countNet,sRoot.nEvents,tdFloor);
+    sRoot.countNet,sRoot.nEvents,tdFloor,balFlags);
 }
 
 // Combined estimator the UI consumes: run the v12 gap estimator (event
@@ -3106,98 +3410,229 @@ function _applyPriorToEstimate(res,prior){
 }
 
 function _estimateCombinedCore(history,options){
+  // ── v30: DESKTOP-PARITY PATH (talent_combine.combine_talent) ─────────
+  // Two independent own-fixed-points — coverage and balance — fused by
+  // inverse-variance weighting with Birge inflation, one-sided pinned
+  // balances truncating rather than entering the mean.  v29 ran a single
+  // static gap estimate plus one replay call; the loop is what desktop
+  // has and online did not.
+  options=options||{};
   const base=estimateTalent(history,options);
-  const events=base.balanceEvents||[];
-  if(!events.length)return{...base,method:"gap"};
-  // v17 (F1): balance requires the event set to be able to say "over".
-  // On short junior gaps every event's hi saturates at 100 (carry slack
-  // swallows the upper bound) ⇒ C(td)=n_under−n_over can never go
-  // negative ⇒ the root-find converges to the LOWER ENVELOPE (max lo),
-  // not a talent point (Kundrík 40171831: 57.9 vs real ~89, with every
-  // gap individually consistent with 89). Desktop is immune — its events
-  // are tracker-replay timing residuals, inherently two-sided; this
-  // guard closes the static-gap-event port's degenerate case.
-  const gapBand=(isFinite(base.tdLo)&&isFinite(base.tdHi)&&!base.contradictory)
-    ?[base.tdLo,base.tdHi]:null;
-  // ── v21 STAGE A: REPLAY balance (desktop parity) with static fallback ──
-  // Replay residuals are two-sided by construction, so the Kundrík
-  // nTwoSided guard applies only to the static path.  If the replay
-  // yields insufficient events, fall through to the v17 static-gap
-  // balance, then to the plain gap verdict — never worse than before.
-  let bal=null,balSrc=null;
-  if(options.replayBalance!==false){
-    try{
-      const netFn=_mkReplayNetFn(history,options.coachDb??_COACH_DB,base.isGk);
-      const rb=_estimateBalanceCore(netFn,_BAL_FLOOR,_BAL_CAP,gapBand,1);
-      if(rb.confidence!=="insufficient_signal"){bal=rb;balSrc="replay";}
-    }catch(e){}
+  if(!isFinite(base.td)&&base.confidence==="no_data")return{...base,method:"gap"};
+  const coachDb=options.coachDb??_COACH_DB;
+  const isGk=options.isGk!=null?options.isGk:base.isGk;
+  const hist=[...history].sort((a,b)=>(a.week||0)-(b.week||0));
+  const tws=hist.map(_parseRecord);
+
+  let covRun=null,balRun=null;
+  try{covRun=_coverageFixedPoint(history,hist,tws,coachDb,isGk);}catch(e){covRun=null;}
+  if(options.balanceFixedPoint!==false){
+    try{balRun=_balanceFixedPoint(history,hist,tws,coachDb,isGk,null,true);}catch(e){balRun=null;}
   }
-  if(!bal){
-    const nTwoSided=events.filter(e=>isFinite(e.hi)&&e.hi<100).length;
-    if(nTwoSided===0)return{...base,method:"gap"};
-    const sb=estimateBalance(events,_BAL_FLOOR,_BAL_CAP,gapBand,nTwoSided);
-    if(sb.confidence==="insufficient_signal")return{...base,method:"gap"};
-    bal=sb;balSrc="static";
-  }
-  // ── v19: PRECISION-WEIGHTED FUSION (talent_combine v2 port) ──────────
-  // The v14–v18 composition was winner-take-all: the balance verdict
-  // REPLACED the gap verdict, including the floor/ceiling-PINNED cases,
-  // where the pinned point is a one-sided constraint, not a measurement —
-  // the desktop Żołądek/Ozieriański amplification path.  v19 fuses:
-  //   • gap + balance become σ-weighted two-sided signals (IVW mean);
-  //   • a pinned balance becomes a CONSTRAINT that truncates the mean and
-  //     never enters it;
-  //   • Birge χ² inflation widens σ_f when the signals disagree beyond
-  //     their stated bands (μ untouched — IVW is scale-invariant);
-  //   • equal-σ two-signal input reproduces the plain midpoint exactly.
-  // v28 note: the gap-side signal is the v26 coverage-weighted,
-  // agreement-gated verdict — a gate-demoted label widens σ_gap via
-  // _CONF_SIGMA_MULT, which is exactly the down-weighting the gate wants.
-  // Fixed-point machinery deliberately NOT ported: desktop's loops exist
-  // for its carry-in↔talent feedback; the online gaps are static bounds.
-  const sigGap=_signalFromGap(base);
-  const sigBal=_signalFromBalance(bal);
-  const fus=_fuseSignals([sigGap,sigBal]);
+
+  // Fall back to the v29 single-shot path only if the coverage loop itself
+  // failed — never silently, the flag says so.
+  if(!covRun)return{...base,method:"gap",fpFallback:"coverage_failed"};
+  const covDetail=covRun.detail||base;
+
+  const sigCov=_signalFromCoverage(covRun);
+  const sigBal=balRun?_signalFromBalance(balRun.detail,balRun.flag):{valid:false};
+  const fus=_fuseSignals([sigCov,sigBal]);
   if(!isFinite(fus.point)){
-    return{...base,method:"gap"};          // no usable signal — v17 semantics
+    // No usable signal: adopt whichever fixed point survives, zero width.
+    const good=isFinite(covRun.value)?covRun.value
+      :(balRun&&isFinite(balRun.value)?balRun.value:NaN);
+    if(!isFinite(good))return{...base,method:"gap",fpFallback:"no_valid_signal"};
+    return{...covDetail,method:"fusion",td:Math.round(good*10)/10,
+      tdLo:Math.round(good*10)/10,tdHi:Math.round(good*10)/10,
+      confidence:"low_confidence",
+      fixedPoint:{coverage:covRun.value,balance:balRun?balRun.value:NaN,
+        covFlag:covRun.flag,balFlag:balRun?balRun.flag:null},
+      fusion:{sigma:NaN,virtual:good,flags:fus.flags,gapSigma:null,balSigma:null}};
   }
+
   const virt=fus.point;
-  const tdAdopt=Math.min(100,virt);
-  // v19 band semantics: fus.lo/hi is the SIGNAL-POINT SPREAD (desktop
-  // CombineResult convention, where σ rides separately).  For the chip the
-  // displayed band is μ ± σ_f EXPANDED to cover any disagreement — two
-  // agreeing signals must never render a zero-width band while σ_f is
-  // ±3–4 DB (caught in the v18↔v19 A/B: 20 players showed band 0–2).
   const bandLo=Math.min(fus.lo,virt-fus.sigma);
   const bandHi=Math.max(fus.hi,virt+fus.sigma);
   const width=bandHi-bandLo;
-  const lowConf=width>25||fus.flags.includes("single_signal")
+
+  // ── Confidence: talent_combine's rule verbatim ───────────────────────
+  // v29 used width>25 and only the fusion flags.  Desktop uses 12 DB and
+  // additionally demotes on a non-converged fixed point on either side and
+  // on the balance detail's exact-string 'anchor_suspect' flag (the
+  // per-skill 'anchor_suspect:<skill>' variants do NOT demote).
+  const balFlags=(balRun&&balRun.detail&&balRun.detail.flags)||[];
+  const lowConf=width>_LOW_CONF_RANGE_DB
+    ||fus.flags.includes("single_signal")
     ||fus.flags.includes("constraints_only")
-    ||fus.flags.some(f=>f.startsWith("truncated_by_"));
+    ||fus.flags.some(f=>f.startsWith("truncated_by_"))
+    ||covRun.flag!=="converged"
+    ||(balRun&&balRun.flag!=="converged")
+    ||balFlags.indexOf("anchor_suspect")>=0;
+
+  const bal=balRun?balRun.detail:null;
   return{
-    ...base,
+    ...covDetail,
     method:"fusion",
-    td:Math.round(tdAdopt*10)/10,
-    tdLo:Math.round(Math.max(_BAL_FLOOR,bandLo)*10)/10,
+    td:Math.round(Math.min(_TD_ADOPT_CAP,Math.max(_TALENT_DB_FLOOR,virt))*10)/10,
+    tdLo:Math.round(Math.max(_TALENT_DB_FLOOR,bandLo)*10)/10,
     tdHi:Math.round(bandHi*10)/10,          // may exceed 100 (virtual band)
     confidence:lowConf?"low_confidence":"reliable",
-    oneSided:bal.oneSided,
-    balance:{epsilon:bal.epsilon,nEvents:bal.nEvents,
+    oneSided:bal?bal.oneSided:null,
+    fixedPoint:{coverage:covRun.value,balance:balRun?balRun.value:NaN,
+      covFlag:covRun.flag,balFlag:balRun?balRun.flag:null,
+      covIters:covRun.its?covRun.its.length-1:0,
+      balIters:balRun&&balRun.its?balRun.its.length-1:0},
+    balance:bal?{epsilon:bal.epsilon,nEvents:bal.nEvents,
       countNet:bal.countNetAtPoint,virtual:bal.virtualTalentDb,
-      capped:bal.capped,source:balSrc},               // v21: replay|static
+      capped:bal.capped,source:"replay"}:null,
     fusion:{sigma:Math.round(fus.sigma*100)/100,virtual:Math.round(virt*10)/10,
       flags:fus.flags,
-      gapSigma:sigGap.valid?Math.round(sigGap.sigma*100)/100:null,
+      gapSigma:sigCov.valid?Math.round(sigCov.sigma*100)/100:null,
       balSigma:sigBal.valid?Math.round(sigBal.sigma*100)/100:null},
   };
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// v30: FIXED-POINT MACHINERY (talent_combine.py port)
+//
+// v29 and earlier ran the gap estimator ONCE on static bounds and called
+// the balance replay ONCE with that band.  Desktop runs two own-fixed-
+// points instead, each re-deriving the pop-derived carry-ins at the
+// current iterate and feeding them back into the evidence.  That feedback
+// is the whole reason the two engines disagreed by +6.6 DB: it was never
+// the replay component (desktop has one too), it was the missing loop.
+// ═══════════════════════════════════════════════════════════════════════
+const _FP_MAX_IT=40, _FP_EPS=0.05;
+const _FP_DRIFT_DB=10.0, _FP_EDGE_DB=1.0;
+const _INNER_SEED_REF_TD=82.0;      // balance's inner replay reference
+const _SEED_PERTURB=12.0, _SEED_DEGEN_TOL=2.0;
+const _TALENT_DB_FLOOR=1.0, _TD_ADOPT_CAP=100.0;
+const _LOW_CONF_RANGE_DB=12.0;      // was an implicit 25 online — desktop is 12
+
+// Generic own-fixed-point loop with 2-cycle, monotone-drift and
+// boundary-attractor detection.  A carry-in<->talent feedback loop can
+// slide monotonically into the floor/ceiling and "converge" only because
+// the clamp stopped it — a self-consistent story, not evidence.  Those
+// runs are reported but their sigma is saturated downstream.
+function _iterateFixedPoint(stepFn,seed,maxIter,eps,bounds){
+  const its=[seed];
+  let t=seed,flag=null;
+  for(let i=0;i<maxIter;i++){
+    const tk=stepFn(t);
+    its.push(tk);
+    if(!isFinite(tk))return{value:tk,flag:"converged",its};  // caller invalidates
+    if(Math.abs(tk-t)<eps){flag="converged";t=tk;break;}
+    if(its.length>=3&&Math.abs(tk-its[its.length-3])<eps){
+      const mean=0.5*(tk+its[its.length-2]);
+      its.push(mean);
+      return{value:mean,flag:"cycle",its};
+    }
+    t=tk;
+  }
+  if(flag===null)flag="non_converged";
+  const steps=[];
+  for(let i=1;i<its.length;i++)steps.push(its[i]-its[i-1]);
+  const monotone=steps.length>=3&&
+    (steps.every(d=>d<=0)||steps.every(d=>d>=0));
+  const total=its[its.length-1]-its[0];
+  if(monotone&&Math.abs(total)>=_FP_DRIFT_DB){
+    if(bounds){
+      const atLo=total<0&&(its[its.length-1]-bounds[0])<=_FP_EDGE_DB;
+      const atHi=total>0&&(bounds[1]-its[its.length-1])<=_FP_EDGE_DB;
+      if(atLo||atHi)return{value:t,flag:"boundary_attractor",its};
+    }
+    if(flag==="non_converged")return{value:t,flag:"drift",its};
+  }
+  return{value:t,flag,its};
+}
+
+// COVERAGE fixed point — iterate talent through the gap estimator, with
+// the pop-derived carry pins recomputed at each iterate (gate OFF) and the
+// pinned skills marked spent so their own first-pop gap is not counted
+// twice.
+function _coverageFixedPoint(history,hist,tws,coachDb,isGk){
+  const t0=estimateTalent(history,{coachDb,isGk});
+  let last=t0;
+  const seed=isFinite(t0.td)?t0.td:_INNER_SEED_REF_TD;
+  const step=(t)=>{
+    const ci=_popDerivedAnchorFractions(hist,tws,coachDb,isGk,t,false);
+    const spent=new Set(Object.keys(ci));
+    const te=estimateTalent(history,{coachDb,isGk,useSubskill:true,
+      perSkillSubskills:Object.keys(ci).length?ci:null,
+      spentFirstGapSkills:spent.size?spent:null});
+    last=te;
+    return te.td;
+  };
+  const run=_iterateFixedPoint(step,seed,_FP_MAX_IT,_FP_EPS,
+                               [_TALENT_DB_FLOOR,_TD_ADOPT_CAP]);
+  run.detail=last;
+  return run;
+}
+
+// BALANCE fixed point — iterate the OUTER seed.  Each step re-derives the
+// carry pins at that seed to obtain a coverage band, which becomes the
+// balance search floor and the gap band; the balance itself replays at the
+// FIXED inner reference (_INNER_SEED_REF_TD), independent of both the outer
+// seed and the probed talent.  Then a seed-invariance probe: a trustworthy
+// fixed point is a property of the data, so it must be reproduced from a
+// different seed.  If it is not, the value is seed-determined and must not
+// enter the fused mean.
+function _balanceFixedPoint(history,hist,tws,coachDb,isGk,innerSeedRef,degenProbe){
+  const _ref=(innerSeedRef!=null&&isFinite(innerSeedRef))?innerSeedRef:_INNER_SEED_REF_TD;
+  let last=null;
+  const netFn=_mkReplayNetFn(history,coachDb,isGk,_ref);
+  const step=(seed)=>{
+    const ci=_popDerivedAnchorFractions(hist,tws,coachDb,isGk,seed,false);
+    const spent=new Set(Object.keys(ci));
+    const te=estimateTalent(history,{coachDb,isGk,useSubskill:true,
+      perSkillSubskills:Object.keys(ci).length?ci:null,
+      spentFirstGapSkills:spent.size?spent:null});
+    const lo=Math.max(_TALENT_DB_FLOOR,isFinite(te.tdLo)?te.tdLo:1.0);
+    const band=(isFinite(te.tdLo)&&isFinite(te.tdHi)&&!te.contradictory)
+      ?[te.tdLo,te.tdHi]:null;
+    const br=_estimateBalanceCore(netFn,lo,_BAL_CAP,band,1);
+    last=br;
+    return br.talentDb;
+  };
+  const run=_iterateFixedPoint(step,_ref,_FP_MAX_IT,_FP_EPS,
+                               [_TALENT_DB_FLOOR,_TD_ADOPT_CAP]);
+  run.detail=last;
+  if(degenProbe!==false&&isFinite(run.value)){
+    let s2=_ref-_SEED_PERTURB;
+    if(s2<=_TALENT_DB_FLOOR+5.0)s2=_ref+_SEED_PERTURB;
+    const alt=_balanceFixedPoint(history,hist,tws,coachDb,isGk,s2,false);
+    if(!isFinite(alt.value)||Math.abs(alt.value-run.value)>_SEED_DEGEN_TOL){
+      run.flag="seed_degenerate";
+    }
+  }
+  return run;
+}
+
 // ── v19 fusion helpers (talent_combine v2 port; pure, headless-testable) ──
 const _SIGMA_FLOOR=1.5,_SIGMA_CAP=40.0;
+const _FP_DEGRADE_MULT=2.0;   // v30: sigma x this for a cycle/non-converged loop
 const _CONF_SIGMA_MULT={reliable:1.0,reliable_via_gap:1.0,indicative:1.5,
   weak:2.5,unreliable:2.5};
 function _clampSigma(s){return!isFinite(s)?_SIGMA_CAP:
   Math.min(Math.max(s,_SIGMA_FLOOR),_SIGMA_CAP);}
+
+// v30: coverage signal (talent_combine signal_from_coverage).  Same sigma
+// derivation as v29's _signalFromGap, PLUS the fixed-point flag handling:
+// a boundary-attractor or drifting loop is reported but saturated, a cycle
+// or non-converged loop is doubled.  _signalFromGap is kept as the
+// no-fixed-point entry point.
+function _signalFromCoverage(run){
+  const te=run&&run.detail;
+  if(!te||!isFinite(run.value)||te.confidence==="no_data")
+    return{name:"coverage",valid:false};
+  const sig=_signalFromGap(te);
+  if(!sig.valid)return{name:"coverage",valid:false};
+  let sigma=sig.sigma;
+  if(run.flag==="boundary_attractor"||run.flag==="drift")sigma=_SIGMA_CAP;
+  else if(run.flag!=="converged")sigma=_clampSigma(sigma*_FP_DEGRADE_MULT);
+  return{name:"coverage",point:run.value,sigma,valid:true,oneSided:null};
+}
 
 function _signalFromGap(base){
   // Gap verdict → two-sided signal.  σ = half band × confidence mult.
@@ -3209,7 +3644,12 @@ function _signalFromGap(base){
   return{name:"gap",point:base.td,sigma,valid:true,oneSided:null};
 }
 
-function _signalFromBalance(bal){
+// v30: `fpFlag` is the balance fixed point's own flag.  A seed_degenerate
+// run is DROPPED entirely (its value is determined by the seed, not the
+// data); boundary_attractor / drift saturate sigma; anything else
+// non-converged doubles it.  Matching desktop, these checks apply only on
+// the two-sided branch — a ceiling/floor-pinned result returns first.
+function _signalFromBalance(bal,fpFlag){
   // Balance verdict → two-sided signal, one-sided constraint, or invalid.
   // ceiling_pinned → 'ge' at (virtual − half); floor_pinned → 'le' at
   // (virtual + half) — the clamped point NEVER enters the mean.
@@ -3223,7 +3663,11 @@ function _signalFromBalance(bal){
     return{name:"balance",point:virtual-half,sigma,valid:true,oneSided:"ge"};
   if(bal.confidence==="floor_pinned")
     return{name:"balance",point:virtual+half,sigma,valid:true,oneSided:"le"};
-  return{name:"balance",point:virtual,sigma,valid:true,oneSided:null};
+  if(fpFlag==="seed_degenerate")return{name:"balance",valid:false};
+  let sg=sigma;
+  if(fpFlag==="boundary_attractor"||fpFlag==="drift")sg=_SIGMA_CAP;
+  else if(fpFlag&&fpFlag!=="converged")sg=_clampSigma(sigma*_FP_DEGRADE_MULT);
+  return{name:"balance",point:virtual,sigma:sg,valid:true,oneSided:null};
 }
 
 function _fuseSignals(signals){
@@ -5592,7 +6036,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v28 · coupled engine K16 · coach-parametrized · fusion-v2 talent (replay balance) · auto current-week · Calibration corpus enabled
+        Sokker Training Planner v30 · coupled engine K15.4 · desktop-parity estimator (two fixed points + replay balance) · auto current-week · Calibration corpus enabled
       </div>
 
       {/* Mobile responsiveness — collapse 2-col grids below 720px */}
