@@ -1,6 +1,45 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SOKKER TRAINING PLANNER v33 — two field-reported planner bugs
+//
+// v33 (Nov 2026), base v32.  No engine, estimator or corpus changes.
+//
+//  1. BUG FIX — "✓ Manual Schedule" in the strategy list froze the Plan
+//     stage (forum, wonsky90 / loczenty / Arsuf, 2026-10-16..11-04).
+//     allStrats carries a `manual` entry so the comparison table can name
+//     the Manual column, and the Compare-strategies toggle list iterated
+//     allStrats — so "Manual Schedule" was selectable as a STRATEGY.
+//     runSim then called runPlan(…,"manual",…), STRATS.manual is undefined,
+//     and every Rerun threw (TypeError reading 'fn'): results stayed dimmed
+//     under the stale ribbon and Rerun did nothing.  The toggle list now
+//     skips `manual` (the orange builder button is the one way in).
+//     Second path to the same dead end: with every strategy deselected and
+//     a manual schedule active, the main Run button was disabled while the
+//     previous run sat dimmed.  Run is now enabled whenever there is a
+//     manual result to settle against.
+//
+//  2. BUG FIX — Sale Optimizer trained skills already at 18.  Its base
+//     schedule is a round-robin of the KEY skills only (DEF: pace and
+//     defending), and the swap loop only takes weeks FROM skills with
+//     carry > 0.15 — a maxed skill has carry 0, so its weeks were never
+//     moved.  At the default end-of-27 horizon this was most of the plan
+//     (DEF, 20yo, YS 3.5, 104 weeks: 80 weeks of direct training on a
+//     skill already at 18).  _simSched — used only by the Sale Optimizer —
+//     now reassigns a week whose skill is already maxed when that week is
+//     reached, to the weighted non-maxed skill closest to its next pop
+//     (any non-maxed outfield skill if every weighted one is at 18; left
+//     as is only when all six are maxed), and returns the schedule it
+//     actually trained.  runSaleOpt adopts that schedule before every
+//     carry comparison, so the revert-to-previous check can no longer
+//     restore a schedule with maxed weeks in it.  "Seed from Sale
+//     Optimizer" inherits the fix.  Manual schedules are untouched — they
+//     stay literal and flag maxed weeks red (v14).
+//     NOT changed (open design question): weeks on a skill that GT alone
+//     would carry to 18 before the deadline.  Auto strategies keep the v14
+//     _gwm redirect; the Sale Optimizer does not look ahead at all.
+//
+// ═══════════════════════════════════════════════════════════════════════════
 // SOKKER TRAINING PLANNER v32 — THE SCORE VERDICT (sokker_47 + sokker_49)
 //
 // v32 (Sep 2026), base v31.  Port of the desktop sokker_49 estimator
@@ -1314,9 +1353,20 @@ function runPlanFromSchedule(skills,td,age,ssw,pos,schedule,subs,coachDb){
 // ─── Sale Optimizer ────────────────────────────────────────────────────────
 function _simSched(sched,skills,td,age,ssw,subs,prof){
   const te=_te(td);const st=_initSt(skills,age,te,subs);
-  let sw=ssw,ca=age;const log=[];
+  let sw=ssw,ca=age;const log=[],eff=[];
+  // v33: a week assigned to a skill already at 18 goes to the weighted
+  // non-maxed skill closest to its next pop instead (any non-maxed outfield
+  // skill when every weighted one is maxed).  `eff` is the schedule actually
+  // trained; runSaleOpt adopts it.
+  const _closest=pool=>pool.reduce((a,b)=>_sub(st[a],a,ca,te)>=_sub(st[b],b,ca,te)?a:b);
   for(let i=0;i<sched.length;i++){
-    const tr=sched[i],wk=i+1,g={},wp=[];
+    let tr=sched[i];const wk=i+1,g={},wp=[];
+    if(st[tr]&&st[tr].lv>=_MX){
+      const wOpen=OS.filter(sk=>(prof.w[sk]||0)>0&&st[sk].lv<_MX);
+      const anyOpen=OS.filter(sk=>st[sk].lv<_MX);
+      if(wOpen.length)tr=_closest(wOpen);else if(anyOpen.length)tr=_closest(anyOpen);
+    }
+    eff.push(tr);
     for(const sk of OS){if(st[sk].lv>=_MX){g[sk]=0;continue;}
       const xp=sk===tr?_XD:_XG;g[sk]=xp;
       for(const l of _applyXp(st[sk],xp,sk,ca,te))wp.push([sk,l]);}
@@ -1326,7 +1376,7 @@ function _simSched(sched,skills,td,age,ssw,subs,prof){
       gains:g,pops:wp});
     sw++;if(sw>_SL){sw=1;ca++;}
   }
-  return{states:st,log};
+  return{states:st,log,sched:eff};
 }
 function _ci(s,sk,a,te){if(s.lv>=_MX)return 0;return s.du*_duc(sk,s.lv,a,te)+s.xp;}
 function _tci(st,prof,a,te){let t=0;for(const sk of OS){const w=prof.w[sk]||0;if(w>0)t+=w*_ci(st[sk],sk,a,te);}return t;}
@@ -1341,9 +1391,10 @@ function runSaleOpt(skills,td,age,deadWeeks,pos,subs,ssw,maxExt=3,coachDb){
   const wsk=OS.filter(sk=>(prof.w[sk]||0)>0);
   let best=_buildRR(deadWeeks,prof),extUsed=0,totSwaps=0;
   for(let er=0;er<=maxExt;er++){
-    const curLen=deadWeeks+extUsed;let sched=[...best];const pre=[...sched];
+    const curLen=deadWeeks+extUsed;
+    let sched=_simSched(best,skills,td,age,ssw,subs,prof).sched;const pre=[...sched]; // v33
     for(let it=0;it<curLen;it++){
-      const{states}=_simSched(sched,skills,td,age,ssw,subs,prof);
+      const{states,sched:eff}=_simSched(sched,skills,td,age,ssw,subs,prof);sched=eff; // v33
       const fa=_ageAfter(age,ssw,curLen);
       const sc={};for(const sk of wsk)sc[sk]=states[sk].lv>=_MX?0:_sub(states[sk],sk,fa,te);
       let tgt=null,tf=-1;for(const sk of wsk){if(states[sk].lv<_MX&&sc[sk]>tf){tf=sc[sk];tgt=sk;}}
@@ -1354,6 +1405,7 @@ function runSaleOpt(skills,td,age,deadWeeks,pos,subs,ssw,maxExt=3,coachDb){
         if(li==null)continue;sched[li]=tgt;totSwaps++;swapped=true;break;}
       if(!swapped)break;
     }
+    sched=_simSched(sched,skills,td,age,ssw,subs,prof).sched; // v33: repair the last swap
     const{states:sn}=_simSched(sched,skills,td,age,ssw,subs,prof);
     const{states:so}=_simSched(pre,skills,td,age,ssw,subs,prof);
     const fa=_ageAfter(age,ssw,curLen);
@@ -1375,7 +1427,8 @@ function runSaleOpt(skills,td,age,deadWeeks,pos,subs,ssw,maxExt=3,coachDb){
       if(_tci(ts,prof,na,te)<oldCI-0.01){best=trial;extUsed++;}else break;
     }else break;
   }
-  const{states:fs,log}=_simSched(best,skills,td,age,ssw,subs,prof);
+  const{states:fs,log,sched:finSched}=_simSched(best,skills,td,age,ssw,subs,prof);
+  best=finSched; // v33: report the schedule actually trained
   const fAge=_ageAfter(age,ssw,best.length);
   const fsk={},fdb={};
   for(const sk of OS){fsk[sk]=fs[sk].lv;fdb[sk]=_tdb(fs[sk],sk,fAge,te);}
@@ -5265,7 +5318,7 @@ export default function App(){
       {/* ── Header ───────────────────────────────────────────────────── */}
       <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:4}}>
         <span style={{fontSize:22,fontWeight:700,color:C.acc,fontFamily:_ft}}>⚽ Sokker Training Planner</span>
-        <span style={{fontSize:12,color:C.txM}}>v28 · coupled K16 · coach input · fusion talent · auto current-week</span>
+        <span style={{fontSize:12,color:C.txM}}>v33 · coupled K15.2 · coach input · fusion talent · auto current-week</span>
       </div>
       <div style={{fontSize:12,color:C.txM,marginBottom:20}}>
         Load a player, plan their training, export a calibration bundle.
@@ -5865,11 +5918,11 @@ export default function App(){
                 })()}
               </div>
 
-              <button onClick={runSim} disabled={selStrats.length===0||!hasPlayerData}
+              <button onClick={runSim} disabled={(selStrats.length===0&&!manualResult)||!hasPlayerData}
                 style={{...sB,width:"100%",fontSize:16,padding:"14px 20px",
                   background:resultsStale?C.warn:C.acc,
-                  opacity:(selStrats.length===0||!hasPlayerData)?0.4:1,
-                  cursor:(selStrats.length===0||!hasPlayerData)?"not-allowed":"pointer"}}>
+                  opacity:((selStrats.length===0&&!manualResult)||!hasPlayerData)?0.4:1,
+                  cursor:((selStrats.length===0&&!manualResult)||!hasPlayerData)?"not-allowed":"pointer"}}>
                 {resultsStale?"↻ Rerun — parameters changed":results?"↻ Rerun Simulation":"▶ Run Simulation"}
               </button>
               {!advOpen&&(
@@ -5931,7 +5984,7 @@ export default function App(){
                     </div>
                     <div style={sL}>Compare strategies</div>
                     <div style={{display:"flex",flexDirection:"column",gap:4,marginTop:4,marginBottom:12}}>
-                      {Object.entries(validStrats).map(([k,v])=>{
+                      {Object.entries(validStrats).filter(([k])=>k!=="manual").map(([k,v])=>{
                         const sel=selStrats.includes(k);const isSale=k==="sale_optimizer";
                         return(
                           <button key={k} onClick={()=>setSelStrats(p=>sel?p.filter(x=>x!==k):[...p,k])} style={{
@@ -6463,7 +6516,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v31 · coupled engine K15.2 · unified 100/18 DB axis · desktop-parity estimator (two fixed points + replay balance) · auto current-week · Calibration corpus enabled
+        Sokker Training Planner v33 · coupled engine K15.2 · unified 100/18 DB axis · desktop-parity estimator (two fixed points + replay balance) · auto current-week · Calibration corpus enabled
       </div>
 
       {/* Mobile responsiveness — collapse 2-col grids below 720px */}
