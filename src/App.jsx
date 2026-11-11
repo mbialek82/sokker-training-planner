@@ -1,6 +1,55 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SOKKER TRAINING PLANNER v34 — the chain talent estimator
+//
+// v34 (Nov 2026), base v33.  Port of desktop talent_chain v1.1
+// (TALENT_CHAIN_DESIGN_v1.md; desktop default since talent_combine v10.6).
+//
+//  THE ESTIMATE FROM HISTORY IS NOW THE CHAINED CARRY-STATE LIKELIHOOD.
+//  The score estimator (v32) judged every gap alone, with a flat dead zone
+//  about 40 DB wide per pop, and let each gap pick its own carry-in.  The
+//  chain estimator keeps ONE hidden number per skill — the XP banked past
+//  the last threshold — and pushes it through every consecutive pop:
+//      level k needs N_k(t)·eps_k,  eps_k ~ 0.985·N(1, 0.05²) + 0.015·N(1, 0.5²)
+//      c' = c + X − N_k·eps_k,  the pop is seen in its week iff 0 ≤ c' < xp_last
+//  L(t) is the product over chains; D(t) = −2·(log L − max log L).
+//    point   the likelihood-weighted mean talent (never the cap by default);
+//    band    {D ≤ 3.84}, each end at the interpolated crossing;
+//    no verdict  no pop, a band open at both ends, or a band of 60 DB or
+//                more — the band is shown, Apply is disabled (as it already
+//                is for an unpinned band), and the user's own YS stays.
+//  Constants tau 0.05 / pi 0.015 are the desktop's corpus fit (Nov 2026).
+//  Same gap extractor, same drop screen, same age-bias steps as v32/v33.
+//  Parity: harness/chain_parity_v1.mjs runs this file's engine in Node
+//  against values exported from talent_chain.py for every cached player.
+//
+//  Speed: the talent grid is evaluated coarse (2 DB) first and at 0.5 DB only
+//  where D ≤ 30 — the same result as the full grid, about 2.5x faster.
+//
+//  NOT ported: the half-vs-half drift line (two more fits per player) and
+//  the youth-school combination (the online planner has no school record).
+//  `_ENGINE` is "chain"; "score" and "legacy" stay reachable through
+//  options.engine for the A/B harness.  The submission snapshot's
+//  `talent_estimator` now reads "chain-v1.1" (it still said "fusion-v2").
+//  No strategy, threshold or XP change.
+//
+//  THE BUILD-ORDER CARD LETS FREE GT FINISH A LEVEL (desktop planner v12).
+//  The card simulated every order as PURE blocks — skill #1 trained directly
+//  all the way to its target, then #2, then #3 — so the skill trained first
+//  kept rising on general training for the rest of the build, progress the
+//  target does not need.  (Field report on the desktop, 11 Nov 2026: pace
+//  13.99 / technique 11.10 / striker 12.69 → 16/16/16 at talent 87 was
+//  "fastest in 63 weeks" while a week-by-week plan had all three at 16
+//  around week 58.)  Now, inside each order, a skill takes a direct week
+//  only while general training alone would not carry it to its target by
+//  the finish week; the finish week is searched per order, starting from
+//  the pure-block finish.  Same case: 57 weeks.  The card shows the pure-
+//  block weeks beside the new ones and the direct weeks per skill, says it
+//  is the best of the orders tried (not a proven optimum), and can load the
+//  winning schedule into the Manual Schedule.
+//
+// ── v33 ──────────────────────────────────────────────────────────────────
 // SOKKER TRAINING PLANNER v33 — two field-reported planner bugs
 //
 // v33 (Nov 2026), base v32.  No engine, estimator or corpus changes.
@@ -1455,17 +1504,33 @@ function _permutations(arr){
 // Literal fixed-order simulator: trains order[k] until its target level,
 // then advances; stops when every target is met or the cap is reached.
 // No _gwm swap by design — the order is honored literally (v14 manual-
-// schedule semantics).  Returns {weeks, finalDb, finalSkills, endAge};
-// weeks=null when the cap ran out before all targets were met.
-function _simOrderToTargets(order,targets,skills,td,age,ssw,subs,capWeeks){
+// schedule semantics).  Returns {weeks, finalDb, finalSkills, endAge,
+// schedule, direct}; weeks=null when the cap ran out before all targets
+// were met.
+// v34 `gtAware`: within the order, the week goes to the first skill still
+// short that free GT will NOT carry to its target in the weeks left before
+// the cap; if GT covers all of them, to the first still short (a week
+// cannot be empty).
+function _simOrderToTargets(order,targets,skills,td,age,ssw,subs,capWeeks,gtAware){
   const te=_te(td);
   const st=_initSt(skills,age,te,subs);
   let sw=ssw,ca=age,wk=0;
+  const schedule=[],direct={};
   const done=()=>order.every(sk=>st[sk].lv>=targets[sk]);
   while(wk<capWeeks&&!done()){
     let tr=null;
-    for(const sk of order){if(st[sk].lv<targets[sk]){tr=sk;break;}}
+    if(gtAware){
+      const rem=capWeeks-wk;
+      for(const sk of order){
+        if(st[sk].lv>=targets[sk])continue;
+        if(tr==null)tr=sk;                       // fallback: first still short
+        if(!_gwl(st[sk],sk,ca,te,rem,targets[sk])){tr=sk;break;}   // _gwl: the v24 helper
+      }
+    }else{
+      for(const sk of order){if(st[sk].lv<targets[sk]){tr=sk;break;}}
+    }
     if(!tr)break;
+    schedule.push(tr);direct[tr]=(direct[tr]||0)+1;
     wk++;
     for(const sk of OS){
       if(st[sk].lv>=_MX)continue;
@@ -1475,14 +1540,23 @@ function _simOrderToTargets(order,targets,skills,td,age,ssw,subs,capWeeks){
   }
   const finalDb={},finalSkills={};
   for(const sk of OS){finalSkills[sk]=st[sk].lv;finalDb[sk]=_tdb(st[sk],sk,ca,te);}
-  return{weeks:done()?wk:null,finalDb,finalSkills,endAge:ca};
+  return{weeks:done()?wk:null,finalDb,finalSkills,endAge:ca,schedule,direct};
 }
 
-// Exhaustive ranking of every block order.  targets: {skill: displayLevel};
-// entries at/below the current level (or >18) are dropped.  Returns
-// {targets, orders:[{order,weeks,finalDb,finalSkills,endAge}…] fastest
-// first (infeasible last), best: fastest feasible entry or null}.
-function optimizeBlockOrder(skills,td,age,ssw,targets,subs,coachDb){
+// Ranking of every block order.  targets: {skill: displayLevel}; entries
+// at/below the current level (or >18) are dropped.  Returns
+// {targets, orders:[{order,weeks,finalDb,finalSkills,endAge,schedule,direct,
+// pureWeeks,deadline}…] fastest first (infeasible last), best: fastest
+// feasible entry or null}.
+// v34 (desktop planner v12): `gtAware` (default true) — for each order the
+// pure-block finish is the starting deadline, shortened week by week while
+// the GT-aware build still completes inside it (two misses in a row end the
+// search; the GT test is conservative, so feasibility is not strictly
+// monotone).  Never slower than the pure blocks of the same order.
+// gtAware=false is the v18 behaviour.  Best of the n! orders under this
+// rule — not a proven optimum over all schedules.
+function optimizeBlockOrder(skills,td,age,ssw,targets,subs,coachDb,gtAware){
+  if(gtAware==null)gtAware=true;
   _setCoach(coachDb);
   const eff={};
   for(const sk of OS){
@@ -1494,8 +1568,20 @@ function optimizeBlockOrder(skills,td,age,ssw,targets,subs,coachDb){
   if(!keys.length)return out;
   const capWeeks=Math.max(_SL,(28-age)*_SL);   // mirror desktop age-27 horizon
   for(const perm of _permutations(keys)){
-    const r=_simOrderToTargets(perm,eff,skills,td,age,ssw,subs,capWeeks);
-    out.orders.push({order:perm,...r});
+    const pure=_simOrderToTargets(perm,eff,skills,td,age,ssw,subs,capWeeks,false);
+    let best=pure,deadline=null;
+    if(gtAware&&pure.weeks!=null){
+      let misses=0,W=pure.weeks;
+      while(W>=1&&misses<2){
+        const r=_simOrderToTargets(perm,eff,skills,td,age,ssw,subs,W,true);
+        if(r.weeks!=null&&r.weeks<=W){
+          misses=0;
+          if(r.weeks<best.weeks||(r.weeks===best.weeks&&deadline==null)){best=r;deadline=W;}
+          W=Math.min(W,r.weeks)-1;
+        }else{misses++;W--;}
+      }
+    }
+    out.orders.push({order:perm,...best,pureWeeks:pure.weeks,deadline});
   }
   out.orders.sort((a,b)=>{
     if(a.weeks==null&&b.weeks==null)return 0;
@@ -2131,7 +2217,7 @@ function buildBundle(ctx){
       // pinned source string (RLS gate) stays untouched. The desktop side
       // reads these to know which producer generated talent_db_estimate.
       engine:`coupled-K16-coach${_COACH_LIVE}`,   // v19: coach-parametrized
-      talent_estimator:"fusion-v2",                 // v19: IVW fusion port
+      talent_estimator:"chain-v1.1",                // v34 (was "fusion-v2" since v19)
       coach_db:_COACH_LIVE,
       external_prior:prior||null,               // v20: [loDb,hiDb] | null
       latest_report_week:lastReport?.week??null,
@@ -3580,9 +3666,10 @@ function _applyPriorToEstimate(res,prior){
   const r1=x=>Math.round(x*10)/10;
   // v32: a score verdict carries censoring + width tier — recompute them on
   // the intersected band so the display never shows the pre-prior marks.
-  const rescore=o=>o.method==="score"
+  const rescore=o=>(o.method==="score"||o.method==="chain")
     ?{...o,censored:_scCensoring(o.tdLo,o.tdHi),confidenceScore:_scConfFromWidth(o.tdLo,o.tdHi),
-      confidenceTier:_scConfTier(_scConfFromWidth(o.tdLo,o.tdHi))}:o;
+      confidenceTier:_scConfTier(_scConfFromWidth(o.tdLo,o.tdHi)),
+      noVerdict:""}:o;      // v34: an external prior supplies the point the chain withheld
   if(ilo<=ihi){                    // overlap → narrow to the intersection
     return rescore({...res,td:r1(Math.min(100,0.5*(ilo+ihi))),tdLo:r1(ilo),tdHi:r1(ihi),
       confidence:"reliable_via_prior",prior:{lo:r1(plo),hi:r1(phi),mode:"intersect"}});
@@ -3777,10 +3864,239 @@ function _scAsNotes(r,top){
   return out;
 }
 
-const _ENGINE="score";    // "score" (sokker_49) | "legacy" (v31 coverage+balance+fusion)
+// ═════════════════════════════════════════════════════════════════════
+// v34: THE CHAIN ESTIMATOR — port of talent_chain.py v1.1
+// (see the v34 header).  Reuses _extractMixedGaps / _extractOpenMixedGap /
+// _dropEligible / _scAgeBias / _te unchanged.
+// ═════════════════════════════════════════════════════════════════════
+const _CH_TAU=0.05,_CH_PI=0.015,_CH_OUT_SD=0.5,_CH_DC=1.0,_CH_CUT=3.84;
+const _CH_STEP=0.5,_CH_COARSE=2.0,_CH_KEEP_D=30.0,_CH_NSTART=64,_CH_NO_VERDICT_W=60.0;
+const _CH_OUTLIER_CARRIED=3.0;
+const _CH_S2=Math.SQRT2,_CH_S2PI=Math.sqrt(2*Math.PI),_CH_SPI=Math.sqrt(Math.PI);
+
+// erf to ~1e-15: Maclaurin series below 2.5, continued fraction for erfc above.
+function _chErf(x){
+  const ax=Math.abs(x);let r;
+  if(ax<2.5){
+    let sum=ax,term=ax,n=0;
+    while(Math.abs(term)>1e-17*Math.abs(sum)&&n<200){n++;term*=-ax*ax/n;sum+=term/(2*n+1);}
+    r=2/_CH_SPI*sum;
+  }else{
+    let f=0;for(let k=60;k>=1;k--)f=(k/2)/(ax+f);
+    r=1-Math.exp(-ax*ax)/(_CH_SPI*(ax+f));
+  }
+  return x<0?-r:r;
+}
+function _chCdf(e,pi){
+  let v=(1-pi)*0.5*(1+_chErf((e-1)/(_CH_TAU*_CH_S2)));
+  if(pi)v+=pi*0.5*(1+_chErf((e-1)/(_CH_OUT_SD*_CH_S2)));
+  return v;
+}
+function _chPdf(e,pi){
+  const a=(e-1)/_CH_TAU;
+  let v=(1-pi)*Math.exp(-0.5*a*a)/(_CH_TAU*_CH_S2PI);
+  if(pi){const b=(e-1)/_CH_OUT_SD;v+=pi*Math.exp(-0.5*b*b)/(_CH_OUT_SD*_CH_S2PI);}
+  return v;
+}
+
+// Chains from the extractor's own bookkeeping (talent_chain.build_chains).
+// A closed gap joins the running chain iff it starts at a confirmed pop AND
+// that pop is the chain's last one (weekStart === previous weekEnd).
+function _chBuildChains(history,coachDb,isGk){
+  const hist=[...history].sort((a,b)=>(a.week||0)-(b.week||0));
+  const latest=hist[hist.length-1]||{},latestSkills=latest.skills||{};
+  const latestAge=parseFloat(latest.age??21);
+  const pool=isGk?OS.concat(["keeper"]):OS;
+  const chains=[];let nDrop=0;
+  for(const sk of pool){
+    if((latestSkills[sk]??0)>=_LEVELS_STD)continue;
+    const[gaps,nd]=_extractMixedGaps(hist,sk,coachDb,isGk);nDrop+=nd;
+    let cur=null,curEnd=null;
+    for(const g of gaps){
+      if(g.xpTotal<=0){cur=null;curEnd=null;continue;}
+      const o={skill:sk,level:g.levelBefore,base:g.thresholdRaw*(1+_scAgeBias(g.ageMid,sk)),
+        xpTotal:g.xpTotal,xpLast:g.xpLast,weekEnd:g.weekEnd};
+      if(cur&&g.hasKnownStart&&g.weekStart===curEnd)cur.pops.push(o);
+      else{
+        cur={skill:sk,start:g.hasKnownStart?"restart":"unknown",
+          carryMax:g.hasKnownStart?g.carryXpMax:0,pops:[o],open:null};
+        chains.push(cur);
+      }
+      curEnd=g.weekEnd;
+    }
+    const og=_extractOpenMixedGap(hist,sk,coachDb,isGk);
+    if(!og||og.xpTotal<=0)continue;
+    if(_dropEligible(sk,latestAge)){nDrop+=1;continue;}
+    const oo={skill:sk,level:og.level,base:og.thresholdRaw*(1+_scAgeBias(og.ageMid??latestAge,sk)),
+      xpTotal:og.xpTotal,xpLast:0,weekEnd:latest.week||0};
+    if(!og.hasKnownStart){chains.push({skill:sk,start:"unknown",carryMax:0,pops:[],open:oo});continue;}
+    let lastWeek=null,lastXp=0;      // the open gap follows the LAST pop of this skill
+    for(const rec of hist){
+      const tw=_parseRecord(rec);
+      if((tw.skillsChange[sk]||0)>0){lastWeek=tw.week;lastXp=_weekXpContribution(tw,sk,coachDb,isGk)[0];}
+    }
+    if(cur&&curEnd===lastWeek)cur.open=oo;
+    else chains.push({skill:sk,start:"restart",carryMax:lastXp,pops:[],open:oo});
+  }
+  const unk=hist.filter(r=>((r.kind||{}).name==="general")&&(r.intensity||0)>0).map(r=>r.week||0);
+  return{chains,nDrop,unknownWeeks:unk};
+}
+
+// log P(this chain's pop weeks and open gap | talent t)
+function _chChainLL(ch,t,pi){
+  const eff=_te(t),DC=_CH_DC;
+  const first=ch.pops.length?ch.pops[0]:ch.open;
+  const S=ch.start==="unknown"?first.base/eff:Math.max(ch.carryMax,DC);
+  if(!ch.pops.length){
+    const No=ch.open.base/eff;let L=0;
+    for(let i=0;i<_CH_NSTART;i++)L+=1-_chCdf((((i+0.5)/_CH_NSTART)*S+ch.open.xpTotal)/No,pi);
+    return Math.log(Math.max(L/_CH_NSTART,1e-300));
+  }
+  let cmax=0;for(const g of ch.pops)cmax=Math.max(cmax,Math.max(g.xpLast,DC));
+  const C=Math.ceil(cmax/DC),c=new Float64Array(C);
+  for(let i=0;i<C;i++)c[i]=(i+0.5)*DC;
+  let p=new Float64Array(C),q=new Float64Array(C);
+  let g=ch.pops[0],N=g.base/eff,w=Math.max(g.xpLast,DC);
+  for(let i=0;i<C;i++)p[i]=c[i]<w?(_chCdf((g.xpTotal+S-c[i])/N,pi)-_chCdf((g.xpTotal-c[i])/N,pi))/S:0;
+  for(let k=1;k<ch.pops.length;k++){
+    g=ch.pops[k];N=g.base/eff;w=Math.max(g.xpLast,DC);
+    const scale=DC/N;
+    for(let i=0;i<C;i++){
+      if(c[i]>=w){q[i]=0;continue;}
+      let sum=0;const off=g.xpTotal-c[i];
+      for(let j=0;j<C;j++){const pj=p[j];if(pj!==0)sum+=_chPdf((c[j]+off)/N,pi)*pj;}
+      q[i]=sum*scale;
+    }
+    const tmp=p;p=q;q=tmp;
+  }
+  let L=0;
+  if(ch.open){const No=ch.open.base/eff;for(let i=0;i<C;i++)L+=p[i]*(1-_chCdf((c[i]+ch.open.xpTotal)/No,pi));}
+  else for(let i=0;i<C;i++)L+=p[i];
+  return Math.log(Math.max(L*DC,1e-300));
+}
+function _chTag(ch){
+  const n=ch.pops.length;
+  const span=n?`L${ch.pops[0].level}→${ch.pops[n-1].level+1}`:`L${ch.open.level} open`;
+  return`${ch.skill} ${span} [${n} pop(s)${ch.open&&n?", open gap":""}, ${ch.start} start]`;
+}
+
+function _chainTalent(history,coachDb,isGk){
+  const b=_chBuildChains(history,coachDb,isGk);
+  return _chainFromChains(b.chains,b.nDrop,b.unknownWeeks);
+}
+// The filter on a given list of chains — split from the extraction so the
+// parity harness can feed it the DESKTOP's chains (harness/chain_parity).
+function _chainFromChains(chains,nDrop,unknownWeeks){
+  const LO=_SC_DOMAIN_LO,HI=_SC_DOMAIN_HI;
+  const nPops=chains.reduce((a,c)=>a+c.pops.length,0);
+  const nObs=chains.reduce((a,c)=>a+c.pops.length+(c.open?1:0),0);
+  const notes=[];
+  if(unknownWeeks.length)notes.push(`⚠ ${unknownWeeks.length} week(s) with UNKNOWN training kind (weeks ${Math.min(...unknownWeeks)}–${Math.max(...unknownWeeks)}) — gaps containing them excluded`);
+  const base={point:NaN,mean:NaN,best:NaN,lo:LO,hi:HI,censored:"both",noVerdict:"no usable observations",
+    nPops,nObs,nChains:chains.length,conflicts:[],flags:["no_verdict","censored_both"],notes,grid:[],nDrop,unknownWeeks};
+  if(!chains.length){notes.push("chain: no usable observations — no verdict");return base;}
+
+  // coarse pass, then 0.5 DB wherever the coarse deviance is within _CH_KEEP_D
+  const perChain=new Map();                  // t → [ll per chain]
+  const at=t=>{
+    let v=perChain.get(t);
+    if(!v){v=chains.map(ch=>_chChainLL(ch,t,_CH_PI));perChain.set(t,v);}
+    return v.reduce((a,b)=>a+b,0);
+  };
+  const TC=[];for(let t=LO;t<=HI+1e-9;t+=_CH_COARSE)TC.push(t);
+  if(TC[TC.length-1]<HI-1e-9)TC.push(HI);
+  const lc=TC.map(at),mxc=Math.max(...lc);
+  const TG=[];
+  for(let t=LO;t<=HI+1e-9;t+=_CH_STEP){
+    let k=TC.findIndex(x=>x>=t-1e-9);if(k<0)k=TC.length-1;
+    const a=Math.max(k-1,0);
+    if(-2*(Math.max(lc[a],lc[k])-mxc)<=_CH_KEEP_D)TG.push(t);
+  }
+  const ll=TG.map(at),mx=Math.max(...ll),D=ll.map(x=>-2*(x-mx));
+  let sw=0,swt=0;ll.forEach((x,i)=>{const w=Math.exp(x-mx);sw+=w;swt+=w*TG[i];});
+  const mean=swt/sw;
+  const zero=TG.filter((t,i)=>D[i]<=1e-9);
+  const best=0.5*(Math.min(...zero)+Math.max(...zero));
+  let i0=0;while(D[i0]>_CH_CUT)i0++;
+  let i1=D.length-1;while(D[i1]>_CH_CUT)i1--;
+  let lo=TG[i0],hi=TG[i1];
+  // the band ends where D CROSSES the cut, not at the last grid point inside it
+  if(i0>0&&D[i0-1]>D[i0])lo-=(TG[i0]-TG[i0-1])*(_CH_CUT-D[i0])/(D[i0-1]-D[i0]);
+  if(i1<TG.length-1&&D[i1+1]>D[i1])hi+=(TG[i1+1]-TG[i1])*(_CH_CUT-D[i1])/(D[i1+1]-D[i1]);
+  const cen=_scCensoring(lo,hi);
+  let reason="";
+  if(nPops===0)reason="no pop in the usable history";
+  else if(cen==="both")reason="band unconstrained at both ends";
+  else if(hi-lo>=_CH_NO_VERDICT_W)reason=`band ${(hi-lo).toFixed(0)} DB wide (≥ ${_CH_NO_VERDICT_W.toFixed(0)}): the evidence is one-sided`;
+  const point=reason?NaN:mean;
+
+  // per-chain diagnostics at the reported point
+  let ib=0;TG.forEach((t,i)=>{if(Math.abs(t-mean)<Math.abs(TG[ib]-mean))ib=i;});
+  const conflicts=[],rows=[];let nCarried=0;
+  chains.forEach((ch,ci)=>{
+    let cmx=-Infinity;for(const v of perChain.values())cmx=Math.max(cmx,v[ci]);
+    const here=perChain.get(TG[ib])[ci];
+    const dOwn=Math.max(0,-2*(here-cmx));
+    let carried=false;
+    if(ch.pops.length){carried=(here-_chChainLL(ch,TG[ib],0))>_CH_OUTLIER_CARRIED;if(carried)nCarried++;}
+    if(dOwn>_CH_CUT)conflicts.push(`${_chTag(ch)}: its own deviance at the verdict is ${dOwn.toFixed(1)}`);
+    rows.push([dOwn,carried,ch]);
+  });
+  const flags=[];
+  if(reason)flags.push("no_verdict");
+  if(cen!=="none")flags.push("censored_"+cen);
+  if(conflicts.length)flags.push("conflicts_"+conflicts.length);
+  if(nCarried)flags.push("outlier_"+nCarried);
+  const cenTxt={none:"both ends constrained",hi:"upper end NOT constrained by this history",
+    lo:"lower end NOT constrained by this history",both:"neither end constrained"}[cen];
+  notes.push((reason?`chain: NO VERDICT (${reason}); weighted mean ${mean.toFixed(1)}, best fit ${best.toFixed(1)}`
+    :`chain verdict: point ${point.toFixed(1)} (weighted mean; best fit ${best.toFixed(1)})`)
+    +`, 95% [${lo.toFixed(1)}–${hi.toFixed(1)}] (w=${(hi-lo).toFixed(1)}) — ${cenTxt}`);
+  notes.push(`  ${nPops} pop(s) in ${chains.length} chain(s); tau=${_CH_TAU}, pi=${_CH_PI}, outlier sd ${_CH_OUT_SD}; chain v1.1 (online port)`);
+  rows.sort((a,b)=>b[0]-a[0]);
+  for(const[dOwn,carried,ch]of rows)
+    notes.push(`  ${dOwn>_CH_CUT?"CONFLICT ":"         "}D@verdict ${dOwn.toFixed(2).padStart(5)}  ${_chTag(ch)}${carried?"  — carried by the outlier term; check its records":""}`);
+  return{point,mean,best,lo,hi,censored:cen,noVerdict:reason,nPops,nObs,nChains:chains.length,
+    conflicts,flags,notes,grid:TG.map((t,i)=>[t,D[i]]),nDrop,unknownWeeks};
+}
+
+const _ENGINE="chain";    // v34: "chain" (talent_chain v1.1) | "score" (sokker_49) | "legacy" (v31)
 
 function _estimateCombinedCore(history,options){
   options=options||{};
+  if((options.engine||_ENGINE)==="chain"){
+    // ── v34: CHAIN PATH (desktop talent_combine v10.6 `_combine_chain`) ──
+    // Same shape as the score path below, so every reader keeps working.
+    // `td` is the weighted mean even without a verdict (the page needs a
+    // number for its own bookkeeping); `noVerdict` carries the reason and
+    // is what disables Apply.  With no observation at all td is NaN, as on
+    // the score path.
+    const base=estimateTalent(history,options);
+    const coachDb=options.coachDb??_COACH_DB;
+    const isGk=options.isGk!=null?options.isGk:base.isGk;
+    let cr;
+    try{cr=_chainTalent(history,coachDb,isGk);}
+    catch(e){return{...base,method:"gap",fpFallback:"chain_failed:"+(e&&e.message)};}
+    const r1=x=>Math.round(x*10)/10;
+    const has=cr.nObs>0&&isFinite(cr.mean);
+    const valid=isFinite(cr.point);
+    const width=cr.hi-cr.lo;
+    const conf=!has?"no_data":((!valid||width>_LOW_CONF_RANGE_DB)?"low_confidence":"reliable");
+    const cScore=_scConfFromWidth(cr.lo,cr.hi);
+    return{
+      ...base,method:"chain",
+      td:has?r1(Math.min(_TD_ADOPT_CAP,Math.max(_TALENT_DB_FLOOR,valid?cr.point:cr.mean))):NaN,
+      tdLo:r1(cr.lo),tdHi:r1(cr.hi),
+      confidence:conf,oneSided:null,
+      censored:cr.censored,confidenceScore:cScore,confidenceTier:_scConfTier(cScore),
+      noVerdict:has&&!valid?cr.noVerdict:"",
+      score:{eps:(cr.hi-cr.lo)/(2*1.96),tension:0,conflicts:cr.conflicts,impossible:[],
+        inconsistent:false,nObs:cr.nObs,unknownWeeks:cr.unknownWeeks,grid:cr.grid},
+      chain:{point:cr.point,mean:cr.mean,best:cr.best,lo:cr.lo,hi:cr.hi,nPops:cr.nPops,nChains:cr.nChains},
+      notes:[...(base.notes||[]),...cr.notes],
+      flags:["engine_chain",...cr.flags],
+    };
+  }
   if((options.engine||_ENGINE)==="score"){
     // ── v32: SCORE PATH (desktop talent_combine v10) ───────────────────
     // The gap estimator still runs for its diagnostics (perGap, notes,
@@ -4176,7 +4492,7 @@ const CONF_EXPLAIN={
 // tab_squad._resolve_talent_band), never as a flat 'lo–hi'.  In YS terms the
 // scale is inverted (td_hi → ys_lo), so td≥lo reads as YS≤ys(lo).
 function _scDisplay(e){
-  const isScore=e.method==="score";
+  const isScore=e.method==="score"||e.method==="chain";   // v34: same display path
   const bLo=isFinite(e.tdLo)?Math.max(1,Math.min(100,e.tdLo)):null;
   const bHi=isFinite(e.tdHi)?Math.max(1,Math.min(100,e.tdHi)):null;
   const ysLo=bHi!=null?_csYsFromTd(bHi):null;   // td_hi → ys_lo (tighter ys)
@@ -4199,7 +4515,8 @@ function _scDisplay(e){
   const impossible=sc.impossible||[],unknownWeeks=sc.unknownWeeks||[],conflicts=sc.conflicts||[];
   const red=impossible.length>0;
   return{isScore,ivl,dbBand,cen,cenText,label,explain,impossible,unknownWeeks,conflicts,
-    inconsistent:!!sc.inconsistent,nObs:sc.nObs||0,red,unpinned:cen==="both"};
+    inconsistent:!!sc.inconsistent,nObs:sc.nObs||0,red,unpinned:cen==="both",
+    engine:e.method,noVerdict:e.noVerdict||""};   // v34
 }
 const DEMO_HISTORY_JSON=JSON.stringify({"reports":[{"week":897,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":9,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":448868}},{"week":898,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":9,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":470480}},{"week":899,"age":20,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":9,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":489376}},{"week":900,"age":20,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":9,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":506352}},{"week":901,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":10,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":0,"striker":0},"playerValue":{"value":530020}},{"week":902,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":8,"technique":8,"passing":6,"defending":10,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":1,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":554944}},{"week":903,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":6,"defending":10,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":1,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":581395}},{"week":904,"age":20,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":6,"defending":10,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":600783}},{"week":905,"age":20,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":10,"playmaking":7,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":1,"defending":0,"playmaking":0,"striker":1},"playerValue":{"value":621569}},{"week":906,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":10,"playmaking":7,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":650154}},{"week":907,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":11,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":1,"striker":0},"playerValue":{"value":684292}},{"week":908,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":11,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":721420}},{"week":909,"age":20,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":11,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":744264}},{"week":910,"age":21,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":9,"technique":9,"passing":7,"defending":11,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":1,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":757795}},{"week":911,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":9,"passing":7,"defending":11,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":794982}},{"week":912,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":9,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":0,"striker":0},"playerValue":{"value":831742}},{"week":913,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":9,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":866958}},{"week":914,"age":21,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":9,"technique":9,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":889557}},{"week":915,"age":21,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":9,"technique":9,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":912683}},{"week":916,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":9,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":950862}},{"week":917,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":1,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":991064}},{"week":918,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1033419}},{"week":919,"age":21,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":0,"striker":0},"playerValue":{"value":1058626}},{"week":920,"age":21,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1085864}},{"week":921,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1137789}},{"week":922,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1192999}},{"week":923,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1226679}},{"week":924,"age":22,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1253437}},{"week":925,"age":22,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":7,"defending":13,"playmaking":8,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":1,"passing":0,"defending":0,"playmaking":0,"striker":1},"playerValue":{"value":1281447}},{"week":926,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":8,"defending":13,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":1,"defending":0,"playmaking":1,"striker":0},"playerValue":{"value":1338666}},{"week":927,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":0,"striker":0},"playerValue":{"value":1390838}},{"week":928,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1442946}},{"week":929,"age":22,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1471005}},{"week":930,"age":22,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1500475}},{"week":931,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1556068}},{"week":932,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1614130}},{"week":933,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1674775}},{"week":934,"age":22,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":11,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":1,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1707382}},{"week":935,"age":22,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":11,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1740851}},{"week":936,"age":23,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":11,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1763542}},{"week":937,"age":23,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":11,"technique":10,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":0,"striker":0},"playerValue":{"value":1828954}},{"week":938,"age":23,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":11,"technique":10,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1899997}},{"week":939,"age":23,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":11,"technique":10,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1935339}},{"week":940,"age":23,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":11,"technique":11,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":1,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1972010}},{"week":941,"age":23,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":11,"technique":11,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":2011324}}]});
 const _ft="'JetBrains Mono','Fira Code',monospace";
@@ -4339,7 +4656,7 @@ function SkillEditor({skills,setSkills,subs,setSubs,age,setAge,pos,name,warnings
     const d=_scDisplay(e);
     const cBd=d.red?C.warn:(cMap[d.label]||C.txM);
     const ys=_csYsFromTd(e.td);
-    const src=e.method==="score"?"score":e.method==="fusion"?"fusion":e.method==="balance"?"balance":"gaps";
+    const src=e.method==="chain"?"chain":e.method==="score"?"score":e.method==="fusion"?"fusion":e.method==="balance"?"balance":"gaps";
     const pre=e.oneSided==="ge"?"≤":e.oneSided==="le"?"≥":""; // td≥cap ⇒ YS≤
     let ivl=d.ivl;
     if(!d.isScore){
@@ -4565,7 +4882,7 @@ function NextPopForecast({reports,tdLo,tdHi,coachDb}){
 }
 
 // ─── Target Build Order card (v18) ─────────────────────────────────────────
-function TargetBuildOrder({skills,td,age,ssw,subsFloat,coachDb}){
+function TargetBuildOrder({skills,td,age,ssw,subsFloat,coachDb,onLoadSchedule}){
   const[tg,setTg]=useState({});
   const[res,setRes]=useState(null);
   const cardS={background:C.card,borderRadius:10,padding:"16px 20px",marginTop:12,
@@ -4590,8 +4907,11 @@ function TargetBuildOrder({skills,td,age,ssw,subsFloat,coachDb}){
       </div>
       <div style={{fontSize:11,color:C.txM,lineHeight:1.5,marginBottom:12}}>
         Pick target levels (a skill left at its current level is excluded). Every
-        block order is simulated exactly — the age factor makes expensive skills
-        (pace) cheaper to buy early, so the ranking replaces the rule of thumb.
+        order of the target skills is simulated. Within an order a skill gets direct
+        weeks only until free general training will finish its level by the end of
+        the build — "Pure blocks" is the old rule, each skill trained all the way to
+        its target. This is the fastest of the orders tried under that rule, not a
+        proven optimum.
       </div>
       <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:8,marginBottom:12}}>
         {OS.map(sk=>{
@@ -4621,6 +4941,8 @@ function TargetBuildOrder({skills,td,age,ssw,subsFloat,coachDb}){
               <tr style={{color:C.txM,textAlign:"left"}}>
                 <th style={{padding:"4px 8px"}}>Order</th>
                 <th style={{padding:"4px 8px"}}>Weeks</th>
+                <th style={{padding:"4px 8px"}}>Pure blocks</th>
+                <th style={{padding:"4px 8px"}}>Direct weeks</th>
                 <th style={{padding:"4px 8px"}}>Done</th>
               </tr>
             </thead>
@@ -4633,6 +4955,8 @@ function TargetBuildOrder({skills,td,age,ssw,subsFloat,coachDb}){
                     fontWeight:isBest?700:400}}>
                     <td style={{padding:"5px 8px"}}>{o.order.map(sk=>SN[sk]).join(" → ")}</td>
                     <td style={{padding:"5px 8px"}}>{o.weeks==null?"—":o.weeks}</td>
+                    <td style={{padding:"5px 8px",color:C.txM}}>{o.pureWeeks==null?"—":o.pureWeeks}</td>
+                    <td style={{padding:"5px 8px",color:C.txM}}>{o.weeks==null?"—":o.order.filter(sk=>o.direct&&o.direct[sk]).map(sk=>`${SN[sk]} ${o.direct[sk]}`).join(" · ")}</td>
                     <td style={{padding:"5px 8px"}}>{o.weeks==null
                       ?"✗ not before age 28"
                       :`age ${o.endAge}${isBest?"  ← fastest":""}`}</td>
@@ -4645,6 +4969,14 @@ function TargetBuildOrder({skills,td,age,ssw,subsFloat,coachDb}){
             <div style={{marginTop:8,fontSize:11,color:C.warn}}>
               No order reaches every target before age 28 — lower a target.
             </div>
+          )}
+          {res.best&&onLoadSchedule&&res.best.schedule&&res.best.schedule.length>0&&(
+            <button onClick={()=>onLoadSchedule(res.best.schedule)}
+              title="Copies this week-by-week schedule into the Manual Schedule (replacing what is there) and switches it on."
+              style={{marginTop:10,padding:"6px 14px",fontSize:11,fontFamily:_ft,fontWeight:700,borderRadius:6,
+                cursor:"pointer",background:C.hi,color:C.acc,border:`1px solid ${C.acc}`}}>
+              Load fastest into Manual Schedule ({res.best.schedule.length} weeks)
+            </button>
           )}
         </div>
       )}
@@ -5318,7 +5650,7 @@ export default function App(){
       {/* ── Header ───────────────────────────────────────────────────── */}
       <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:4}}>
         <span style={{fontSize:22,fontWeight:700,color:C.acc,fontFamily:_ft}}>⚽ Sokker Training Planner</span>
-        <span style={{fontSize:12,color:C.txM}}>v33 · coupled K15.2 · coach input · fusion talent · auto current-week</span>
+        <span style={{fontSize:12,color:C.txM}}>v34 · coupled K15.2 · coach input · chain talent · auto current-week</span>
       </div>
       <div style={{fontSize:12,color:C.txM,marginBottom:20}}>
         Load a player, plan their training, export a calibration bundle.
@@ -5739,7 +6071,7 @@ export default function App(){
                   const ivlText=d.isScore?d.ivl:(ysLo!=null&&ysHi!=null&&ysLo!==ysHi
                     ?`${ysLo.toFixed(2)}–${ysHi.toFixed(2)}`:`${pre}${ysVal.toFixed(2)}`);
                   // an unpinned band has no point worth applying (desktop shows TD '—')
-                  const canApply=!(d.isScore&&d.unpinned);
+                  const canApply=!(d.isScore&&(d.unpinned||d.noVerdict));   // v34: chain "no verdict"
                   return(
                     <div style={{
                       borderLeft:`3px solid ${cBd}`,
@@ -5768,20 +6100,20 @@ export default function App(){
                               background:cBd,color:"#fff",letterSpacing:0.3,cursor:"help",
                             }}>{d.label}</span>
                             <span style={{color:C.txM}}>
-                              · {d.isScore?`score · ${d.nObs} obs`:isBal?`balance · ${e.balance.nEvents} event${e.balance.nEvents===1?"":"s"}`:`gaps · ${e.nGaps}`}
+                              · {d.isScore?`${d.engine} · ${d.nObs} obs`:isBal?`balance · ${e.balance.nEvents} event${e.balance.nEvents===1?"":"s"}`:`gaps · ${e.nGaps}`}
                               {!d.isScore&&!isBal&&e.nNoPopBounds?` · ${e.nNoPopBounds} no-pop`:""}
                               {e.isGk?" · GK":""}
                             </span>
                             <button onClick={()=>setYsTalent(ysVal.toFixed(2))}
                               disabled={!canApply||Math.abs(ysNum-ysVal)<0.005}
-                              title={canApply?"":"band is unpinned at both ends — no point to apply"}
+                              title={canApply?"":d.noVerdict&&!d.unpinned?`no verdict — ${d.noVerdict}`:"band is unpinned at both ends — no point to apply"}
                               style={{
                                 ...sBs,padding:"2px 10px",fontSize:11,marginLeft:"auto",
                                 ...((!canApply||Math.abs(ysNum-ysVal)<0.005)
                                   ?{opacity:0.5,cursor:"default"}
                                   :{background:cBd,color:"#fff",borderColor:cBd}),
                               }}>
-                              {!canApply?"unpinned":Math.abs(ysNum-ysVal)<0.005?"applied":"Apply"}
+                              {!canApply?(d.noVerdict&&!d.unpinned?"no verdict":"unpinned"):Math.abs(ysNum-ysVal)<0.005?"applied":"Apply"}
                             </button>
                           </>
                         )}
@@ -5811,7 +6143,7 @@ export default function App(){
                       )}
                       {d.isScore&&!d.inconsistent&&d.conflicts.length>0&&(
                         <div style={{color:C.txM,fontSize:10,marginTop:4}}>
-                          {d.conflicts.length} observation{d.conflicts.length===1?"":"s"} &gt; 2σ from the verdict (kept, down-weighted by clipping): {d.conflicts.join("; ")}
+                          {d.conflicts.length} {d.engine==="chain"?"chain":"observation"}{d.conflicts.length===1?"":"s"} {d.engine==="chain"?"at odds with the verdict (kept; an outlier level is down-weighted, never removed)":"> 2σ from the verdict (kept, down-weighted by clipping)"}: {d.conflicts.join("; ")}
                         </div>
                       )}
                       {ntWeeks>0&&(
@@ -6261,7 +6593,11 @@ export default function App(){
                 </div>);
               })()}
               {/* v18: target-build block-order optimizer */}
-              <TargetBuildOrder skills={skills} td={td} age={age} ssw={ssw} subsFloat={subsFloat} coachDb={coachDb}/>
+              <TargetBuildOrder skills={skills} td={td} age={age} ssw={ssw} subsFloat={subsFloat} coachDb={coachDb}
+                onLoadSchedule={sched=>{
+                  if(manualSchedule.length>0&&!window.confirm(`Replace current manual schedule (${manualSchedule.length} weeks) with the target build (${sched.length} weeks)?`))return;
+                  _snapshotManual();setManualSchedule(sched.slice());setManualEnabled(true);
+                }}/>
 
             </div>
           </div>
@@ -6479,7 +6815,7 @@ export default function App(){
     subskills_estimate:Object.fromEntries(OS.map(sk=>[sk,(subs[sk]??25)/100])),
     age_current:age,
     engine:`coupled-K16-coach${coachDb}`,
-    talent_estimator:"fusion-v2",
+    talent_estimator:"chain-v1.1",
     coach_db:coachDb,
     external_prior:priorBand?priorBand.map(x=>Math.round(x*10)/10):null,
     talent_db_estimate:Number(td.toFixed(2)),
@@ -6516,7 +6852,7 @@ export default function App(){
       )}
 
       <div style={{marginTop:24,textAlign:"center",fontSize:11,color:C.txM}}>
-        Sokker Training Planner v33 · coupled engine K15.2 · unified 100/18 DB axis · desktop-parity estimator (two fixed points + replay balance) · auto current-week · Calibration corpus enabled
+        Sokker Training Planner v34 · coupled engine K15.2 · unified 100/18 DB axis · desktop-parity chain estimator · auto current-week · Calibration corpus enabled
       </div>
 
       {/* Mobile responsiveness — collapse 2-col grids below 720px */}
