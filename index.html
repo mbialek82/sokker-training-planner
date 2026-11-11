@@ -1,4 +1,11 @@
 <!DOCTYPE html>
+<!-- index.html v2 (Nov 2026), for the planner v38 and later.
+     v2: the page is painted in the right theme before the planner starts.
+     v1 painted the body dark always, so light-theme visitors saw a dark
+     flash on every load.  The rule below is the planner's own (App.jsx,
+     _THEME_KEY): a stored "light" or "dark" wins; otherwise the device
+     setting decides.  Once the planner has started it sets the background
+     of html and body itself. -->
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -8,8 +15,18 @@
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap">
     <style>
       * { margin: 0; padding: 0; box-sizing: border-box; }
-      body { background: #0c0e14; }
+      html { background: #0c0e14; color-scheme: dark; }
+      html[data-theme="light"] { background: #f3f5f9; color-scheme: light; }
     </style>
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem("sokker_theme_v1");
+          var light = t === "light" || (t !== "dark" && window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches);
+          if (light) document.documentElement.setAttribute("data-theme", "light");
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

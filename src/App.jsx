@@ -1,6 +1,48 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SOKKER TRAINING PLANNER v38 — one scale, plain words, light theme, progress
+//
+// v38 (Nov 2026), base v37.  UI, plus one engine REFACTOR with no change of
+// result: optimizeBlockOrder is split into _blockOrderPrep / _blockOrderOne /
+// _blockOrderFinish so the page can rank in slices (checked in Node against
+// v37 for 1–6 targets; every other engine output identical for every cached
+// history).
+//
+//  1. ONE TYPE SCALE.  Ten text sizes became five: FS.xs 12, sm 13, md 15,
+//     lg 18, xl 22 (px at the default browser size; still rem).  14/16 → 15,
+//     17 → 18.  FS.icon (44) is for the two empty-state pictures only.
+//  2. ONE SPACING SCALE.  Padding, margin and gap use 2·4·6·8·12·16·20·24·32·64
+//     (nineteen values before); corner radius 4·6·8·10.  Off-scale values
+//     moved to the nearest step: vertical padding up, the rest down.
+//  3. HEADER AND FOOTER.  The header carries the title, the version and the
+//     theme choice.  The engine facts moved to "about this version" in the
+//     footer, closed until asked for.
+//  4. PLAIN WORDS.  "GT" is written out as general training, "unpinned" as
+//     a band open at both ends, "obs" as observations; DB and carry-in are
+//     explained in the "?" help beside them; the How page has a short list
+//     of the words used.  Three How-page statements the code had outgrown
+//     were corrected (coach input, what the estimate chip shows).
+//  5. LIGHT THEME.  _PAL holds two palettes; C and SK_COLORS are the active
+//     ones, set by _setTheme() at the top of every App render.  "System"
+//     follows prefers-color-scheme; a choice is kept in localStorage.  The
+//     dark palette is unchanged.  The planner sets the background of html
+//     and body itself; index.html v2 paints the same theme before it starts.
+//  6. PROGRESS.  Ranking five or six targets (120 / 720 orders, about 1–4 s)
+//     runs in 50 ms slices with a progress bar and Cancel; up to four
+//     targets still run at once.
+//  7. Three phone flaws seen on the live v37: the header wrapped into three
+//     lines, the estimate line began with a stray "·", and the "?" of the
+//     build-order card dropped under its title.
+//  8. SMALLER THINGS.  Level boxes are 46 px wide (two digits at FS.md).  The
+//     build-order result shows the ten fastest, the rest on request.  The
+//     export text said "strategyies".  No style object pairs a colour
+//     shorthand with a longhand any more (sI uses backgroundColor, chips set
+//     the whole border): React re-sets a shorthand that changed with the
+//     theme and drops the unchanged longhand beside it, so the select arrows
+//     and selected-chip borders vanished on a theme switch.
+//
+// ── v37 ──────────────────────────────────────────────────────────────────
 // SOKKER TRAINING PLANNER v37 — source tidy
 //
 // v37 (Nov 2026), base v36.  NO BEHAVIOUR CHANGE.  One internal function
@@ -1634,34 +1676,34 @@ function _simOrderToTargets(order,targets,skills,td,age,ssw,subs,capWeeks,gtAwar
 // monotone).  Never slower than the pure blocks of the same order.
 // gtAware=false is the v18 behaviour.  Best of the n! orders under this
 // rule — not a proven optimum over all schedules.
-function optimizeBlockOrder(skills,td,age,ssw,targets,subs,coachDb,gtAware){
-  if(gtAware==null)gtAware=true;
-  _setCoach(coachDb);
+// v38: the ranking in three parts, so the page can rank in slices and show
+// progress.  optimizeBlockOrder runs the same three, so the result is the
+// same either way (the sort is stable: equal weeks keep permutation order).
+function _blockOrderPrep(skills,age,targets){
   const eff={};
   for(const sk of OS){
     const t=Math.round(targets?.[sk]??0);
     if(t>(skills[sk]||0)&&t<=_MX)eff[sk]=t;
   }
-  const keys=Object.keys(eff).sort();
-  const out={targets:eff,orders:[],best:null};
-  if(!keys.length)return out;
-  const capWeeks=Math.max(_SL,(28-age)*_SL);   // mirror desktop age-27 horizon
-  for(const perm of _permutations(keys)){
-    const pure=_simOrderToTargets(perm,eff,skills,td,age,ssw,subs,capWeeks,false);
-    let best=pure,deadline=null;
-    if(gtAware&&pure.weeks!=null){
-      let misses=0,W=pure.weeks;
-      while(W>=1&&misses<2){
-        const r=_simOrderToTargets(perm,eff,skills,td,age,ssw,subs,W,true);
-        if(r.weeks!=null&&r.weeks<=W){
-          misses=0;
-          if(r.weeks<best.weeks||(r.weeks===best.weeks&&deadline==null)){best=r;deadline=W;}
-          W=Math.min(W,r.weeks)-1;
-        }else{misses++;W--;}
-      }
+  return{eff,keys:Object.keys(eff).sort(),capWeeks:Math.max(_SL,(28-age)*_SL)};   // capWeeks mirrors the desktop age-27 horizon
+}
+function _blockOrderOne(perm,eff,skills,td,age,ssw,subs,capWeeks,gtAware){
+  const pure=_simOrderToTargets(perm,eff,skills,td,age,ssw,subs,capWeeks,false);
+  let best=pure,deadline=null;
+  if(gtAware&&pure.weeks!=null){
+    let misses=0,W=pure.weeks;
+    while(W>=1&&misses<2){
+      const r=_simOrderToTargets(perm,eff,skills,td,age,ssw,subs,W,true);
+      if(r.weeks!=null&&r.weeks<=W){
+        misses=0;
+        if(r.weeks<best.weeks||(r.weeks===best.weeks&&deadline==null)){best=r;deadline=W;}
+        W=Math.min(W,r.weeks)-1;
+      }else{misses++;W--;}
     }
-    out.orders.push({order:perm,...best,pureWeeks:pure.weeks,deadline});
   }
+  return{order:perm,...best,pureWeeks:pure.weeks,deadline};
+}
+function _blockOrderFinish(out){
   out.orders.sort((a,b)=>{
     if(a.weeks==null&&b.weeks==null)return 0;
     if(a.weeks==null)return 1;
@@ -1670,6 +1712,15 @@ function optimizeBlockOrder(skills,td,age,ssw,targets,subs,coachDb,gtAware){
   });
   if(out.orders.length&&out.orders[0].weeks!=null)out.best=out.orders[0];
   return out;
+}
+function optimizeBlockOrder(skills,td,age,ssw,targets,subs,coachDb,gtAware){
+  if(gtAware==null)gtAware=true;
+  _setCoach(coachDb);
+  const{eff,keys,capWeeks}=_blockOrderPrep(skills,age,targets);
+  const out={targets:eff,orders:[],best:null};
+  if(!keys.length)return out;
+  for(const perm of _permutations(keys))out.orders.push(_blockOrderOne(perm,eff,skills,td,age,ssw,subs,capWeeks,gtAware));
+  return _blockOrderFinish(out);
 }
 
 // ─── XML History Parser (port of xml_history_parser.py, DOMParser-based) ──
@@ -4522,14 +4573,32 @@ function _fuseSignals(signals){
 // txM, for decoration only (never text); `accFill` is the blue that white
 // text passes on; `onFill` is the dark text for green / orange / badge fills;
 // `red` lightened (#ef4444 was 4.5:1 at best as text).
-const C={bg:"#0c0e14",card:"#14171f",hi:"#1a1e29",bdr:"#252a38",
-  acc:"#4a90d9",pop:"#48c774",warn:"#f5a623",tx:"#dfe3ed",txD:"#a3adbd",txM:"#7f8a9c",red:"#f47272",
-  faint:"#4e5a6e",accFill:"#2c6fbf",onFill:"#0c0e14"};
+// v38: two palettes.  `C` is the ACTIVE one: App calls _setTheme() at the
+// top of every render, before any colour is read, and every component reads
+// C when it renders — so nothing may copy a colour at module load.  Values
+// stay plain hex so the alpha suffixes (C.pop+"22") keep working.  Light:
+// every text colour is 4.5:1 or better on card, bg, hi and on its own 20%
+// tint; `onFill` is white there (the fills are dark), `halo` is the outline
+// behind the number on a sub-level bar, bar* are the skill-editor bar fills.
+const _PAL={
+  dark:{bg:"#0c0e14",card:"#14171f",hi:"#1a1e29",bdr:"#252a38",acc:"#4a90d9",pop:"#48c774",warn:"#f5a623",tx:"#dfe3ed",txD:"#a3adbd",txM:"#7f8a9c",red:"#f47272",faint:"#4e5a6e",accFill:"#2c6fbf",onFill:"#0c0e14",halo:"rgba(0,0,0,0.9)",barCrit:"#4a90d9",barHelp:"#6b7a8d",barOff:"#3a3f4a"},
+  light:{bg:"#f3f5f9",card:"#ffffff",hi:"#e9edf4",bdr:"#c3ccd8",acc:"#1755a2",pop:"#0e6431",warn:"#834700",tx:"#151a23",txD:"#3f4a5a",txM:"#566173",red:"#a21f1f",faint:"#aeb7c4",accFill:"#2c6fbf",onFill:"#ffffff",halo:"rgba(255,255,255,0.95)",barCrit:"#8bb8ee",barHelp:"#b3bcc9",barOff:"#d5dbe4"},
+};
+let C=_PAL.dark;
+const _THEME_KEY="sokker_theme_v1";   // localStorage: "light" | "dark"; absent = follow the system
 // v35: text sizes in rem, so the page follows the browser's text-size setting.
 const _rem=px=>(px/16)+"rem";
+// v38: the type scale.  Five text sizes; `icon` is for empty-state pictures only.
+const FS={xs:_rem(12),sm:_rem(13),md:_rem(15),lg:_rem(18),xl:_rem(22),icon:_rem(44)};
 // v8.4: Canonical per-skill chip colors for Manual Schedule
 // v35: pace / playmaking / striker lightened so each passes 4.5:1 as text on its own tinted chip.
-const SK_COLORS={pace:"#5b9ee3",technique:"#48c774",passing:"#a78bfa",defending:"#f5a623",playmaking:"#f06aad",striker:"#f47272"};
+// v38: per theme, like C.
+const _PAL_SK={
+  dark:{pace:"#5b9ee3",technique:"#48c774",passing:"#a78bfa",defending:"#f5a623",playmaking:"#f06aad",striker:"#f47272"},
+  light:{pace:"#1755a2",technique:"#0e6431",passing:"#5b34c4",defending:"#834700",playmaking:"#9e1762",striker:"#a21f1f"},
+};
+let SK_COLORS=_PAL_SK.dark;
+function _setTheme(name){const k=name==="light"?"light":"dark";C=_PAL[k];SK_COLORS=_PAL_SK[k];}
 // v15: canonical English level names (sokker_01 v23 table, display 0–18).
 // Lowercase for in-card sentence fidelity ("solid [8] keeper").
 const LEVEL_NAMES=["tragic","hopeless","unsatisfactory","poor","weak","average",
@@ -4587,7 +4656,7 @@ function _scDisplay(e){
   const cen=isScore?(e.censored||"none"):"none";
   let ivl;
   if(bLo==null||bHi==null)ivl="—";
-  else if(cen==="both")ivl="unpinned";
+  else if(cen==="both")ivl="open band";
   else if(cen==="hi")ivl=`≤${ysHi.toFixed(2)}`;    // td≥lo ⇒ YS≤ys(lo)
   else if(cen==="lo")ivl=`≥${ysLo.toFixed(2)}`;    // td≤hi ⇒ YS≥ys(hi)
   else ivl=ysLo!==ysHi?`${ysLo.toFixed(2)}–${ysHi.toFixed(2)}`:ysLo.toFixed(2);
@@ -4627,16 +4696,16 @@ function HelpBtn({open,onToggle,label}){
     <button type="button" aria-expanded={open} aria-label={`${open?"Hide":"Show"} help: ${label}`}
       onClick={onToggle}
       style={{width:24,height:24,minWidth:24,borderRadius:"50%",padding:0,lineHeight:1,flex:"none",
-        fontFamily:_fs,fontSize:_rem(13),fontWeight:700,cursor:"pointer",textTransform:"none",letterSpacing:0,
+        fontFamily:_fs,fontSize:FS.sm,fontWeight:700,cursor:"pointer",textTransform:"none",letterSpacing:0,
         background:open?C.acc+"33":"transparent",color:open?C.tx:C.txD,
         border:`1px solid ${open?C.acc:C.txM}`}}>?</button>
   );
 }
 function HelpText({children,style}){
   return(
-    <div role="note" style={{fontSize:_rem(12),color:C.txD,lineHeight:1.5,margin:"6px 0",fontFamily:_fs,
+    <div role="note" style={{fontSize:FS.xs,color:C.txD,lineHeight:1.5,margin:"6px 0",fontFamily:_fs,
       fontWeight:400,textTransform:"none",letterSpacing:0,
-      padding:"6px 10px",background:C.bg,borderLeft:`2px solid ${C.acc}`,borderRadius:4,...style}}>{children}</div>
+      padding:"6px 8px",background:C.bg,borderLeft:`2px solid ${C.acc}`,borderRadius:4,...style}}>{children}</div>
   );
 }
 function useHelp(){
@@ -4650,18 +4719,18 @@ function Disc({open,onToggle,children,color}){
   return(
     <button type="button" aria-expanded={open} onClick={onToggle}
       style={{flex:1,background:"transparent",border:"none",color:color||C.txD,fontFamily:_fs,fontWeight:600,
-        fontSize:_rem(12),cursor:"pointer",padding:"6px 0",textAlign:"left",letterSpacing:"0.08em",
+        fontSize:FS.xs,cursor:"pointer",padding:"6px 0",textAlign:"left",letterSpacing:"0.08em",
         textTransform:"uppercase"}}>{open?"▾":"▸"} {children}</button>
   );
 }
 // AskRow: an inline confirm (replaces window.confirm).  ask = {text,label,run}.
 function AskRow({ask,onCancel}){
   if(!ask)return null;
-  const b={padding:"5px 14px",borderRadius:6,fontFamily:_fs,fontWeight:600,fontSize:_rem(13),cursor:"pointer"};
+  const b={padding:"6px 12px",borderRadius:6,fontFamily:_fs,fontWeight:600,fontSize:FS.sm,cursor:"pointer"};
   return(
     <div role="alert" style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginTop:8,marginBottom:8,
-      padding:"8px 10px",background:C.warn+"18",border:`1px solid ${C.warn}66`,borderRadius:6,
-      fontSize:_rem(13),color:C.tx,fontFamily:_fs}}>
+      padding:"8px 8px",background:C.warn+"18",border:`1px solid ${C.warn}66`,borderRadius:6,
+      fontSize:FS.sm,color:C.tx,fontFamily:_fs}}>
       <span style={{flex:"1 1 220px"}}>{ask.text}</span>
       <button type="button" autoFocus onClick={ask.run} style={{...b,background:C.warn,color:C.onFill,border:`1px solid ${C.warn}`}}>{ask.label}</button>
       <button type="button" onClick={onCancel} style={{...b,background:C.hi,color:C.tx,border:`1px solid ${C.bdr}`}}>Cancel</button>
@@ -4673,11 +4742,11 @@ function NoteRow({note,onUndo}){
   if(!note)return null;
   return(
     <div role="status" style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginTop:8,marginBottom:8,
-      padding:"6px 10px",background:C.pop+"14",border:`1px solid ${C.pop}55`,borderRadius:6,
-      fontSize:_rem(13),color:C.tx,fontFamily:_fs}}>
+      padding:"6px 8px",background:C.pop+"14",border:`1px solid ${C.pop}55`,borderRadius:6,
+      fontSize:FS.sm,color:C.tx,fontFamily:_fs}}>
       <span style={{flex:"1 1 220px"}}>✓ {note.text}</span>
       {onUndo&&<button type="button" onClick={onUndo} style={{padding:"4px 12px",borderRadius:6,fontFamily:_fs,
-        fontWeight:600,fontSize:_rem(13),cursor:"pointer",background:C.hi,color:C.tx,border:`1px solid ${C.bdr}`}}>↶ Undo</button>}
+        fontWeight:600,fontSize:FS.sm,cursor:"pointer",background:C.hi,color:C.tx,border:`1px solid ${C.bdr}`}}>↶ Undo</button>}
     </div>
   );
 }
@@ -4715,8 +4784,8 @@ function SubBar({value,onChange,color}){
           it background-black over the still-unfilled right side for every
           value in ~60–95 ("czarna czcionka gubi się na czarnym tle").
           Bright text + dark halo is readable over both fill and bg. */}
-      <div style={{position:"absolute",right:6,top:"50%",transform:"translateY(-50%)",fontSize:_rem(12),fontFamily:_ft,fontWeight:600,
-        color:C.tx,textShadow:"0 0 3px rgba(0,0,0,0.9),0 0 2px rgba(0,0,0,0.9)",zIndex:1}}>.{value.toString().padStart(2,"0")}</div>
+      <div style={{position:"absolute",right:6,top:"50%",transform:"translateY(-50%)",fontSize:FS.xs,fontFamily:_ft,fontWeight:600,
+        color:C.tx,textShadow:`0 0 3px ${C.halo},0 0 2px ${C.halo}`,zIndex:1}}>.{value.toString().padStart(2,"0")}</div>
     </div>
   );
 }
@@ -4735,8 +4804,8 @@ function SokkerCard({title,name,age,skills,form,value,valueLabel,deltas,footnote
     const gained=deltas?.[sk]||0;
     const known=Number.isFinite(lv);
     return(
-      <div key={sk} style={{padding:"7px 12px",borderBottom:`1px solid ${C.bdr}55`,fontSize:_rem(13),
-        display:"flex",alignItems:"baseline",gap:5,minWidth:0,flexWrap:"wrap"}}>
+      <div key={sk} style={{padding:"8px 12px",borderBottom:`1px solid ${C.bdr}55`,fontSize:FS.sm,
+        display:"flex",alignItems:"baseline",gap:4,minWidth:0,flexWrap:"wrap"}}>
         {known?(
           <>
             <span style={{fontWeight:700,color:gained>0?C.pop:C.tx,whiteSpace:"nowrap"}}>
@@ -4744,8 +4813,8 @@ function SokkerCard({title,name,age,skills,form,value,valueLabel,deltas,footnote
             </span>
             <span style={{color:C.txD,whiteSpace:"nowrap"}}>{label}</span>
             {gained>0&&(
-              <span style={{fontSize:_rem(12),fontWeight:700,color:C.pop,background:C.pop+"1c",
-                borderRadius:3,padding:"0 4px",fontFamily:_ft}}>+{gained}</span>
+              <span style={{fontSize:FS.xs,fontWeight:700,color:C.pop,background:C.pop+"1c",
+                borderRadius:4,padding:"0 4px",fontFamily:_ft}}>+{gained}</span>
             )}
           </>
         ):(
@@ -4759,21 +4828,21 @@ function SokkerCard({title,name,age,skills,form,value,valueLabel,deltas,footnote
   };
   return(
     <div style={{background:C.card,border:`1px solid ${C.bdr}`,borderRadius:8,overflow:"hidden",flex:1,minWidth:280}}>
-      <div style={{background:C.hi,padding:"9px 12px",display:"flex",alignItems:"baseline",gap:8,
+      <div style={{background:C.hi,padding:"8px 12px",display:"flex",alignItems:"baseline",gap:8,
         borderBottom:`1px solid ${C.bdr}`}}>
-        <span style={{fontWeight:700,fontSize:_rem(14),color:C.tx}}>{name||"Player"}</span>
-        {Number.isFinite(age)&&<span style={{fontSize:_rem(13),color:C.txD}}>age: <b style={{color:C.tx}}>{age}</b></span>}
-        {title&&<span style={{marginLeft:"auto",fontSize:_rem(12),fontWeight:700,letterSpacing:0.6,
+        <span style={{fontWeight:700,fontSize:FS.md,color:C.tx}}>{name||"Player"}</span>
+        {Number.isFinite(age)&&<span style={{fontSize:FS.sm,color:C.txD}}>age: <b style={{color:C.tx}}>{age}</b></span>}
+        {title&&<span style={{marginLeft:"auto",fontSize:FS.xs,fontWeight:700,letterSpacing:0.6,
           color:C.txD,textTransform:"uppercase"}}>{title}</span>}
       </div>
       {Number.isFinite(value)&&(
-        <div style={{padding:"7px 12px",borderBottom:`1px solid ${C.bdr}55`,fontSize:_rem(13)}}>
+        <div style={{padding:"8px 12px",borderBottom:`1px solid ${C.bdr}55`,fontSize:FS.sm}}>
           <span style={{color:C.txD}}>value{valueLabel?` (${valueLabel})`:""}: </span>
           <b style={{color:C.red}}>{Math.round(value).toLocaleString("pl-PL").replace(/,/g," ")} zł</b>
         </div>
       )}
       {Number.isFinite(form)&&(
-        <div style={{padding:"7px 12px",borderBottom:`1px solid ${C.bdr}55`,fontSize:_rem(13)}}>
+        <div style={{padding:"8px 12px",borderBottom:`1px solid ${C.bdr}55`,fontSize:FS.sm}}>
           <span style={{fontWeight:700,color:form<=5?C.red:form>=11?C.pop:C.tx}}>
             {LEVEL_NAMES[Math.max(0,Math.min(18,form))]} [{form}]</span>
           <span style={{color:C.txD}}> form</span>
@@ -4783,7 +4852,7 @@ function SokkerCard({title,name,age,skills,form,value,valueLabel,deltas,footnote
         {CARD_GRID.map(row=>row.map(([sk,label])=>cell(sk,label)))}
       </div>
       {footnote&&(
-        <div style={{padding:"6px 12px",fontSize:_rem(12),color:C.txM,lineHeight:1.35}}>{footnote}</div>
+        <div style={{padding:"6px 12px",fontSize:FS.xs,color:C.txM,lineHeight:1.35}}>{footnote}</div>
       )}
     </div>
   );
@@ -4826,12 +4895,12 @@ function SkillEditor({skills,setSkills,subs,setSubs,age,setAge,pos,name,warnings
         display:"inline-flex",alignItems:"center",gap:6,
         padding:"2px 8px",borderRadius:4,
         background:C.card,border:`${d.red?2:1}px solid ${cBd}`,
-        fontSize:_rem(12),fontFamily:_ft,
+        fontSize:FS.xs,fontFamily:_ft,
       }} title={`Talent estimate from training history (${src}): YS ${ivl} (${d.label}). ${d.explain}${flag} Apply on Stage 2.`}>
-        <span style={{color:C.txM,letterSpacing:0.3,fontFamily:_fs,fontSize:_rem(12),fontWeight:600}}>EST.</span>
+        <span style={{color:C.txM,letterSpacing:0.3,fontFamily:_fs,fontSize:FS.xs,fontWeight:600}}>EST.</span>
         <span style={{color:C.tx,fontWeight:700}}>{ivl}</span>
         <span style={{
-          padding:"0 5px",borderRadius:2,fontSize:_rem(12),fontWeight:600,
+          padding:"0 4px",borderRadius:4,fontSize:FS.xs,fontWeight:600,
           background:cBd,color:C.onFill,letterSpacing:0.3,fontFamily:_fs,
         }}>{d.label}</span>
         {d.red&&<span role="img" aria-label="Impossible pop set aside — see Stage 2" title="IMPOSSIBLE pop set aside — see Stage 2">🛑</span>}
@@ -4842,28 +4911,28 @@ function SkillEditor({skills,setSkills,subs,setSubs,age,setAge,pos,name,warnings
   return(
     <div style={{background:C.bg,borderRadius:6,border:`1px solid ${C.bdr}`,padding:12}}>
       {name&&(
-        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:8,flexWrap:"wrap"}}>
-          <div style={{fontWeight:600,color:warnings?.length?C.warn:C.pop,fontSize:_rem(14)}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8,flexWrap:"wrap"}}>
+          <div style={{fontWeight:600,color:warnings?.length?C.warn:C.pop,fontSize:FS.md}}>
             {name} {age?`· age ${age}`:""}
           </div>
           {teBadge}
         </div>
       )}
-      {warnings?.length>0&&<div style={{fontSize:_rem(12),color:C.warn,marginBottom:8}}>⚠ {warnings.join("; ")}</div>}
+      {warnings?.length>0&&<div style={{fontSize:FS.xs,color:C.warn,marginBottom:8}}>⚠ {warnings.join("; ")}</div>}
 
       {/* Age row (manual mode) — v13: talent badge shown alongside if estimate available */}
       {editable&&!name&&(
-        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,flexWrap:"wrap"}}>
-          <span style={{fontSize:_rem(12),color:C.txD,fontFamily:_fs,textTransform:"uppercase",letterSpacing:"0.06em"}}>Age</span>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8,flexWrap:"wrap"}}>
+          <span style={{fontSize:FS.xs,color:C.txD,fontFamily:_fs,textTransform:"uppercase",letterSpacing:"0.06em"}}>Age</span>
           <input type="number" aria-label="Age" min={16} max={40} value={age}
             onChange={e=>setAge(Math.max(16,Math.min(40,parseInt(e.target.value)||16)))}
-            style={{background:C.card,border:`1px solid ${C.bdr}`,borderRadius:4,color:C.tx,fontFamily:_ft,fontSize:_rem(14),fontWeight:600,
+            style={{background:C.card,border:`1px solid ${C.bdr}`,borderRadius:4,color:C.tx,fontFamily:_ft,fontSize:FS.md,fontWeight:600,
               padding:"4px 8px",width:52,textAlign:"center"}}/>
           {teBadge}
         </div>
       )}
 
-      <div style={{display:"flex",gap:6,marginBottom:6,fontSize:_rem(12),color:C.txM,fontFamily:_ft}}>
+      <div style={{display:"flex",gap:6,marginBottom:6,fontSize:FS.xs,color:C.txM,fontFamily:_ft}}>
         <span style={{width:62}}>Skill</span>
         <span style={{width:40,textAlign:"center"}}>Level</span>
         <span style={{flex:1,display:"flex",alignItems:"center",gap:6}}>Sub-level {hb("sub","Sub-level")}</span>
@@ -4875,20 +4944,20 @@ function SkillEditor({skills,setSkills,subs,setSubs,age,setAge,pos,name,warnings
         const isCrit=w===1;
         const isHelp=w>0&&w<1;
         const color=w===0?C.txM:isCrit?C.acc:C.txD;
-        const barColor=isCrit?"#4a90d9":isHelp?"#6b7a8d":"#3a3f4a";
+        const barColor=isCrit?C.barCrit:isHelp?C.barHelp:C.barOff;
         return(
-          <div key={sk} style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+          <div key={sk} style={{display:"flex",alignItems:"center",gap:6,marginBottom:4}}>
             {/* Skill label */}
-            <div style={{width:62,fontFamily:_ft,fontSize:_rem(13),fontWeight:600,color,display:"flex",alignItems:"center",gap:4}}>
+            <div style={{width:62,fontFamily:_ft,fontSize:FS.sm,fontWeight:600,color,display:"flex",alignItems:"center",gap:4}}>
               {SN[sk]}
-              {isCrit&&<span style={{fontSize:_rem(12),color:C.acc}}>★</span>}
-              {isHelp&&<span style={{fontSize:_rem(12),color:C.txM}}>{w}</span>}
+              {isCrit&&<span style={{fontSize:FS.xs,color:C.acc}}>★</span>}
+              {isHelp&&<span style={{fontSize:FS.xs,color:C.txM}}>{w}</span>}
             </div>
             {/* Level input */}
             <input type="number" aria-label={`${sk} level`} min={0} max={18} value={skills[sk]??0}
               onChange={e=>setSkills(p=>({...p,[sk]:Math.max(0,Math.min(18,parseInt(e.target.value)||0))}))}
-              style={{width:40,background:C.card,border:`1px solid ${C.bdr}`,borderRadius:4,color:C.tx,fontFamily:_ft,
-                fontSize:_rem(14),fontWeight:700,padding:"3px 4px",textAlign:"center"}}/>
+              style={{width:46,background:C.card,border:`1px solid ${C.bdr}`,borderRadius:4,color:C.tx,fontFamily:_ft,
+                fontSize:FS.md,fontWeight:700,padding:"4px 4px",textAlign:"center"}}/>
             {/* Sub bar */}
             <div style={{flex:1}}>
               <SubBar value={subs[sk]??25} onChange={v=>setSubs(p=>({...p,[sk]:v}))} color={barColor}/>
@@ -4897,7 +4966,7 @@ function SkillEditor({skills,setSkills,subs,setSubs,age,setAge,pos,name,warnings
             <input type="number" aria-label={`${sk} sub-level, percent toward the next pop`} min={0} max={99} value={subs[sk]??25}
               onChange={e=>setSubs(p=>({...p,[sk]:Math.max(0,Math.min(99,parseInt(e.target.value)||0))}))}
               style={{width:46,background:C.card,border:`1px solid ${C.bdr}`,borderRadius:4,color:C.txD,fontFamily:_ft,
-                fontSize:_rem(12),padding:"3px 4px",textAlign:"right"}}/>
+                fontSize:FS.xs,padding:"4px 4px",textAlign:"right"}}/>
           </div>
         );
       })}
@@ -4990,7 +5059,7 @@ function NextPopForecast({reports,tdLo,tdHi,coachDb}){
     return _forecastNextPops(reports,Math.max(1,tdLo),Math.min(100,Math.max(tdLo,tdHi)),coachDb);
   },[reports,tdLo,tdHi,coachDb]);
   if(!fc||!fc.rows.length)return null;
-  const cell={padding:"3px 8px",fontFamily:_ft,fontSize:_rem(12)};
+  const cell={padding:"4px 8px",fontFamily:_ft,fontSize:FS.xs};
   // v20 semantics (validated on the half-split corpus): the ASSUMED skill
   // gets a two-sided range (93.5% within ±2 w where the assumption held);
   // every OTHER skill is projected on GT ALONE, which is the SLOWEST
@@ -5001,7 +5070,7 @@ function NextPopForecast({reports,tdLo,tdHi,coachDb}){
     if(!r.assumed){
       const bound=r.slow;
       return bound==null?">3 seasons / drop-age"
-        :`by ≤ ${bound} w · GT alone (sooner if trained)`;
+        :`by ≤ ${bound} w · general training alone (sooner if trained)`;
     }
     if(r.mode==="upper")return r.slow==null?">3 seasons / drop-age":`≤ ${r.slow} w`;
     if(r.fast==null&&r.slow==null)return">3 seasons / drop-age";
@@ -5010,7 +5079,7 @@ function NextPopForecast({reports,tdLo,tdHi,coachDb}){
     return r.fast!=null?`≥ ${r.fast} w`:`≤ ${r.slow} w`;
   };
   return(
-    <div style={{marginTop:12,background:C.card,borderRadius:8,padding:"10px 14px",
+    <div style={{marginTop:12,background:C.card,borderRadius:8,padding:"12px 12px",
       borderLeft:`3px solid ${C.pop}`}}>
       <div style={{display:"flex",alignItems:"center",gap:8}}>
         <Disc open={open} onToggle={()=>setOpen(o=>!o)} color={C.pop}>⏱ Next pops — if current training continues</Disc>
@@ -5028,10 +5097,10 @@ function NextPopForecast({reports,tdLo,tdHi,coachDb}){
           ))}
         </tbody>
       </table>
-      <div style={{fontSize:_rem(12),color:C.txM,marginTop:6,lineHeight:1.4}}>
+      <div style={{fontSize:FS.xs,color:C.txM,marginTop:6,lineHeight:1.4}}>
         assuming "{SN[fc.assumed]||fc.assumed}" stays the trained skill
       </div>
-      {ht("np",<>Standard week, coach {coachDb}. The trained-skill range spans the talent band; the other skills are projected on general training alone, so theirs are upper bounds. Out of sample the model's pops fall within ±2 weeks 80% of the time (n=767); this card's ranges hold 94% and its bounds 93% of the time.</>)}
+      {ht("np",<>A pop is a level-up. Standard week, coach {coachDb}. The trained-skill range spans the talent band; the other skills are projected on general training alone, so theirs are upper bounds. Out of sample the model's pops fall within ±2 weeks 80% of the time (n=767); this card's ranges hold 94% and its bounds 93% of the time.</>)}
       </>)}
     </div>
   );
@@ -5044,10 +5113,10 @@ function TargetBuildOrder({skills,td,age,ssw,subsFloat,coachDb,onLoadSchedule,as
   const[hb,ht]=useHelp();   // v36
   const cardS={background:C.card,borderRadius:10,padding:"16px 20px",marginTop:12,
     borderLeft:`3px solid ${C.acc}`};
-  const labS={fontSize:_rem(12),fontFamily:_fs,color:C.txM,textTransform:"uppercase",
+  const labS={fontSize:FS.xs,fontFamily:_fs,color:C.txM,textTransform:"uppercase",
     letterSpacing:"0.1em",marginBottom:4};
   const inpS={background:C.bg,border:`1px solid ${C.bdr}`,borderRadius:6,color:C.tx,
-    fontFamily:_ft,fontSize:_rem(13),padding:"6px 8px",width:"100%",
+    fontFamily:_ft,fontSize:FS.sm,padding:"6px 8px",width:"100%",
     boxSizing:"border-box",textAlign:"center"};
   const eff={};
   for(const sk of OS){
@@ -5056,14 +5125,40 @@ function TargetBuildOrder({skills,td,age,ssw,subsFloat,coachDb,onLoadSchedule,as
     if(t>cur&&t<=_MX)eff[sk]=t;
   }
   const n=Object.keys(eff).length;
-  const run=()=>setRes(optimizeBlockOrder(skills,td,age,ssw,eff,subsFloat,coachDb));
+  // v38: five or six targets (120 / 720 orders) take 1–4 s.  They are ranked
+  // in 50 ms slices so the page can show progress and stay responsive; the
+  // result is assembled by the same functions optimizeBlockOrder uses.
+  const[prog,setProg]=useState(null);        // {done,total} while ranking
+  const[showAll,setShowAll]=useState(false); // result table: ten fastest, or every order
+  const runId=useRef(0);
+  useEffect(()=>()=>{runId.current++;},[]);   // leaving the stage stops a ranking in flight
+  const cancel=()=>{runId.current++;setProg(null);};
+  const run=()=>{
+    const id=++runId.current;
+    setShowAll(false);
+    const p=_blockOrderPrep(skills,age,eff);
+    const perms=_permutations(p.keys);
+    if(perms.length<=24){setProg(null);setRes(optimizeBlockOrder(skills,td,age,ssw,eff,subsFloat,coachDb));return;}
+    const out={targets:p.eff,orders:[],best:null};
+    let i=0;
+    setRes(null);setProg({done:0,total:perms.length});
+    const step=()=>{
+      if(runId.current!==id)return;            // cancelled, superseded or unmounted
+      _setCoach(coachDb);                      // every slice: another computation may have run in between
+      const t0=Date.now();
+      while(i<perms.length&&Date.now()-t0<50)out.orders.push(_blockOrderOne(perms[i++],p.eff,skills,td,age,ssw,subsFloat,p.capWeeks,true));
+      if(i<perms.length){setProg({done:i,total:perms.length});setTimeout(step,0);}
+      else{setProg(null);setRes(_blockOrderFinish(out));}
+    };
+    setTimeout(step,0);
+  };
   return(
     <div style={cardS}>
-      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,flexWrap:"wrap"}}>
-        <div style={{...labS,color:C.acc,marginBottom:0}}>🎯 Target build order — which skill first?</div>
+      <div style={{display:"flex",alignItems:"flex-start",gap:8,marginBottom:4}}>
+        <div style={{...labS,color:C.acc,marginBottom:0,flex:"1 1 auto",minWidth:0,paddingTop:4}}>🎯 Target build order — which skill first?</div>
         {hb("tbo","Target build order")}
       </div>
-      <div style={{fontSize:_rem(12),color:C.txM,lineHeight:1.5,marginBottom:12}}>
+      <div style={{fontSize:FS.xs,color:C.txM,lineHeight:1.5,marginBottom:12}}>
         Pick target levels; a skill left at its current level is excluded.
       </div>
       {ht("tbo",<>Every order of the target skills is simulated. Within an order a skill gets direct weeks only until free general training will finish its level by the end of the build. "Pure blocks" is the old rule: each skill trained all the way to its target. The result is the fastest of the orders tried under that rule, not a proven optimum. Loading copies the week-by-week schedule into the Manual Schedule and switches it on.</>,{marginBottom:12})}
@@ -5076,21 +5171,34 @@ function TargetBuildOrder({skills,td,age,ssw,subsFloat,coachDb,onLoadSchedule,as
               <input type="number" aria-label={`${sk} target level, now ${cur}`} min={cur} max={_MX} step={1}
                 value={tg[sk]??cur}
                 onChange={e=>{const v=parseInt(e.target.value,10);
-                  setTg(o=>({...o,[sk]:isNaN(v)?cur:Math.min(_MX,Math.max(cur,v))}));setRes(null);}}
+                  setTg(o=>({...o,[sk]:isNaN(v)?cur:Math.min(_MX,Math.max(cur,v))}));cancel();setRes(null);}}
                 style={inpS}/>
             </div>
           );
         })}
       </div>
-      <button onClick={run} disabled={n===0} style={{
-        padding:"8px 18px",fontSize:_rem(13),fontFamily:_ft,fontWeight:700,borderRadius:6,
-        cursor:n===0?"not-allowed":"pointer",
-        background:n===0?C.hi:C.acc+"22",color:n===0?C.txM:C.acc,
-        border:`1px solid ${n===0?C.bdr:C.acc}`,
-      }}>Rank block orders{n>0?` (${Array.from({length:n},(_,i)=>i+1).reduce((a,b)=>a*b,1)} sims)`:""}</button>
+      <button onClick={run} disabled={n===0||!!prog} style={{
+        padding:"8px 16px",fontSize:FS.sm,fontFamily:_ft,fontWeight:700,borderRadius:6,
+        cursor:n===0||prog?"not-allowed":"pointer",
+        background:n===0||prog?C.hi:C.acc+"22",color:n===0||prog?C.txM:C.acc,
+        border:`1px solid ${n===0||prog?C.bdr:C.acc}`,
+      }}>{prog?"Ranking…":<>Rank block orders{n>0?` (${Array.from({length:n},(_,i)=>i+1).reduce((a,b)=>a*b,1)} sims)`:""}</>}</button>
+      {prog&&(
+        <div style={{marginTop:12}}>
+          <div role="progressbar" aria-label="Ranking block orders" aria-valuemin={0} aria-valuemax={prog.total} aria-valuenow={prog.done}
+            style={{height:8,background:C.bg,border:`1px solid ${C.bdr}`,borderRadius:4,overflow:"hidden"}}>
+            <div style={{width:`${prog.done/prog.total*100}%`,height:"100%",background:C.acc}}/>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginTop:6,fontSize:FS.xs,color:C.txD,fontFamily:_fs}}>
+            <span style={{flex:"1 1 auto"}}>Ranked {prog.done} of {prog.total} orders…</span>
+            <button type="button" onClick={cancel} style={{padding:"4px 12px",borderRadius:6,fontFamily:_fs,fontWeight:600,
+              fontSize:FS.sm,cursor:"pointer",background:C.hi,color:C.tx,border:`1px solid ${C.bdr}`}}>Cancel</button>
+          </div>
+        </div>
+      )}
       {res&&res.orders.length>0&&(
-        <div style={{marginTop:14,overflowX:"auto"}}>
-          <table style={{width:"100%",borderCollapse:"collapse",fontSize:_rem(13),fontFamily:_ft}}>
+        <div style={{marginTop:12,overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:FS.sm,fontFamily:_ft}}>
             <thead>
               <tr style={{color:C.txM,textAlign:"left"}}>
                 <th style={{padding:"4px 8px"}}>Order</th>
@@ -5101,17 +5209,17 @@ function TargetBuildOrder({skills,td,age,ssw,subsFloat,coachDb,onLoadSchedule,as
               </tr>
             </thead>
             <tbody>
-              {res.orders.map((o,i)=>{
+              {(showAll?res.orders:res.orders.slice(0,10)).map((o,i)=>{
                 const isBest=res.best&&o===res.best;
                 return(
                   <tr key={i} style={{borderTop:`1px solid ${C.bdr}55`,
                     color:o.weeks==null?C.txM:isBest?C.pop:C.tx,
                     fontWeight:isBest?700:400}}>
-                    <td style={{padding:"5px 8px"}}>{o.order.map(sk=>SN[sk]).join(" → ")}</td>
-                    <td style={{padding:"5px 8px"}}>{o.weeks==null?"—":o.weeks}</td>
-                    <td style={{padding:"5px 8px",color:C.txM}}>{o.pureWeeks==null?"—":o.pureWeeks}</td>
-                    <td style={{padding:"5px 8px",color:C.txM}}>{o.weeks==null?"—":o.order.filter(sk=>o.direct&&o.direct[sk]).map(sk=>`${SN[sk]} ${o.direct[sk]}`).join(" · ")}</td>
-                    <td style={{padding:"5px 8px"}}>{o.weeks==null
+                    <td style={{padding:"6px 8px"}}>{o.order.map(sk=>SN[sk]).join(" → ")}</td>
+                    <td style={{padding:"6px 8px"}}>{o.weeks==null?"—":o.weeks}</td>
+                    <td style={{padding:"6px 8px",color:C.txM}}>{o.pureWeeks==null?"—":o.pureWeeks}</td>
+                    <td style={{padding:"6px 8px",color:C.txM}}>{o.weeks==null?"—":o.order.filter(sk=>o.direct&&o.direct[sk]).map(sk=>`${SN[sk]} ${o.direct[sk]}`).join(" · ")}</td>
+                    <td style={{padding:"6px 8px"}}>{o.weeks==null
                       ?"✗ not before age 28"
                       :`age ${o.endAge}${isBest?"  ← fastest":""}`}</td>
                   </tr>
@@ -5119,14 +5227,21 @@ function TargetBuildOrder({skills,td,age,ssw,subsFloat,coachDb,onLoadSchedule,as
               })}
             </tbody>
           </table>
+          {res.orders.length>10&&(
+            <button type="button" aria-expanded={showAll} onClick={()=>setShowAll(s=>!s)}
+              style={{marginTop:8,padding:"4px 12px",borderRadius:6,fontFamily:_fs,fontWeight:600,fontSize:FS.xs,
+                cursor:"pointer",background:"transparent",color:C.txD,border:`1px solid ${C.bdr}`}}>
+              {showAll?"Show the 10 fastest only":`Show all ${res.orders.length} orders`}
+            </button>
+          )}
           {!res.best&&(
-            <div style={{marginTop:8,fontSize:_rem(12),color:C.warn}}>
+            <div style={{marginTop:8,fontSize:FS.xs,color:C.warn}}>
               No order reaches every target before age 28 — lower a target.
             </div>
           )}
           {res.best&&onLoadSchedule&&res.best.schedule&&res.best.schedule.length>0&&(<>
             <button onClick={()=>onLoadSchedule(res.best.schedule)}
-              style={{marginTop:10,padding:"6px 14px",fontSize:_rem(12),fontFamily:_ft,fontWeight:700,borderRadius:6,
+              style={{marginTop:8,padding:"6px 12px",fontSize:FS.xs,fontFamily:_ft,fontWeight:700,borderRadius:6,
                 cursor:"pointer",background:C.hi,color:C.acc,border:`1px solid ${C.acc}`}}>
               Load fastest into Manual Schedule ({res.best.schedule.length} weeks)
             </button>
@@ -5149,6 +5264,22 @@ export default function App(){
   // of "I've seen the intro" yet — that's a v14 candidate if friction shows.
   const[stage,setStage]=useState("intro"); // "intro" | "player" | "plan" | "export"
   const[hb,ht,helpOpen]=useHelp();          // v36: "?" help
+  // v38: theme.  "auto" follows the system setting; a choice is remembered.
+  const[themePref,setThemePref]=useState(()=>{try{const v=localStorage.getItem(_THEME_KEY);return v==="light"||v==="dark"?v:"auto";}catch{return"auto";}});
+  const[sysLight,setSysLight]=useState(()=>{try{return window.matchMedia("(prefers-color-scheme: light)").matches;}catch{return false;}});
+  useEffect(()=>{
+    let mq;try{mq=window.matchMedia("(prefers-color-scheme: light)");}catch{return;}
+    const f=e=>setSysLight(e.matches);
+    if(mq.addEventListener)mq.addEventListener("change",f);else mq.addListener(f);
+    return()=>{if(mq.removeEventListener)mq.removeEventListener("change",f);else mq.removeListener(f);};
+  },[]);
+  const theme=themePref==="auto"?(sysLight?"light":"dark"):themePref;
+  _setTheme(theme);   // before any colour is read in this render
+  // index.html paints the page before the planner starts; from here on the
+  // planner owns the background of html and body.  Native controls follow
+  // color-scheme.
+  useEffect(()=>{try{const bg=_PAL[theme].bg;document.documentElement.style.background=bg;document.body.style.background=bg;document.documentElement.style.colorScheme=theme;}catch{}},[theme]);
+  const pickTheme=v=>{setThemePref(v);try{if(v==="auto")localStorage.removeItem(_THEME_KEY);else localStorage.setItem(_THEME_KEY,v);}catch{}};
   const[disc,setDisc]=useState({});         // v36: sections closed until asked for
   const[askRow,setAskRow]=useState(null);   // v36: {where,text,label,run} — inline confirm
   const[doneNote,setDoneNote]=useState(null); // v36: {where,text} — what just happened, with Undo
@@ -5757,14 +5888,14 @@ export default function App(){
   // v16: visual pass — cards distinguish by background contrast instead
   // of borders; labels recede; one accent color for actions.
   const sC={background:C.card,borderRadius:10,padding:"16px 20px",marginBottom:12};
-  const sL={fontSize:_rem(12),fontFamily:_fs,color:C.txM,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:4};
-  const sI={background:C.bg,border:`1px solid ${C.bdr}`,borderRadius:6,color:C.tx,fontFamily:_ft,fontSize:_rem(13),padding:"8px 10px",width:"100%",boxSizing:"border-box"};
-  const sSel={...sI,cursor:"pointer",appearance:"none",paddingRight:28,backgroundImage:`url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%238a96a8' stroke-width='1.5'/%3E%3C/svg%3E")`,backgroundRepeat:"no-repeat",backgroundPosition:"right 10px center"};
-  const sB={background:C.accFill,color:"#fff",border:"none",borderRadius:6,padding:"10px 20px",fontFamily:_fs,fontWeight:600,fontSize:_rem(14),cursor:"pointer"};
-  const sBs={...sB,padding:"6px 14px",fontSize:_rem(13),background:C.hi,color:C.txD,border:`1px solid ${C.bdr}`};
+  const sL={fontSize:FS.xs,fontFamily:_fs,color:C.txM,textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:4};
+  const sI={backgroundColor:C.bg,border:`1px solid ${C.bdr}`,borderRadius:6,color:C.tx,fontFamily:_ft,fontSize:FS.sm,padding:"8px 8px",width:"100%",boxSizing:"border-box"};
+  const sSel={...sI,cursor:"pointer",appearance:"none",paddingRight:24,backgroundImage:`url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%238a96a8' stroke-width='1.5'/%3E%3C/svg%3E")`,backgroundRepeat:"no-repeat",backgroundPosition:"right 10px center"};
+  const sB={background:C.accFill,color:"#fff",border:"none",borderRadius:6,padding:"12px 20px",fontFamily:_fs,fontWeight:600,fontSize:FS.md,cursor:"pointer"};
+  const sBs={...sB,padding:"6px 12px",fontSize:FS.sm,background:C.hi,color:C.txD,border:`1px solid ${C.bdr}`};
   const allStrats={
     ...STRATS,
-    sale_optimizer:{name:"Sale Optimizer",desc:"Minimize carry-in — best for selling"},
+    sale_optimizer:{name:"Sale Optimizer",desc:"Least carry-in (unfinished progress) at the sale — best for selling"},
     manual:{name:"Manual Schedule",desc:"Hand-built week-by-week"},
   };
   const validStrats=Object.fromEntries(Object.entries(allStrats).filter(([k,v])=>!v.validPos||v.validPos.includes(pos)));
@@ -5776,22 +5907,22 @@ export default function App(){
     const active=stage===k;
     return(
       <button key={k} disabled={!enabled} aria-current={active?"step":undefined} onClick={()=>setStage(k)} style={{
-        flex:1,padding:"14px 10px",background:active?C.accFill:"transparent",
+        flex:1,padding:"16px 8px",background:active?C.accFill:"transparent",
         color:active?"#fff":enabled?C.tx:C.txM,
         border:`1px ${enabled?"solid":"dashed"} ${active?C.accFill:C.bdr}`,
-        borderRadius:8,fontFamily:_fs,fontWeight:active?600:500,fontSize:_rem(14),
+        borderRadius:8,fontFamily:_fs,fontWeight:active?600:500,fontSize:FS.md,
         cursor:enabled?"pointer":"not-allowed",
-        transition:"all .15s",display:"flex",alignItems:"center",justifyContent:"center",gap:10,
+        transition:"all .15s",display:"flex",alignItems:"center",justifyContent:"center",gap:8,
       }}>
         <span aria-hidden="true" style={{
           display:"inline-flex",alignItems:"center",justifyContent:"center",flex:"none",
           width:24,height:24,borderRadius:"50%",
           background:active?"rgba(0,0,0,0.28)":done?C.pop+"33":C.hi,
-          color:active?"#fff":done?C.pop:C.txD,fontSize:_rem(13),fontWeight:700,fontFamily:_ft,
+          color:active?"#fff":done?C.pop:C.txD,fontSize:FS.sm,fontWeight:700,fontFamily:_ft,
         }}>{done?"✓":num}</span>
         <span style={{display:"flex",flexDirection:"column",alignItems:"flex-start",lineHeight:1.25,textAlign:"left"}}>
           <span>{label}{done&&<span className="vh"> — done</span>}</span>
-          {!enabled&&why&&<span style={{fontSize:_rem(12),fontWeight:400,color:C.txD}}>{why}</span>}
+          {!enabled&&why&&<span style={{fontSize:FS.xs,fontWeight:400,color:C.txD}}>{why}</span>}
         </span>
       </button>
     );
@@ -5802,7 +5933,7 @@ export default function App(){
     const on=tilesOn[k];
     return(
       <button key={k} aria-pressed={!!on} onClick={()=>toggleTile(k)} style={{
-        flex:1,minWidth:140,padding:"14px 14px",
+        flex:1,minWidth:140,padding:"16px 12px",
         background:on?C.acc+"18":C.card,
         border:`1px solid ${on?C.acc:C.bdr}`,
         borderLeft:on?`3px solid ${C.acc}`:`1px solid ${C.bdr}`,
@@ -5810,10 +5941,10 @@ export default function App(){
         display:"flex",flexDirection:"column",gap:4,
         transition:"all .15s",fontFamily:_fs,
       }}>
-        <div style={{fontSize:_rem(13),fontWeight:600,color:on?C.acc:C.tx}}>
+        <div style={{fontSize:FS.sm,fontWeight:600,color:on?C.acc:C.tx}}>
           {on?"✓ ":""}{icon} {title}
         </div>
-        <div style={{fontSize:_rem(12),color:C.txM,lineHeight:1.4}}>{desc}</div>
+        <div style={{fontSize:FS.xs,color:C.txM,lineHeight:1.4}}>{desc}</div>
       </button>
     );
   };
@@ -5823,20 +5954,30 @@ export default function App(){
   // ═══════════════════════════════════════════════════════════════════════
   return(
     <div style={{background:C.bg,minHeight:"100vh",color:C.tx,fontFamily:_fs,
-      padding:isMobile?"16px 14px 84px":"20px 24px"}}>
+      padding:isMobile?"16px 12px 84px":"20px 24px"}}>
       {/* ── Header ───────────────────────────────────────────────────── */}
-      <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:4}}>
-        <span style={{fontSize:_rem(22),fontWeight:700,color:C.acc,fontFamily:_ft}}>⚽ Sokker Training Planner</span>
-        <span style={{fontSize:_rem(13),color:C.txM}}>v37 · coupled K15.2 · coach input · chain talent · auto current-week</span>
+      {/* v38: title, version, theme.  The engine facts are in the footer ("about this version"). */}
+      <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:4,flexWrap:"wrap"}}>
+        <span style={{fontSize:isMobile?FS.lg:FS.xl,fontWeight:700,color:C.acc,fontFamily:_ft}}>⚽ Sokker Training Planner</span>
+        <span style={{fontSize:FS.xs,color:C.txM}}>v38</span>
+        <label style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:6,fontSize:FS.xs,color:C.txM}}>
+          Theme
+          <select value={themePref} onChange={e=>pickTheme(e.target.value)}
+            style={{...sSel,width:"auto",fontSize:FS.xs,padding:"4px 24px 4px 8px",backgroundPosition:"right 8px center"}}>
+            <option value="auto">System</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </label>
       </div>
-      <div style={{fontSize:_rem(13),color:C.txM,marginBottom:20}}>
+      <div style={{fontSize:FS.sm,color:C.txM,marginBottom:20}}>
         Load a player, plan their training, export a calibration bundle.
       </div>
 
       {/* v16: demo-mode banner — visible on every stage while active */}
       {demoMode&&(
         <div style={{background:C.warn+"18",border:`1px solid ${C.warn}66`,borderRadius:8,
-          padding:"8px 14px",marginBottom:12,fontSize:_rem(13),color:C.warn,display:"flex",alignItems:"center",gap:10}}>
+          padding:"8px 12px",marginBottom:12,fontSize:FS.sm,color:C.warn,display:"flex",alignItems:"center",gap:8}}>
           <span>🧪 <b>Demo player</b> — a synthetic history generated by the engine (not a real Sokker player). Nothing is submitted to the corpus. Load your own player on the Player tab any time.</span>
         </div>
       )}
@@ -5864,10 +6005,10 @@ export default function App(){
       {stage==="intro"&&(
         <div style={{maxWidth:900}}>
           <div style={sC}>
-            <div style={{fontSize:_rem(18),fontWeight:600,color:C.tx,marginBottom:8,fontFamily:_fs}}>
+            <div style={{fontSize:FS.lg,fontWeight:600,color:C.tx,marginBottom:8,fontFamily:_fs}}>
               How it works
             </div>
-            <div style={{fontSize:_rem(13),color:C.txD,lineHeight:1.6}}>
+            <div style={{fontSize:FS.sm,color:C.txD,lineHeight:1.6}}>
               A decision-support tool for Sokker. You give it a player's current state and a
               planning horizon; it returns a side-by-side comparison of training strategies and
               the predicted skill trajectory under each one. Two goals: (1) make the trade-offs
@@ -5878,7 +6019,7 @@ export default function App(){
 
           <div style={sC}>
             <div style={sL}>What it does</div>
-            <div style={{fontSize:_rem(13),color:C.txD,lineHeight:1.6}}>
+            <div style={{fontSize:FS.sm,color:C.txD,lineHeight:1.6}}>
               For each candidate strategy, the planner forward-simulates every week of training
               and reports the predicted level of every skill at the horizon, the timing of each
               level-up, and the subskill — the partial fill between level-ups — carried into the
@@ -5888,14 +6029,14 @@ export default function App(){
 
           <div style={sC}>
             <div style={sL}>Two ways to start</div>
-            <div style={{fontSize:_rem(13),color:C.txD,lineHeight:1.6,marginBottom:12}}>
+            <div style={{fontSize:FS.sm,color:C.txD,lineHeight:1.6,marginBottom:12}}>
               Stage 1 offers two entry points.
             </div>
             <div style={{paddingLeft:12,borderLeft:`3px solid ${C.acc}`,marginBottom:12}}>
-              <div style={{fontSize:_rem(13),fontWeight:600,color:C.tx,marginBottom:4}}>
-                Known history <span style={{fontWeight:400,color:C.txM,fontSize:_rem(12)}}>(recommended)</span>
+              <div style={{fontSize:FS.sm,fontWeight:600,color:C.tx,marginBottom:4}}>
+                Known history <span style={{fontWeight:400,color:C.txM,fontSize:FS.xs}}>(recommended)</span>
               </div>
-              <div style={{fontSize:_rem(13),color:C.txD,lineHeight:1.6}}>
+              <div style={{fontSize:FS.sm,color:C.txD,lineHeight:1.6}}>
                 Load the player's training history from Sokker. The planner reconstructs every
                 week, fits a talent estimate from the level-up record (point + confidence band),
                 and seeds the subskills via per-skill forward simulation. This is the highest-
@@ -5905,8 +6046,8 @@ export default function App(){
               </div>
             </div>
             <div style={{paddingLeft:12,borderLeft:`3px solid ${C.faint}`}}>
-              <div style={{fontSize:_rem(13),fontWeight:600,color:C.tx,marginBottom:4}}>No known history</div>
-              <div style={{fontSize:_rem(13),color:C.txD,lineHeight:1.6}}>
+              <div style={{fontSize:FS.sm,fontWeight:600,color:C.tx,marginBottom:4}}>No known history</div>
+              <div style={{fontSize:FS.sm,color:C.txD,lineHeight:1.6}}>
                 Paste the player's in-game card — name, age, levels of each skill, value. You
                 enter talent yourself. Sub-levels start from a default estimate that you can
                 adjust. Use this for any player whose history you cannot access.
@@ -5916,7 +6057,7 @@ export default function App(){
 
           <div style={sC}>
             <div style={sL}>The three stages</div>
-            <ol style={{margin:"6px 0 0 0",paddingLeft:22,fontSize:_rem(13),color:C.txD,lineHeight:1.8}}>
+            <ol style={{margin:"6px 0 0 0",paddingLeft:20,fontSize:FS.sm,color:C.txD,lineHeight:1.8}}>
               <li><b style={{color:C.tx}}>Player</b> — load the player; confirm skills, age, position, talent.</li>
               <li><b style={{color:C.tx}}>Plan</b> — pick the horizon, pick the strategies to compare, run.</li>
               <li><b style={{color:C.tx}}>Compare</b> — side-by-side deltas, total levels gained, level-up timing. Manual schedules can be built here and simulated alongside the algorithmic strategies.</li>
@@ -5924,16 +6065,33 @@ export default function App(){
           </div>
 
           <div style={sC}>
+            <div style={sL}>Words used here</div>
+            <dl style={{margin:0,fontSize:FS.sm,color:C.txD,lineHeight:1.6}}>
+              {[
+                ["Pop","a level-up: a skill moving to the next level."],
+                ["Sub-level","progress inside the current level toward the next pop, 0–99%. The game does not show it; the planner estimates it."],
+                ["Talent (YS scale)","how fast the player trains. 3.00 is the best possible; higher numbers train slower."],
+                ["DB","the planner's fine 0–100 scale. A skill's 18 levels are spread over it, about 5.6 DB per level. Talent is on it too (100 DB = YS 3.00), and so is the head coach (93 DB = unearthly)."],
+                ["General training","the smaller gain that the skills you are not training still get every week."],
+                ["Carry-in","progress toward the next level that has not yet become a level. At a sale it does not show on the card."],
+                ["95% band","the range the talent lies in, given the history, with 95% confidence. The narrower it is, the more reliable the estimate."],
+              ].map(([w,d])=>(
+                <div key={w} style={{marginBottom:6}}><dt style={{display:"inline",fontWeight:600,color:C.tx}}>{w}</dt><dd style={{display:"inline",margin:0}}> — {d}</dd></div>
+              ))}
+            </dl>
+          </div>
+
+          <div style={sC}>
             <div style={sL}>Reading the talent estimate</div>
-            <div style={{fontSize:_rem(13),color:C.txD,lineHeight:1.6,marginBottom:8}}>
+            <div style={{fontSize:FS.sm,color:C.txD,lineHeight:1.6,marginBottom:8}}>
               When a training history is loaded, a chip under the YS Talent input shows:
             </div>
-            <ul style={{margin:"0 0 10px 0",paddingLeft:22,fontSize:_rem(13),color:C.txD,lineHeight:1.7}}>
-              <li>a point estimate on the YS-standard scale (lower is better; 3.00 is the cap) and the [low, high] band,</li>
-              <li>a confidence label, from <code style={{color:C.pop,fontSize:_rem(12),fontFamily:_ft,background:"transparent"}}>reliable</code> (history is rich enough to anchor the estimate) down to <code style={{color:C.txM,fontSize:_rem(12),fontFamily:_ft,background:"transparent"}}>no_data</code> (too short to infer anything),</li>
-              <li>the count of level-ups used and any skills excluded as outliers.</li>
+            <ul style={{margin:"0 0 8px 0",paddingLeft:20,fontSize:FS.sm,color:C.txD,lineHeight:1.7}}>
+              <li>the band the talent lies in, on the YS scale (lower is better; 3.00 is the best possible),</li>
+              <li>a confidence label, from <code style={{color:C.pop,fontSize:FS.xs,fontFamily:_ft,background:"transparent"}}>reliable</code> (history is rich enough to anchor the estimate) down to <code style={{color:C.txM,fontSize:FS.xs,fontFamily:_ft,background:"transparent"}}>no_data</code> (too short to infer anything),</li>
+              <li>the number of observations used, and how many are at odds with the verdict.</li>
             </ul>
-            <div style={{fontSize:_rem(13),color:C.txD,lineHeight:1.6}}>
+            <div style={{fontSize:FS.sm,color:C.txD,lineHeight:1.6}}>
               Click <b style={{color:C.tx}}>Apply</b> to write the estimate into the input. If the
               estimate is flagged contradictory, the model residual exceeds the data — treat the
               number as indicative and check against an external source.
@@ -5942,8 +6100,8 @@ export default function App(){
 
           <div style={{...sC,borderLeft:`3px solid ${C.warn}`}}>
             <div style={sL}>Caveats</div>
-            <ul style={{margin:"0",paddingLeft:22,fontSize:_rem(13),color:C.txD,lineHeight:1.7}}>
-              <li>The coach value is currently fixed at the corpus-calibrated default. If your coach is lower, the planner will overestimate training gains.</li>
+            <ul style={{margin:"0",paddingLeft:20,fontSize:FS.sm,color:C.txD,lineHeight:1.7}}>
+              <li>The head coach defaults to 93 (unearthly). If yours is lower, set it under Advanced on the Plan stage; otherwise the planner will overestimate training gains.</li>
               <li>Drop-eligible ages are excluded from talent estimation: pace from 28, other outfield skills from 30.</li>
               <li>This is a planning tool, not a market valuation tool — the value formula here anchors the simulator, not the transfer market.</li>
             </ul>
@@ -5951,11 +6109,11 @@ export default function App(){
 
           <div style={{display:"flex",justifyContent:"flex-end",marginTop:12}}>
             <button onClick={()=>setStage("player")}
-              style={{...sB,fontSize:_rem(14),padding:"12px 28px"}}>
+              style={{...sB,fontSize:FS.md,padding:"12px 24px"}}>
               Get started — load a player →
             </button>
             <button onClick={loadDemo}
-              style={{...sBs,marginLeft:10,padding:"12px 22px",fontSize:_rem(14),borderColor:C.pop+"88",color:C.pop}}
+              style={{...sBs,marginLeft:8,padding:"12px 20px",fontSize:FS.md,border:`1px solid ${C.pop+"88"}`,color:C.pop}}
               title="Loads a synthetic engine-generated player — see the whole tool working in one click">
               🧪 Try a demo player
             </button>
@@ -5971,24 +6129,24 @@ export default function App(){
           {/* PID input — top of stage */}
           <div style={sC}>
             <div style={{...sL,display:"flex",alignItems:"center",gap:8}}>Player ID {hb("pid","Player ID")}</div>
-            <div style={{display:"flex",gap:10,alignItems:"center"}}>
+            <div style={{display:"flex",gap:8,alignItems:"center"}}>
               <input type="text" aria-label="Player ID" value={pid} placeholder="e.g. 39028856"
                 onChange={e=>{const v=e.target.value;if(/^\d*$/.test(v))setPid(v);}}
-                style={{...sI,maxWidth:220,fontSize:_rem(15),fontFamily:_ft,letterSpacing:"0.05em"}}/>
+                style={{...sI,maxWidth:220,fontSize:FS.md,fontFamily:_ft,letterSpacing:"0.05em"}}/>
             </div>
             {ht("pid",<>Find it in the URL of any Sokker player page. Optional — but it unlocks the one-click training-report fetch below.</>)}
           </div>
 
           {/* v8.2: Load saved bundle — visible at top of stage, no clicks required */}
           <div style={{...sC,borderLeft:`3px solid ${C.acc}`}}>
-            <div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
+            <div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
               <div style={{flex:"1 1 280px"}}>
                 <div style={{...sL,display:"flex",alignItems:"center",gap:8,marginBottom:0}}>Returning? Load a saved bundle {hb("bundle","Load a saved bundle")}</div>
-                {ht("bundle",<>Pick any <code style={{color:C.tx,fontSize:_rem(12),fontFamily:_ft}}>sokker_bundle_*.json</code> file
+                {ht("bundle",<>Pick any <code style={{color:C.tx,fontSize:FS.xs,fontFamily:_ft}}>sokker_bundle_*.json</code> file
                   exported earlier — yours, or one shared with you. The player, training history, skills and sub-level estimates restore exactly; nothing needs pasting again.</>)}
               </div>
               <label className="filebtn" style={{
-                ...sB,padding:"10px 18px",fontSize:_rem(13),cursor:"pointer",
+                ...sB,padding:"12px 16px",fontSize:FS.sm,cursor:"pointer",
                 display:"inline-flex",alignItems:"center",gap:8,
               }}>
                 📂 Load bundle (.json)
@@ -6001,7 +6159,7 @@ export default function App(){
                   }}/>
               </label>
             </div>
-            {historyError&&<div role="alert" style={{fontSize:_rem(12),color:C.red,marginTop:8}}>⚠ {historyError}</div>}
+            {historyError&&<div role="alert" style={{fontSize:FS.xs,color:C.red,marginTop:8}}>⚠ {historyError}</div>}
           </div>
 
           {/* Tile picker + skill editor — two columns on desktop */}
@@ -6010,18 +6168,18 @@ export default function App(){
             {/* LEFT: input tiles + their active blocks */}
             {/* v16: one-click demo entry point */}
             {!hasPlayerData&&(
-              <div style={{gridColumn:"1 / -1",display:"flex",alignItems:"center",gap:10,
-                background:C.card,borderRadius:8,padding:"10px 14px",marginBottom:4}}>
-                <span style={{fontSize:_rem(13),color:C.txD}}>No player at hand?</span>
-                <button onClick={loadDemo} style={{...sBs,padding:"6px 14px",fontSize:_rem(13),borderColor:C.pop+"88",color:C.pop}}>
+              <div style={{gridColumn:"1 / -1",display:"flex",alignItems:"center",gap:8,
+                background:C.card,borderRadius:8,padding:"12px 12px",marginBottom:4}}>
+                <span style={{fontSize:FS.sm,color:C.txD}}>No player at hand?</span>
+                <button onClick={loadDemo} style={{...sBs,padding:"6px 12px",fontSize:FS.sm,border:`1px solid ${C.pop+"88"}`,color:C.pop}}>
                   🧪 Try a demo player
                 </button>
               </div>
             )}
             <div>
               <div style={sC}>
-                <div style={{...sL,display:"flex",alignItems:"center",gap:8,marginBottom:10}}>How are you loading this player? {hb("load","Loading a player")}</div>
-                {ht("load",<>Pick one or more — they can stack. Manual entry on top of a parsed card lets you fix anything the parser got wrong.</>,{marginBottom:10})}
+                <div style={{...sL,display:"flex",alignItems:"center",gap:8,marginBottom:8}}>How are you loading this player? {hb("load","Loading a player")}</div>
+                {ht("load",<>Pick one or more — they can stack. Manual entry on top of a parsed card lets you fix anything the parser got wrong.</>,{marginBottom:8})}
                 {/* v13: tile order is now [history, card, manual]. "Known
                     history" (was "Training history") is the recommended
                     path and sits first; "No known history" (was "Paste
@@ -6040,14 +6198,14 @@ export default function App(){
               {tilesOn.history&&(
                 <div style={sC}>
                   <div style={sL}>📄 Known history — fetch from Sokker</div>
-                  <div style={{fontSize:_rem(12),color:C.txM,marginBottom:8,lineHeight:1.4}}>
+                  <div style={{fontSize:FS.xs,color:C.txM,marginBottom:8,lineHeight:1.4}}>
                     Two steps. <b style={{color:C.tx}}>1.</b> Click the button below — it opens your training report in a new tab.
                     <b style={{color:C.tx}}> 2.</b> Select all the JSON, copy it, come back, paste it in the box.
                     Your Sokker login is required (works only for players on your active roster).
                   </div>
                   <button onClick={handleOpenTrainingReport}
                     disabled={!pid||!/^\d+$/.test(pid.trim())}
-                    style={{...sB,width:"100%",marginBottom:10,
+                    style={{...sB,width:"100%",marginBottom:8,
                       background:(!pid||!/^\d+$/.test(pid.trim()))?C.hi:C.accFill,
                       color:(!pid||!/^\d+$/.test(pid.trim()))?C.txM:"#fff",
                       border:(!pid||!/^\d+$/.test(pid.trim()))?`1px solid ${C.bdr}`:"none",
@@ -6059,7 +6217,7 @@ export default function App(){
                   {/* v8: share toggle */}
                   <div style={{
                     background:C.bg,border:`1px solid ${C.bdr}`,borderRadius:6,
-                    padding:"8px 10px",marginBottom:8,fontSize:_rem(12),lineHeight:1.5,
+                    padding:"8px 8px",marginBottom:8,fontSize:FS.xs,lineHeight:1.5,
                   }}>
                     <label style={{display:"flex",alignItems:"flex-start",gap:8,cursor:"pointer",userSelect:"none"}}>
                       <input type="checkbox" checked={shareEnabled}
@@ -6071,14 +6229,14 @@ export default function App(){
                           aria-expanded={showShareInfo}
                           onClick={()=>setShowShareInfo(v=>!v)}
                           style={{background:"none",border:"none",color:C.acc,
-                            cursor:"pointer",padding:0,marginLeft:6,fontSize:_rem(12),
+                            cursor:"pointer",padding:0,marginLeft:6,fontSize:FS.xs,
                             textDecoration:"underline"}}>
                           {showShareInfo?"hide details":"what's shared?"}
                         </button>
                       </span>
                     </label>
                     {showShareInfo&&(
-                      <div style={{marginTop:6,paddingLeft:24,color:C.txM,fontSize:_rem(12),lineHeight:1.5}}>
+                      <div style={{marginTop:6,paddingLeft:24,color:C.txM,fontSize:FS.xs,lineHeight:1.5}}>
                         Sent: player ID and name (if present in your paste), the training-history records you pasted, and the snapshot of estimates this app derived from them (current skills, talent, position).
                         Not sent: your sokker.org credentials, your IP address (we don't log it), your email, anything from other browser tabs.
                         Used for: backtesting the training model against real pop outcomes — the more bundles, the more accurate the planner gets for everyone.
@@ -6087,14 +6245,14 @@ export default function App(){
                   </div>
                   <textarea aria-label="Training history JSON" value={historyText} onChange={e=>setHistoryText(e.target.value)}
                     placeholder={'Paste here ↓\n\n{\n  "reports": [\n    { "week": 1184, "skills": {...}, ... },\n    ...\n  ]\n}'}
-                    style={{...sI,height:120,resize:"vertical",fontFamily:_ft,fontSize:_rem(12),lineHeight:1.4}}/>
+                    style={{...sI,height:120,resize:"vertical",fontFamily:_ft,fontSize:FS.xs,lineHeight:1.4}}/>
                   <button onClick={handleLoadHistory} style={{...sB,marginTop:8,width:"100%"}}>Load History</button>
-                  {historyError&&<div role="alert" style={{fontSize:_rem(12),color:C.red,marginTop:6}}>⚠ {historyError}</div>}
+                  {historyError&&<div role="alert" style={{fontSize:FS.xs,color:C.red,marginTop:6}}>⚠ {historyError}</div>}
                   {historyReports&&(()=>{
                     const last=historyReports[historyReports.length-1];
                     const first=historyReports[0];
                     return(
-                      <div style={{fontSize:_rem(12),color:C.txD,marginTop:8,lineHeight:1.5,fontFamily:_ft}}>
+                      <div style={{fontSize:FS.xs,color:C.txD,marginTop:8,lineHeight:1.5,fontFamily:_ft}}>
                         <div>✓ Weeks {first.week} → {last.week} ({historyReports.length} records loaded)</div>
                         {historyMeta?.player_id&&<div>Player ID: {historyMeta.player_id}</div>}
                         {historyMeta?.name&&<div>Name: {historyMeta.name}</div>}
@@ -6114,7 +6272,7 @@ export default function App(){
                   <div style={sL}>📋 No known history — paste the player's card</div>
                   <textarea aria-label="Player card text" value={paste} onChange={e=>setPaste(e.target.value)}
                     placeholder={"Roman Rysio, wiek: 20\nklub: Zabójcze Strzały, kraj: Polska\nwartość : 788 000 zł\nwynagrodzenie: 13 800 zł\ntragiczna [0] forma\nbardzo dobra [9] dyscyplina taktyczna\ndobra [7] kondycja        słaby [4] bramkarz\nświetna [11] szybkość     bardzo dobry [9] obrońca\ndobra [7] technika        celujący [10] rozgrywający\nprzeciętne [5] podania    świetny [11] strzelec"}
-                    style={{...sI,height:130,resize:"vertical",fontFamily:_ft,fontSize:_rem(12),lineHeight:1.5}}/>
+                    style={{...sI,height:130,resize:"vertical",fontFamily:_ft,fontSize:FS.xs,lineHeight:1.5}}/>
                   <button onClick={handleParse} style={{...sB,marginTop:8,width:"100%"}}>Parse Player Card</button>
                 </div>
               )}
@@ -6123,7 +6281,7 @@ export default function App(){
               {tilesOn.manual&&(
                 <div style={sC}>
                   <div style={sL}>✏️ Manual entry</div>
-                  <div style={{fontSize:_rem(12),color:C.txM,marginBottom:8,lineHeight:1.4}}>
+                  <div style={{fontSize:FS.xs,color:C.txM,marginBottom:8,lineHeight:1.4}}>
                     Edit the skill levels and sub-levels directly in the panel on the right. Useful for hypothetical players or to fix anything the card parser misread.
                   </div>
                   <button onClick={handleManualActivate} style={{...sB,width:"100%"}}>I'll edit on the right →</button>
@@ -6138,8 +6296,8 @@ export default function App(){
                   <>
                     <div style={sL}>Player skills & sub-levels</div>
                     {seasonNote&&(
-                      <div style={{fontSize:_rem(12),color:C.warn,background:C.hi,
-                        borderLeft:`3px solid ${C.warn}`,padding:"6px 10px",
+                      <div style={{fontSize:FS.xs,color:C.warn,background:C.hi,
+                        borderLeft:`3px solid ${C.warn}`,padding:"6px 8px",
                         marginBottom:8,borderRadius:4}}>
                         🗓 {seasonNote}
                       </div>
@@ -6156,10 +6314,10 @@ export default function App(){
                     />
                   </>
                 ):(
-                  <div style={{textAlign:"center",padding:"60px 20px",color:C.txM}}>
-                    <div style={{fontSize:_rem(48),marginBottom:12,opacity:0.4}}>👤</div>
-                    <div style={{fontSize:_rem(13),marginBottom:6,color:C.txD}}>No player loaded yet</div>
-                    <div style={{fontSize:_rem(13),lineHeight:1.5,maxWidth:280,margin:"0 auto"}}>
+                  <div style={{textAlign:"center",padding:"64px 20px",color:C.txM}}>
+                    <div style={{fontSize:FS.icon,marginBottom:12,opacity:0.4}}>👤</div>
+                    <div style={{fontSize:FS.sm,marginBottom:6,color:C.txD}}>No player loaded yet</div>
+                    <div style={{fontSize:FS.sm,lineHeight:1.5,maxWidth:280,margin:"0 auto"}}>
                       Pick an input method on the left — paste a card, fetch training history, or enter skills by hand. The editor will populate here.
                     </div>
                   </div>
@@ -6171,7 +6329,7 @@ export default function App(){
           {/* Continue button */}
           <div style={{display:"flex",justifyContent:"flex-end",marginTop:8}}>
             <button onClick={()=>setStage("plan")} disabled={!hasPlayerData}
-              style={{...sB,fontSize:_rem(14),padding:"12px 28px",
+              style={{...sB,fontSize:FS.md,padding:"12px 24px",
                 opacity:hasPlayerData?1:0.4,cursor:hasPlayerData?"pointer":"not-allowed"}}>
               Continue to planner →
             </button>
@@ -6187,8 +6345,8 @@ export default function App(){
           {!hasPlayerData&&(
             <div style={{...sC,borderLeft:`3px solid ${C.warn}`}}>
               <div style={{color:C.warn,fontWeight:600,marginBottom:4}}>No player loaded</div>
-              <div style={{fontSize:_rem(13),color:C.txD}}>
-                Go back to <button onClick={()=>setStage("player")} style={{...sBs,padding:"2px 10px",fontSize:_rem(12),marginLeft:4,marginRight:4}}>1 · Player</button>
+              <div style={{fontSize:FS.sm,color:C.txD}}>
+                Go back to <button onClick={()=>setStage("player")} style={{...sBs,padding:"2px 8px",fontSize:FS.xs,marginLeft:4,marginRight:4}}>1 · Player</button>
                 to load skills before planning.
               </div>
             </div>
@@ -6202,14 +6360,14 @@ export default function App(){
                 <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6}}>
                   <input type="text" aria-label="Talent on the YS scale: 3.00 is best, lower is better" value={ysTalent}
                     onChange={e=>{const v=e.target.value;if(/^\d*\.?\d*$/.test(v))setYsTalent(v);}}
-                    style={{...sI,width:80,textAlign:"center",fontSize:_rem(16),fontWeight:700}}/>
-                  <span style={{fontSize:_rem(13),color:C.txM}}>YS scale — 3.00 = best, lower is better</span>
+                    style={{...sI,width:80,textAlign:"center",fontSize:FS.md,fontWeight:700}}/>
+                  <span style={{fontSize:FS.sm,color:C.txM}}>YS scale — 3.00 = best, lower is better</span>
                 </div>
-                <div style={{display:"flex",flexWrap:"wrap",gap:3,marginBottom:12}}>
+                <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:12}}>
                   {YS_PRESETS.map(p=>(
                     <button key={p.ys} aria-pressed={Math.abs(ysNum-p.ys)<0.005} onClick={()=>setYsTalent(p.ys.toFixed(2))} style={{
-                      ...sBs,padding:"3px 10px",fontSize:_rem(12),
-                      ...(Math.abs(ysNum-p.ys)<0.005?{background:C.accFill,color:"#fff",borderColor:C.accFill}:{}),
+                      ...sBs,padding:"4px 8px",fontSize:FS.xs,
+                      ...(Math.abs(ysNum-p.ys)<0.005?{background:C.accFill,color:"#fff",border:`1px solid ${C.accFill}`}:{}),
                     }}>{p.l}</button>
                   ))}
                 </div>
@@ -6247,9 +6405,9 @@ export default function App(){
                     <div style={{
                       borderLeft:`3px solid ${cBd}`,
                       background:C.hi,
-                      padding:"8px 10px",
+                      padding:"8px 8px",
                       marginBottom:12,
-                      fontSize:_rem(12),
+                      fontSize:FS.xs,
                     }}>
                       <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
                         <span style={{color:C.txD,fontWeight:600,letterSpacing:0.3}}>EST. FROM HISTORY</span>
@@ -6264,79 +6422,79 @@ export default function App(){
                                 (user decision); Apply writes the band
                                 midpoint without displaying it. */}
                             <span style={{
-                              fontFamily:_ft,fontSize:_rem(14),fontWeight:700,color:C.tx,
+                              fontFamily:_ft,fontSize:FS.md,fontWeight:700,color:C.tx,
                             }}>{ivlText}</span>
                             <span title={d.explain} style={{
-                              padding:"1px 6px",borderRadius:3,fontSize:_rem(12),fontWeight:600,
+                              padding:"2px 6px",borderRadius:4,fontSize:FS.xs,fontWeight:600,
                               background:cBd,color:C.onFill,letterSpacing:0.3,cursor:"help",
                             }}>{d.label}</span>
                             <span style={{color:C.txM}}>
-                              · {d.isScore?`${d.engine} · ${d.nObs} obs`:isBal?`balance · ${e.balance.nEvents} event${e.balance.nEvents===1?"":"s"}`:`gaps · ${e.nGaps}`}
+                              {d.isScore?`${d.engine} · ${d.nObs} observations`:isBal?`balance · ${e.balance.nEvents} event${e.balance.nEvents===1?"":"s"}`:`gaps · ${e.nGaps}`}
                               {!d.isScore&&!isBal&&e.nNoPopBounds?` · ${e.nNoPopBounds} no-pop`:""}
                               {e.isGk?" · GK":""}
                             </span>
                             {d.isScore&&hb("est","Estimate from history")}
                             <button onClick={()=>setYsTalent(ysVal.toFixed(2))}
                               disabled={!canApply||Math.abs(ysNum-ysVal)<0.005}
-                              title={canApply?"":d.noVerdict&&!d.unpinned?`no verdict — ${d.noVerdict}`:"band is unpinned at both ends — no point to apply"}
+                              title={canApply?"":d.noVerdict&&!d.unpinned?`no verdict — ${d.noVerdict}`:"the band is open at both ends — nothing to apply"}
                               style={{
-                                ...sBs,padding:"2px 10px",fontSize:_rem(12),marginLeft:"auto",
+                                ...sBs,padding:"2px 8px",fontSize:FS.xs,marginLeft:"auto",
                                 ...((!canApply||Math.abs(ysNum-ysVal)<0.005)
                                   ?{opacity:0.5,cursor:"default"}
-                                  :{background:cBd,color:C.onFill,borderColor:cBd}),
+                                  :{background:cBd,color:C.onFill,border:`1px solid ${cBd}`}),
                               }}>
-                              {!canApply?(d.noVerdict&&!d.unpinned?"no verdict":"unpinned"):Math.abs(ysNum-ysVal)<0.005?"applied":"Apply"}
+                              {!canApply?(d.noVerdict&&!d.unpinned?"no verdict":"open band"):Math.abs(ysNum-ysVal)<0.005?"applied":"Apply"}
                             </button>
                           </>
                         )}
                       </div>
                       {!noData&&d.isScore&&!canApply&&(
-                        <div style={{color:C.warn,fontSize:_rem(12),marginTop:4,lineHeight:1.5}}>
-                          {d.noVerdict&&!d.unpinned?`No verdict — ${d.noVerdict}.`:"The band is unpinned at both ends, so there is no point to apply."} The talent you typed stays in force.
+                        <div style={{color:C.warn,fontSize:FS.xs,marginTop:4,lineHeight:1.5}}>
+                          {d.noVerdict&&!d.unpinned?`No verdict — ${d.noVerdict}.`:"The history does not limit the talent from either side (the band is open at both ends), so there is nothing to apply."} The talent you typed stays in force.
                         </div>
                       )}
-                      {!noData&&d.isScore&&ht("est",<>95% band {d.dbBand} — {d.cenText}. The confidence label is width-based: 8 DB or less reads reliable, 60 DB or more unreliable.</>)}
+                      {!noData&&d.isScore&&ht("est",<>95% band {d.dbBand} — {d.cenText}. DB is the planner's 0–100 talent scale (100 = YS 3.00, the best). The confidence label goes by the width of the band: 8 DB or less reads reliable, 60 DB or more unreliable.</>)}
                       {d.red&&(
                         <div style={{marginTop:6,padding:"6px 8px",borderRadius:4,
-                          background:"rgba(220,60,60,0.12)",border:`1px solid ${C.warn}`,color:C.tx,fontSize:_rem(12)}}>
+                          background:"rgba(220,60,60,0.12)",border:`1px solid ${C.warn}`,color:C.tx,fontSize:FS.xs}}>
                           <div style={{fontWeight:700,color:C.warn}}>🛑 A pop in this history cannot be produced by the model at ANY talent.</div>
                           <div>It has been set aside and is NOT in the verdict — this is a data problem to trace, not a talent signal:</div>
                           {d.impossible.map((x,i)=><div key={i} style={{fontFamily:_ft}}>• {x}</div>)}
                         </div>
                       )}
                       {d.isScore&&d.unknownWeeks.length>0&&(
-                        <div style={{color:C.warn,fontSize:_rem(12),marginTop:4}}>
-                          ⚠ {d.unknownWeeks.length} week{d.unknownWeeks.length===1?"":"s"} marked <i>rest</i> but trained at intensity &gt; 0 (weeks {Math.min(...d.unknownWeeks)}–{Math.max(...d.unknownWeeks)}) — a shape the API never emits; the training kind was lost on import. Direct or GT is unknowable there, so every gap containing such a week carries no evidence.
+                        <div style={{color:C.warn,fontSize:FS.xs,marginTop:4}}>
+                          ⚠ {d.unknownWeeks.length} week{d.unknownWeeks.length===1?"":"s"} marked <i>rest</i> but trained at intensity &gt; 0 (weeks {Math.min(...d.unknownWeeks)}–{Math.max(...d.unknownWeeks)}) — a shape the API never emits; the training kind was lost on import. Direct or general training is unknowable there, so every gap containing such a week carries no evidence.
                         </div>
                       )}
                       {d.isScore&&d.inconsistent&&(
-                        <div style={{color:C.warn,fontSize:_rem(12),marginTop:4}}>
+                        <div style={{color:C.warn,fontSize:FS.xs,marginTop:4}}>
                           ⚠ INCONSISTENT — no talent satisfies the 95% tolerance; the band shown is the best-fit region
                         </div>
                       )}
                       {d.isScore&&!d.inconsistent&&d.conflicts.length>0&&(
-                        <div style={{color:C.txM,fontSize:_rem(12),marginTop:4}}>
+                        <div style={{color:C.txM,fontSize:FS.xs,marginTop:4}}>
                           {d.conflicts.length} {d.engine==="chain"?"chain":"observation"}{d.conflicts.length===1?"":"s"} at odds with the verdict
                           {helpOpen.est&&<div style={{marginTop:2}}>{d.engine==="chain"?"Kept: an outlier level is down-weighted, never removed.":"More than 2σ from the verdict; kept, down-weighted by clipping."} {d.conflicts.join("; ")}</div>}
                         </div>
                       )}
                       {ntWeeks>0&&(
-                        <div style={{color:C.warn,fontSize:_rem(12),marginTop:4}}>
-                          ⚠ {ntWeeks} national-team week{ntWeeks===1?"":"s"} in this history — NT coaching adds unmodeled XP, so the true talent is likely worse (higher YS) than estimated
+                        <div style={{color:C.warn,fontSize:FS.xs,marginTop:4}}>
+                          ⚠ {ntWeeks} national-team week{ntWeeks===1?"":"s"} in this history — national-team coaching adds training the model cannot see, so the true talent is likely worse (higher YS) than estimated
                         </div>
                       )}
                       {!noData&&isBal&&e.balance.capped&&(
-                        <div style={{color:C.txM,fontSize:_rem(12),marginTop:4}}>
+                        <div style={{color:C.txM,fontSize:FS.xs,marginTop:4}}>
                           ceiling-pinned: virtual balance point {e.balance.virtual.toFixed(0)} DB past the cap — genuine top talent OR high-level K under-thresholding
                         </div>
                       )}
                       {!noData&&!isBal&&!d.isScore&&e.contradictory&&(
-                        <div style={{color:C.warn,fontSize:_rem(12),marginTop:4}}>
+                        <div style={{color:C.warn,fontSize:FS.xs,marginTop:4}}>
                           ⚠ contradictory bounds — model residual; treat as indicative
                         </div>
                       )}
                       {!noData&&!d.isScore&&(e.excludedSkills||[]).length>0&&!isBal&&(
-                        <div style={{color:C.txM,fontSize:_rem(12),marginTop:4}}>
+                        <div style={{color:C.txM,fontSize:FS.xs,marginTop:4}}>
                           consensus excluded: {e.excludedSkills.join(", ")}
                         </div>
                       )}
@@ -6345,7 +6503,7 @@ export default function App(){
                 })()}
                 {/* v20 (recovered in v28): external talent prior + next-pop forecast */}
                 {historyReports&&talentEstimate&&isFinite(talentEstimate.td)&&(
-                  <div style={{marginTop:10,marginBottom:12}}>
+                  <div style={{marginTop:8,marginBottom:12}}>
                     <div style={{display:"flex",alignItems:"center",gap:8}}>
                       <Disc open={disc.prior??(priorRaw.trim()!=="")} onToggle={()=>setDisc(o=>({...o,prior:!(o.prior??(priorRaw.trim()!==""))}))}>External talent (optional)</Disc>
                       {hb("prior","External talent")}
@@ -6359,10 +6517,10 @@ export default function App(){
                       <select aria-label="External talent scale" value={priorScale} onChange={e=>setPriorScale(e.target.value)} style={{...sSel,width:140}}>
                         <option value="senior">senior 3–7.5</option>
                         <option value="ys">YS 3–30</option>
-                        <option value="db">DB 0–100</option>
+                        <option value="db">DB 0–100 (100 = best)</option>
                       </select>
                       {talentEstimate.prior&&(
-                        <span style={{fontSize:_rem(12),color:talentEstimate.prior.mode==="conflict"?C.warn:C.pop}}>
+                        <span style={{fontSize:FS.xs,color:talentEstimate.prior.mode==="conflict"?C.warn:C.pop}}>
                           {talentEstimate.prior.mode==="conflict"
                             ?`⚠ prior [${talentEstimate.prior.lo}–${talentEstimate.prior.hi} DB] disjoint from the history band — prior wins`
                             :`✓ intersected → [${talentEstimate.prior.lo}–${talentEstimate.prior.hi} DB]`}
@@ -6381,7 +6539,7 @@ export default function App(){
                     {Object.entries(POS).map(([k,v])=><option key={k} value={k}>{v.name} — {v.d}</option>)}
                   </select>
                 </div>
-                <div style={{...sL,marginTop:10}}>Training horizon</div>
+                <div style={{...sL,marginTop:8}}>Training horizon</div>
                 {/* v16: simple mode shows only the age/week picker (v15's
                     two-way view of `weeks`) and the 27yo default chip; the
                     raw weeks input and season chips live under Advanced. */}
@@ -6395,12 +6553,12 @@ export default function App(){
                   return(
                     <>
                       <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-                        <span style={{fontSize:_rem(12),color:C.txD}}>until age</span>
+                        <span style={{fontSize:FS.xs,color:C.txD}}>until age</span>
                         <input type="number" aria-label="Train until age" min={age} max={40} value={end.age}
                           onChange={e=>{const v=parseInt(e.target.value,10);
                             if(isFinite(v))setTarget(Math.max(age,Math.min(40,v)),end.week);}}
                           style={{...sI,width:62,textAlign:"center"}}/>
-                        <span style={{fontSize:_rem(12),color:C.txD}}>week</span>
+                        <span style={{fontSize:FS.xs,color:C.txD}}>week</span>
                         <select aria-label="Train until season week" value={end.week}
                           onChange={e=>setTarget(end.age,parseInt(e.target.value,10))}
                           style={{...sSel,width:60}}>
@@ -6408,18 +6566,18 @@ export default function App(){
                             <option key={w} value={w} disabled={end.age===age&&w<ssw}>{w}</option>
                           ))}
                         </select>
-                        <span style={{fontSize:_rem(12),color:C.txM}}>
+                        <span style={{fontSize:FS.xs,color:C.txM}}>
                           = {weeks} wk ({(weeks/13).toFixed(1)}s)
                         </span>
                         {w27&&(
                           <button aria-pressed={weeks===w27} onClick={()=>setWeeks(w27)} title="Train until the last week before he turns 28 — the default" style={{
-                            ...sBs,padding:"2px 8px",fontSize:_rem(12),fontWeight:700,
-                            ...(weeks===w27?{background:C.pop,color:C.onFill,borderColor:C.pop}:{borderColor:C.pop+"88",color:C.pop}),
+                            ...sBs,padding:"2px 8px",fontSize:FS.xs,fontWeight:700,
+                            ...(weeks===w27?{background:C.pop,color:C.onFill,border:`1px solid ${C.pop}`}:{border:`1px solid ${C.pop+"88"}`,color:C.pop}),
                           }}>end of 27</button>
                         )}
                       </div>
                       {seasonNote&&(
-                        <div style={{fontSize:_rem(12),color:C.warn,marginTop:5,lineHeight:1.35}}>🗓 {seasonNote}</div>
+                        <div style={{fontSize:FS.xs,color:C.warn,marginTop:4,lineHeight:1.35}}>🗓 {seasonNote}</div>
                       )}
                     </>
                   );
@@ -6427,14 +6585,14 @@ export default function App(){
               </div>
 
               <button onClick={runSim} disabled={(selStrats.length===0&&!manualResult)||!hasPlayerData}
-                style={{...sB,width:"100%",fontSize:_rem(16),padding:"14px 20px",
+                style={{...sB,width:"100%",fontSize:FS.md,padding:"16px 20px",
                   background:resultsStale?C.warn:C.accFill,color:resultsStale?C.onFill:"#fff",
                   opacity:((selStrats.length===0&&!manualResult)||!hasPlayerData)?0.4:1,
                   cursor:((selStrats.length===0&&!manualResult)||!hasPlayerData)?"not-allowed":"pointer"}}>
                 {resultsStale?"↻ Rerun — parameters changed":results?"↻ Rerun Simulation":"▶ Run Simulation"}
               </button>
               {!advOpen&&(
-                <div style={{fontSize:_rem(12),color:C.txM,marginTop:6,lineHeight:1.4}}>
+                <div style={{fontSize:FS.xs,color:C.txM,marginTop:6,lineHeight:1.4}}>
                   Comparing: {selStrats.map(k=>allStrats[k]?.name||k).join(", ")||"—"}
                   {manualEnabled?" · manual schedule active":""} — change under Advanced.
                 </div>
@@ -6443,10 +6601,10 @@ export default function App(){
               {/* v16: Advanced expander — season week, raw horizon input,
                   strategy set, manual schedule. Nothing removed from v15,
                   only deferred. */}
-              <div style={{...sC,marginTop:12,padding:advOpen?"14px 20px":"0"}}>
+              <div style={{...sC,marginTop:12,padding:advOpen?"16px 20px":"0"}}>
                 <button aria-expanded={advOpen} onClick={()=>setAdvOpen(o=>!o)} style={{
                   background:"transparent",border:"none",color:C.txD,fontFamily:_fs,
-                  fontWeight:600,fontSize:_rem(13),cursor:"pointer",width:"100%",textAlign:"left",
+                  fontWeight:600,fontSize:FS.sm,cursor:"pointer",width:"100%",textAlign:"left",
                   padding:advOpen?"0 0 10px":"12px 20px",letterSpacing:0.3}}>
                   {advOpen?"▾":"▸"} Advanced
                 </button>
@@ -6459,7 +6617,7 @@ export default function App(){
                           onChange={e=>setSsw(Math.max(1,Math.min(13,parseInt(e.target.value)||1)))}
                           style={{...sI,width:60}}/>
                         {seasonNote&&(
-                          <div style={{fontSize:_rem(12),color:C.warn,marginTop:3,lineHeight:1.3}}>
+                          <div style={{fontSize:FS.xs,color:C.warn,marginTop:4,lineHeight:1.3}}>
                             🗓 auto-derived (report week + today's date) — edit to override
                           </div>
                         )}
@@ -6478,13 +6636,13 @@ export default function App(){
                         <input type="number" aria-label="Head coach, DB" min={30} max={120} value={coachDb}
                           onChange={e=>setCoachDb(Math.max(30,Math.min(120,parseInt(e.target.value)||93)))}
                           style={{...sI,width:70}}/>
-                        {ht("coach",<>93 = unearthly, the historical assumption. The value changes XP everywhere: the simulation and the talent estimate.</>)}
+                        {ht("coach",<>DB is the planner's 0–100 scale; a head coach of 93 is unearthly, the assumption used so far. The value changes how much every week of training gives, in the simulation and in the talent estimate.</>)}
                       </div>
                     </div>
-                    <div style={{display:"flex",gap:3,flexWrap:"wrap",marginBottom:14}}>
+                    <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:12}}>
                       {[13,26,39,52,78,104].map(w=>(
                         <button key={w} aria-pressed={weeks===w} onClick={()=>setWeeks(w)} style={{
-                          ...sBs,padding:"2px 8px",fontSize:_rem(12),...(weeks===w?{background:C.accFill,color:"#fff",borderColor:C.accFill}:{}),
+                          ...sBs,padding:"2px 8px",fontSize:FS.xs,...(weeks===w?{background:C.accFill,color:"#fff",border:`1px solid ${C.accFill}`}:{}),
                         }}>{w/13}s</button>
                       ))}
                     </div>
@@ -6494,18 +6652,18 @@ export default function App(){
                         const sel=selStrats.includes(k);const isSale=k==="sale_optimizer";
                         return(
                           <button key={k} aria-pressed={sel} onClick={()=>setSelStrats(p=>sel?p.filter(x=>x!==k):[...p,k])} style={{
-                            ...sBs,textAlign:"left",fontSize:_rem(13),display:"flex",flexDirection:"column",alignItems:"flex-start",gap:2,
-                            ...(sel?{background:(isSale?C.warn:C.acc)+"22",borderColor:isSale?C.warn:C.acc,color:isSale?C.warn:C.acc}:{}),
+                            ...sBs,textAlign:"left",fontSize:FS.sm,display:"flex",flexDirection:"column",alignItems:"flex-start",gap:2,
+                            ...(sel?{background:(isSale?C.warn:C.acc)+"22",border:`1px solid ${isSale?C.warn:C.acc}`,color:isSale?C.warn:C.acc}:{}),
                           }}>
                             <span>{sel?"✓ ":"  "}{v.name} {isSale&&"💰"}</span>
-                            <span style={{fontSize:_rem(12),color:C.txD,fontWeight:400}}>{v.desc}</span>
+                            <span style={{fontSize:FS.xs,color:C.txD,fontWeight:400}}>{v.desc}</span>
                           </button>
                         );
                       })}
                     </div>
                     {/* v8.4: Manual Schedule toggle */}
                     <button aria-pressed={manualEnabled} onClick={manualToggle} disabled={!hasPlayerData}
-                      style={{...sB,width:"100%",fontSize:_rem(13),padding:"10px 16px",
+                      style={{...sB,width:"100%",fontSize:FS.sm,padding:"12px 16px",
                         background:manualEnabled?C.warn:C.hi,
                         color:manualEnabled?C.onFill:C.txD,
                         border:manualEnabled?"none":`1px solid ${C.bdr}`,
@@ -6523,14 +6681,14 @@ export default function App(){
                   the results and surface a rerun ribbon; nothing recomputes
                   behind the user's back. */}
               {resultsStale&&(
-                <div style={{...sC,borderLeft:`3px solid ${C.warn}`,display:"flex",alignItems:"center",gap:12,padding:"10px 16px"}}>
-                  <span style={{color:C.warn,fontSize:_rem(13),fontWeight:600}}>Parameters changed — results below show the previous run.</span>
-                  <button onClick={runSim} style={{...sB,marginLeft:"auto",padding:"6px 16px",fontSize:_rem(13),background:C.warn,color:C.onFill}}>↻ Rerun</button>
+                <div style={{...sC,borderLeft:`3px solid ${C.warn}`,display:"flex",alignItems:"center",gap:12,padding:"12px 16px"}}>
+                  <span style={{color:C.warn,fontSize:FS.sm,fontWeight:600}}>Parameters changed — results below show the previous run.</span>
+                  <button onClick={runSim} style={{...sB,marginLeft:"auto",padding:"6px 16px",fontSize:FS.sm,background:C.warn,color:C.onFill}}>↻ Rerun</button>
                 </div>
               )}
               {!displayResults&&(
-                <div style={{...sC,textAlign:"center",padding:60,color:C.txM}}>
-                  <div style={{fontSize:_rem(40),marginBottom:8,opacity:0.4}}>📊</div>
+                <div style={{...sC,textAlign:"center",padding:64,color:C.txM}}>
+                  <div style={{fontSize:FS.icon,marginBottom:8,opacity:0.4}}>📊</div>
                   <div>Configure parameters and run the simulation.</div>
                 </div>
               )}
@@ -6556,20 +6714,20 @@ export default function App(){
                 }
                 if(cardMeta.actualValue!=null){nowVal=cardMeta.actualValue;nowValLabel="card";}
                 return(<div style={resultsStale?{opacity:0.55}:undefined}>
-                  <div style={{fontSize:_rem(13),color:C.txD,marginBottom:8}}>
+                  <div style={{fontSize:FS.sm,color:C.txD,marginBottom:8}}>
                     {prof.d} · YS {ysNum.toFixed(2)} · {weeks} weeks ({(weeks/13).toFixed(1)}s)
                     <span style={{color:C.txM}}> · projected: </span>
                     <b style={{color:proj.isSale?C.warn:C.acc}}>{allStrats[projKey]?.name||projKey}</b>
-                    {keys.length>1&&<span style={{color:C.txM,fontSize:_rem(12)}}> (click a column header below to switch)</span>}
+                    {keys.length>1&&<span style={{color:C.txM,fontSize:FS.xs}}> (click a column header below to switch)</span>}
                   </div>
                   {(()=>{
                     const best=keys.reduce((a,b)=>wScore(displayResults[a])>wScore(displayResults[b])?a:b);
                     return(
                       <div style={{...sC,background:C.pop+"11",borderLeft:`3px solid ${C.pop}`,
-                        display:"flex",alignItems:"baseline",gap:10,flexWrap:"wrap"}}>
-                        <span style={{fontWeight:700,color:C.pop,fontSize:_rem(17)}}>★ Best: {allStrats[best]?.name||best}</span>
-                        <span style={{color:C.tx,fontSize:_rem(15),fontWeight:700,fontFamily:_ft}}>{wScore(displayResults[best]).toFixed(1)}</span>
-                        <span style={{color:C.txM,fontSize:_rem(12)}}>weighted score</span>
+                        display:"flex",alignItems:"baseline",gap:8,flexWrap:"wrap"}}>
+                        <span style={{fontWeight:700,color:C.pop,fontSize:FS.lg}}>★ Best: {allStrats[best]?.name||best}</span>
+                        <span style={{color:C.tx,fontSize:FS.md,fontWeight:700,fontFamily:_ft}}>{wScore(displayResults[best]).toFixed(1)}</span>
+                        <span style={{color:C.txM,fontSize:FS.xs}}>weighted score</span>
                       </div>
                     );
                   })()}
@@ -6584,7 +6742,7 @@ export default function App(){
                   </div>
 
                   <div style={{...sC,overflow:"auto"}}>
-                    <table style={{width:"100%",borderCollapse:"collapse",fontFamily:_ft,fontSize:_rem(13)}}>
+                    <table style={{width:"100%",borderCollapse:"collapse",fontFamily:_ft,fontSize:FS.sm}}>
                       <thead>
                         <tr style={{borderBottom:`2px solid ${C.bdr}`}}>
                           <th style={{textAlign:"left",padding:"6px 8px",color:C.txD}}>Skill</th>
@@ -6613,20 +6771,20 @@ export default function App(){
                           const w=prof.w[sk];
                           return(
                             <tr key={sk} style={{borderBottom:`1px solid ${C.bdr}22`}}>
-                              <td style={{padding:"5px 8px",color:w===1?C.tx:C.txD}}>
-                                {sk} {w===1?<span style={{fontSize:_rem(12),color:C.acc}}>★</span>:<span style={{fontSize:_rem(12),color:C.txM}}>({w})</span>}
+                              <td style={{padding:"6px 8px",color:w===1?C.tx:C.txD}}>
+                                {sk} {w===1?<span style={{fontSize:FS.xs,color:C.acc}}>★</span>:<span style={{fontSize:FS.xs,color:C.txM}}>({w})</span>}
                               </td>
-                              <td style={{textAlign:"center",padding:"5px 4px",fontWeight:600}}>
-                                {first.startSkills[sk]}<span style={{fontSize:_rem(12),color:C.txM}}>.{(subs[sk]??25).toString().padStart(2,"0")}</span>
+                              <td style={{textAlign:"center",padding:"6px 4px",fontWeight:600}}>
+                                {first.startSkills[sk]}<span style={{fontSize:FS.xs,color:C.txM}}>.{(subs[sk]??25).toString().padStart(2,"0")}</span>
                               </td>
                               {keys.map(kk=>{
                                 const r=displayResults[kk];const lv=r.finalSkills[sk];const gained=lv-first.startSkills[sk];
                                 const lastSub=r.log.length?r.log[r.log.length-1].subs[sk]:0;
                                 return(
-                                  <td key={kk} style={{textAlign:"center",padding:"5px 8px",borderLeft:`1px solid ${C.bdr}`,fontWeight:600}}>
+                                  <td key={kk} style={{textAlign:"center",padding:"6px 8px",borderLeft:`1px solid ${C.bdr}`,fontWeight:600}}>
                                     <span style={{color:gained>0?C.pop:C.tx}}>{lv}</span>
-                                    <span style={{fontSize:_rem(12),color:C.txM,marginLeft:1}}>({Math.floor(lastSub*100)}%)</span>
-                                    {gained>0&&<span style={{fontSize:_rem(12),color:C.pop,marginLeft:3}}>+{gained}</span>}
+                                    <span style={{fontSize:FS.xs,color:C.txM,marginLeft:2}}>({Math.floor(lastSub*100)}%)</span>
+                                    {gained>0&&<span style={{fontSize:FS.xs,color:C.pop,marginLeft:4}}>+{gained}</span>}
                                   </td>
                                 );
                               })}
@@ -6663,7 +6821,7 @@ export default function App(){
                     return(
                       <a href={url} download={`schedule_${pos}_${logKey}.csv`}
                         style={{display:"block",background:C.accFill,color:"#fff",border:"none",borderRadius:6,
-                          padding:"12px 20px",fontFamily:_fs,fontWeight:600,fontSize:_rem(15),cursor:"pointer",
+                          padding:"12px 20px",fontFamily:_fs,fontWeight:600,fontSize:FS.md,cursor:"pointer",
                           textAlign:"center",marginBottom:12,textDecoration:"none",width:"100%",boxSizing:"border-box"}}>
                         ⬇️ Download Schedule CSV
                       </a>
@@ -6675,7 +6833,7 @@ export default function App(){
                     return(
                       <div key={k} style={{...sC,borderLeft:`3px solid ${C.warn}`}}>
                         <div style={{display:"flex"}}><Disc open={!!disc["sale_"+k]} onToggle={()=>setDisc(o=>({...o,["sale_"+k]:!o["sale_"+k]}))} color={C.warn}>💰 Sale Optimizer details</Disc></div>
-                        <div style={{fontSize:_rem(13),color:C.txD,marginBottom:8}}>
+                        <div style={{fontSize:FS.sm,color:C.txD,marginBottom:8}}>
                           {r.totalWeeks} weeks{r.extensions>0&&<span style={{color:C.pop}}> (+{r.extensions} extended)</span>}
                           {r.swaps>0&&<span> · {r.swaps} swaps</span>}
                         </div>
@@ -6683,20 +6841,21 @@ export default function App(){
                         <div style={{...sL,marginTop:4}}>Schedule</div>
                         <div style={{display:"flex",flexWrap:"wrap",gap:2,marginBottom:12}}>
                           {r.schedule.map((sk,i)=>(
-                            <div key={i} style={{padding:"3px 6px",borderRadius:3,fontSize:_rem(12),fontFamily:_ft,fontWeight:600,
+                            <div key={i} style={{padding:"4px 6px",borderRadius:4,fontSize:FS.xs,fontFamily:_ft,fontWeight:600,
                               background:C.hi,border:`1px solid ${C.bdr}`,color:C.acc,textAlign:"center",minWidth:40}}>
-                              <div style={{fontSize:_rem(12),color:C.txM}}>{i+1}</div>{SN[sk]}
+                              <div style={{fontSize:FS.xs,color:C.txM}}>{i+1}</div>{SN[sk]}
                             </div>
                           ))}
                         </div>
-                        <div style={sL}>Carry-in at sale (lower = better)</div>
+                        <div style={{...sL,display:"flex",alignItems:"center",gap:8}}>Carry-in at sale (lower = better) {hb("carry","Carry-in")}</div>
+                        {ht("carry",<>Carry-in is progress toward the next level that has not yet become a level. A buyer sees whole levels only, so what is left inside a level at the sale is training that does not show on the card.</>)}
                         {OS.filter(sk=>prof.w[sk]>0).map(sk=>{
                           const ci=(r.carryPct?.[sk]||0)*100;
                           return(
-                            <div key={sk} style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,fontSize:_rem(13),fontFamily:_ft}}>
+                            <div key={sk} style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,fontSize:FS.sm,fontFamily:_ft}}>
                               <span style={{width:40,color:C.txD}}>{SN[sk]}</span>
-                              <div style={{flex:1,height:10,background:C.bg,borderRadius:5,overflow:"hidden"}}>
-                                <div style={{width:`${Math.min(ci,100)}%`,height:"100%",borderRadius:5,
+                              <div style={{flex:1,height:10,background:C.bg,borderRadius:6,overflow:"hidden"}}>
+                                <div style={{width:`${Math.min(ci,100)}%`,height:"100%",borderRadius:6,
                                   background:ci>70?C.red:ci>40?C.warn:C.pop}}/>
                               </div>
                               <span style={{width:40,textAlign:"right",color:ci>70?C.red:ci>40?C.warn:C.pop,fontWeight:600}}>
@@ -6716,16 +6875,16 @@ export default function App(){
                       {keys.map(k=>(
                         <button key={k} aria-pressed={showLog===k} onClick={()=>setShowLog(showLog===k?null:k)} style={{
                           ...sBs,...(showLog===k?{background:displayResults[k].isSale?C.warn:C.accFill,color:displayResults[k].isSale?C.onFill:"#fff",
-                            borderColor:displayResults[k].isSale?C.warn:C.accFill}:{}),
+                            border:`1px solid ${displayResults[k].isSale?C.warn:C.accFill}`}:{}),
                         }}>{allStrats[k]?.name||k}</button>
                       ))}
                     </div>
                     {showLog&&displayResults[showLog]&&(
                       <div style={{maxHeight:420,overflow:"auto",borderRadius:6}}>
                         {displayResults[showLog].log.some(w=>w.wasted)&&(
-                          <div style={{fontSize:_rem(12),color:C.txM,padding:"4px 6px"}}>✗ = wasted week: the assigned skill was already at its maximum.</div>
+                          <div style={{fontSize:FS.xs,color:C.txM,padding:"4px 6px"}}>✗ = wasted week: the assigned skill was already at its maximum.</div>
                         )}
-                        <table style={{width:"100%",borderCollapse:"collapse",fontFamily:_ft,fontSize:_rem(12)}}>
+                        <table style={{width:"100%",borderCollapse:"collapse",fontFamily:_ft,fontSize:FS.xs}}>
                           <thead style={{position:"sticky",top:0,background:C.hi}}>
                             <tr>
                               <th style={{padding:"4px 6px",textAlign:"center",color:C.txD}}>Wk</th>
@@ -6742,10 +6901,10 @@ export default function App(){
                             {displayResults[showLog].log.map((w,i)=>(
                               <tr key={i} style={{borderBottom:`1px solid ${C.bdr}22`,
                                 background:w.wasted?C.red+"14":w.pops.length?C.pop+"0d":"transparent"}}>
-                                <td style={{padding:"3px 6px",textAlign:"center"}}>{w.week}</td>
-                                <td style={{padding:"3px 6px",textAlign:"center",color:C.txD}}>{w.age}</td>
-                                <td style={{padding:"3px 6px",textAlign:"center",color:C.txM}}>{w.sw}</td>
-                                <td style={{padding:"3px 6px",color:w.wasted?C.red:C.acc,fontWeight:600,
+                                <td style={{padding:"4px 6px",textAlign:"center"}}>{w.week}</td>
+                                <td style={{padding:"4px 6px",textAlign:"center",color:C.txD}}>{w.age}</td>
+                                <td style={{padding:"4px 6px",textAlign:"center",color:C.txM}}>{w.sw}</td>
+                                <td style={{padding:"4px 6px",color:w.wasted?C.red:C.acc,fontWeight:600,
                                   textDecoration:w.wasted?"line-through":"none"}}
                                   title={w.wasted?"Wasted — assigned skill already maxed":undefined}>
                                   {SN[w.trained]}{w.wasted?" ✗":""}
@@ -6753,13 +6912,13 @@ export default function App(){
                                 {OS.filter(sk=>prof.w[sk]>0).map(sk=>{
                                   const hasPop=w.pops.some(p=>p[0]===sk);
                                   return(
-                                    <td key={sk} style={{padding:"3px 6px",textAlign:"center",
+                                    <td key={sk} style={{padding:"4px 6px",textAlign:"center",
                                       color:hasPop?C.pop:C.tx,fontWeight:hasPop?700:400}}>
-                                      {w.levels[sk]}<span style={{color:C.txM,fontSize:_rem(12)}}>.{Math.floor(w.subs[sk]*100).toString().padStart(2,"0")}</span>
+                                      {w.levels[sk]}<span style={{color:C.txM,fontSize:FS.xs}}>.{Math.floor(w.subs[sk]*100).toString().padStart(2,"0")}</span>
                                     </td>
                                   );
                                 })}
-                                <td style={{padding:"3px 6px",color:C.pop,fontSize:_rem(12)}}>
+                                <td style={{padding:"4px 6px",color:C.pop,fontSize:FS.xs}}>
                                   {w.pops.map(p=>`${SN[p[0]]}→${p[1]}`).join(" ")}
                                 </td>
                               </tr>
@@ -6792,26 +6951,26 @@ export default function App(){
           {/* v8.4: Full-width Manual Schedule Builder */}
           {manualEnabled&&hasPlayerData&&(
             <div style={{...sC,borderLeft:`3px solid ${C.warn}`,marginTop:8}}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10,flexWrap:"wrap",gap:10}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8,flexWrap:"wrap",gap:8}}>
                 <div>
                   <div style={{...sL,color:C.warn,marginBottom:2,display:"flex",alignItems:"center",gap:8}}>✏️ Manual Schedule Builder {hb("man","Manual Schedule Builder")}</div>
-                  <div style={{fontSize:_rem(12),color:C.txM,lineHeight:1.4}}>
+                  <div style={{fontSize:FS.xs,color:C.txM,lineHeight:1.4}}>
                     Click a chip to delete that week.
                   </div>
                   {ht("man",<>Hand-pick training week by week. Every edit updates the Manual column in the comparison table above. Undo steps back through your changes.</>)}
                 </div>
-                <div style={{fontSize:_rem(13),fontFamily:_ft,color:C.txD}}>
+                <div style={{fontSize:FS.sm,fontFamily:_ft,color:C.txD}}>
                   <span style={{color:C.warn,fontWeight:700}}>{manualSchedule.length}</span> weeks
                   {manualSchedule.length>0&&<span style={{color:C.txM}}> · {(manualSchedule.length/13).toFixed(1)} seasons</span>}
                 </div>
               </div>
 
               {/* Quick-add row */}
-              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,flexWrap:"wrap"}}>
-                <span style={{fontSize:_rem(12),color:C.txM,fontFamily:_fs,letterSpacing:"0.04em",textTransform:"uppercase"}}>Add</span>
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8,flexWrap:"wrap"}}>
+                <span style={{fontSize:FS.xs,color:C.txM,fontFamily:_fs,letterSpacing:"0.04em",textTransform:"uppercase"}}>Add</span>
                 <input type="number" id="manualBulk" aria-label="Number of weeks to add" min={1} max={52} defaultValue={1}
-                  style={{...sI,width:60,padding:"6px 8px",textAlign:"center",fontSize:_rem(13)}}/>
-                <span style={{fontSize:_rem(12),color:C.txM}}>×</span>
+                  style={{...sI,width:60,padding:"6px 8px",textAlign:"center",fontSize:FS.sm}}/>
+                <span style={{fontSize:FS.xs,color:C.txM}}>×</span>
                 {OS.map(sk=>{
                   const w=prof.w[sk]||0;
                   const dim=w===0;
@@ -6820,8 +6979,8 @@ export default function App(){
                       const n=parseInt(document.getElementById("manualBulk").value,10)||1;
                       manualAppend(sk,n);
                     }} disabled={dim} aria-label={`Add ${SN[sk]} (${sk})`} style={{
-                      padding:"6px 12px",fontSize:_rem(13),fontFamily:_ft,fontWeight:700,
-                      borderRadius:5,cursor:dim?"not-allowed":"pointer",
+                      padding:"6px 12px",fontSize:FS.sm,fontFamily:_ft,fontWeight:700,
+                      borderRadius:6,cursor:dim?"not-allowed":"pointer",
                       background:dim?C.hi:SK_COLORS[sk]+"22",
                       color:dim?C.txM:SK_COLORS[sk],
                       border:`1px solid ${dim?C.bdr:SK_COLORS[sk]}`,
@@ -6836,22 +6995,22 @@ export default function App(){
                 </button>
                 <button onClick={manualClear} disabled={manualSchedule.length===0}
                   style={{...sBs,opacity:manualSchedule.length===0?0.4:1,cursor:manualSchedule.length===0?"not-allowed":"pointer",
-                    color:manualSchedule.length>0?C.red:C.txM,borderColor:manualSchedule.length>0?C.red:C.bdr}}>
+                    color:manualSchedule.length>0?C.red:C.txM,border:`1px solid ${manualSchedule.length>0?C.red:C.bdr}`}}>
                   🗑 Clear
                 </button>
               </div>
 
               {/* Seed-from-strategy row */}
-              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:14,flexWrap:"wrap",
-                padding:"8px 10px",background:C.bg,borderRadius:6,border:`1px dashed ${C.bdr}`}}>
-                <span style={{fontSize:_rem(12),color:C.txM}}>Or seed from strategy:</span>
+              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12,flexWrap:"wrap",
+                padding:"8px 8px",background:C.bg,borderRadius:6,border:`1px dashed ${C.bdr}`}}>
+                <span style={{fontSize:FS.xs,color:C.txM}}>Or seed from strategy:</span>
                 <select aria-label="Strategy to seed the manual schedule from" value={manualSeedFrom} onChange={e=>setManualSeedFrom(e.target.value)}
-                  style={{...sSel,width:200,padding:"5px 28px 5px 8px",fontSize:_rem(13)}}>
+                  style={{...sSel,width:200,padding:"6px 24px 6px 8px",fontSize:FS.sm}}>
                   {Object.entries(validStrats).filter(([k])=>k!=="manual").map(([k,v])=>(
                     <option key={k} value={k}>{v.name}</option>
                   ))}
                 </select>
-                <button onClick={manualSeed} style={{...sBs,background:C.warn+"22",borderColor:C.warn,color:C.warn}}>
+                <button onClick={manualSeed} style={{...sBs,background:C.warn+"22",border:`1px solid ${C.warn}`,color:C.warn}}>
                   🌱 Seed ({weeks} weeks)
                 </button>
               </div>
@@ -6860,7 +7019,7 @@ export default function App(){
 
               {/* Chip strip — grouped by season */}
               {manualSchedule.length===0?(
-                <div style={{padding:"24px 12px",textAlign:"center",color:C.txM,fontSize:_rem(13),
+                <div style={{padding:"24px 12px",textAlign:"center",color:C.txM,fontSize:FS.sm,
                   background:C.bg,borderRadius:6,border:`1px dashed ${C.bdr}`}}>
                   No weeks yet. Pick a skill above to start, or seed from a strategy.
                 </div>
@@ -6880,19 +7039,19 @@ export default function App(){
                     }
                     return rows.map((row,si)=>(
                       <div key={si} style={{display:"flex",alignItems:"center",gap:6}}>
-                        <span style={{fontSize:_rem(12),color:C.txM,fontFamily:_ft,minWidth:78,letterSpacing:"0.04em"}}>
+                        <span style={{fontSize:FS.xs,color:C.txM,fontFamily:_ft,minWidth:78,letterSpacing:"0.04em"}}>
                           SEASON {si+1}
                         </span>
-                        <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
+                        <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
                           {row.map(({sk,idx})=>{
                             const isWasted=wastedIdx.has(idx);
                             return(
                             <button key={idx} aria-label={`Week ${idx+1}: ${sk}${isWasted?", wasted":""}. Delete this week.`} onClick={()=>manualDeleteAt(idx)}
                               title={isWasted
-                                ?`Week ${idx+1}: ${sk} — WASTED (skill already maxed; direct XP burns against the ceiling, GT still flows). Click to delete.`
+                                ?`Week ${idx+1}: ${sk} — WASTED (skill already maxed; direct training is lost against the ceiling, general training still flows). Click to delete.`
                                 :`Week ${idx+1}: ${sk} (click to delete)`}
                               style={{
-                                padding:"4px 8px",borderRadius:4,fontSize:_rem(12),fontFamily:_ft,fontWeight:700,
+                                padding:"4px 8px",borderRadius:4,fontSize:FS.xs,fontFamily:_ft,fontWeight:700,
                                 background:isWasted?C.red+"22":SK_COLORS[sk]+"22",
                                 color:isWasted?C.red:SK_COLORS[sk],
                                 border:`1px solid ${isWasted?C.red:SK_COLORS[sk]}`,
@@ -6903,21 +7062,21 @@ export default function App(){
                               }}
                               onMouseEnter={e=>{e.target.style.transform="scale(1.08)";e.target.style.boxShadow=`0 0 0 2px ${C.red}66`;}}
                               onMouseLeave={e=>{e.target.style.transform="scale(1)";e.target.style.boxShadow="none";}}>
-                              <div style={{fontSize:_rem(12),color:isWasted?C.red:C.txD,marginBottom:1}}>{isWasted?"✗":idx+1}</div>
+                              <div style={{fontSize:FS.xs,color:isWasted?C.red:C.txD,marginBottom:2}}>{isWasted?"✗":idx+1}</div>
                               {SN[sk]}
                             </button>
                           );})}
                           {/* Pad row to 13 chips so seasons line up visually */}
                           {row.length<13&&Array.from({length:13-row.length}).map((_,k)=>(
-                            <div key={"pad"+k} style={{minWidth:44,padding:"4px 8px",fontSize:_rem(12)}}/>
+                            <div key={"pad"+k} style={{minWidth:44,padding:"4px 8px",fontSize:FS.xs}}/>
                           ))}
                         </div>
                       </div>
                     ));
                   })()}
                   {manualResult&&manualResult.wastedWeeks>0&&(
-                    <div style={{fontSize:_rem(12),color:C.red,marginTop:2}}>
-                      ✗ {manualResult.wastedWeeks} wasted week{manualResult.wastedWeeks===1?"":"s"} — assigned skill already maxed (direct XP lost; GT to other skills still delivered)
+                    <div style={{fontSize:FS.xs,color:C.red,marginTop:2}}>
+                      ✗ {manualResult.wastedWeeks} wasted week{manualResult.wastedWeeks===1?"":"s"} — assigned skill already maxed (direct training lost; general training to the other skills still delivered)
                     </div>
                   )}
                 </div>
@@ -6932,7 +7091,7 @@ export default function App(){
             <div style={{...sC,marginTop:4,padding:exportOpen?"16px 20px":"0"}}>
               <button aria-expanded={exportOpen} onClick={()=>setExportOpen(o=>!o)} style={{
                 background:"transparent",border:"none",color:C.txD,fontFamily:_fs,
-                fontWeight:600,fontSize:_rem(13),cursor:"pointer",width:"100%",textAlign:"left",
+                fontWeight:600,fontSize:FS.sm,cursor:"pointer",width:"100%",textAlign:"left",
                 padding:exportOpen?"0 0 10px":"12px 20px",letterSpacing:0.3}}>
                 {exportOpen?"▾":"▸"} 💾 Save / export calibration bundle
               </button>
@@ -6942,10 +7101,10 @@ export default function App(){
               <div style={sC}>
                 <div style={{...sL,display:"flex",alignItems:"center",gap:8}}>What's in the bundle {hb("bundleWhat","The calibration bundle")}</div>
                 {ht("bundleWhat",<>A self-contained JSON file describing this player's current state plus, if you loaded training history, the full weekly record. The desktop calibration tool consumes it directly.</>)}
-                <ul style={{fontSize:_rem(13),color:C.txD,lineHeight:1.7,marginTop:8,paddingLeft:20}}>
+                <ul style={{fontSize:FS.sm,color:C.txD,lineHeight:1.7,marginTop:8,paddingLeft:20}}>
                   <li><b style={{color:C.tx}}>Snapshot</b> — current skills and your sub-level estimates, age, YS talent, position, horizon you planned for.</li>
                   <li><b style={{color:C.tx}}>Reports</b> — {historyReports?`${historyReports.length} weekly training records (week ${historyReports[0].week} → ${historyReports[historyReports.length-1].week})`:"empty (no training history loaded — load it on Stage 1 for richer calibration)"}.</li>
-                  <li><b style={{color:C.tx}}>Plans</b> — {displayResults?`${Object.keys(displayResults).length} simulated strategy${Object.keys(displayResults).length>1?"ies":""} available, pick which to include below`:"none (run simulations on the Plan stage first)"}.</li>
+                  <li><b style={{color:C.tx}}>Plans</b> — {displayResults?`${Object.keys(displayResults).length} simulated strateg${Object.keys(displayResults).length>1?"ies":"y"} available, pick which to include below`:"none (run simulations on the Plan stage first)"}.</li>
                   <li><b style={{color:C.tx}}>Player ID</b> — {pid&&/^\d+$/.test(pid)?pid:historyMeta?.player_id?historyMeta.player_id:"not set (the file will use the player name instead)"}.</li>
                 </ul>
               </div>
@@ -6963,18 +7122,18 @@ export default function App(){
                       const len=r.log?r.log.length:0;
                       return(
                         <label key={k} style={{
-                          display:"flex",alignItems:"center",gap:10,cursor:"pointer",
-                          padding:"8px 10px",borderRadius:6,
+                          display:"flex",alignItems:"center",gap:8,cursor:"pointer",
+                          padding:"8px 8px",borderRadius:6,
                           background:sel?(r.isSale?C.warn+"15":C.acc+"15"):C.bg,
                           border:`1px solid ${sel?(r.isSale?C.warn:C.acc):C.bdr}`,
                         }}>
                           <input type="checkbox" checked={sel}
                             onChange={()=>setPlanExportSel(s=>({...s,[k]:!s[k]}))}
                             style={{cursor:"pointer",accentColor:r.isSale?C.warn:C.acc}}/>
-                          <span style={{flex:1,fontSize:_rem(13),fontWeight:600,color:r.isSale?C.warn:C.acc}}>
+                          <span style={{flex:1,fontSize:FS.sm,fontWeight:600,color:r.isSale?C.warn:C.acc}}>
                             {name} {r.isSale&&"💰"}
                           </span>
-                          <span style={{fontSize:_rem(12),fontFamily:_ft,color:C.txD}}>
+                          <span style={{fontSize:FS.xs,fontFamily:_ft,color:C.txD}}>
                             {len} weeks
                           </span>
                         </label>
@@ -6988,7 +7147,7 @@ export default function App(){
                 <div style={sL}>Bundle preview</div>
                 <pre style={{
                   background:C.bg,border:`1px solid ${C.bdr}`,borderRadius:6,
-                  padding:12,fontSize:_rem(12),fontFamily:_ft,color:C.txD,
+                  padding:12,fontSize:FS.xs,fontFamily:_ft,color:C.txD,
                   maxHeight:200,overflow:"auto",margin:"8px 0 0",lineHeight:1.5,
                 }}>
 {JSON.stringify({
@@ -7014,17 +7173,17 @@ export default function App(){
               </div>
 
               <div style={sC}>
-                <button onClick={handleExportBundle} style={{...sB,width:"100%",fontSize:_rem(15),padding:"14px 20px",
+                <button onClick={handleExportBundle} style={{...sB,width:"100%",fontSize:FS.md,padding:"16px 20px",
                   background:historyReports?C.pop:C.accFill,color:historyReports?C.onFill:"#fff"}}>
                   ⬇ Download Calibration Bundle (.json)
                 </button>
-                <div style={{fontSize:_rem(12),color:C.txM,marginTop:10,lineHeight:1.5}}>
+                <div style={{fontSize:FS.xs,color:C.txM,marginTop:8,lineHeight:1.5}}>
                   {(()=>{
                     const planCount=displayResults?Object.keys(displayResults).filter(k=>planExportSel[k]).length:0;
                     const reportCount=historyReports?historyReports.length:0;
-                    if(reportCount>0&&planCount>0)return `Bundle includes ${reportCount} training weeks and ${planCount} planned strategy${planCount>1?"ies":""}. Re-load it later to compare predictions against new training data.`;
+                    if(reportCount>0&&planCount>0)return `Bundle includes ${reportCount} training weeks and ${planCount} planned strateg${planCount>1?"ies":"y"}. Re-load it later to compare predictions against new training data.`;
                     if(reportCount>0)return `Bundle includes ${reportCount} training weeks. Run simulations on the Plan stage to also save your strategies.`;
-                    if(planCount>0)return `Bundle includes ${planCount} planned strategy${planCount>1?"ies":""}, but no training history. Add training history on Stage 1 to make calibration possible.`;
+                    if(planCount>0)return `Bundle includes ${planCount} planned strateg${planCount>1?"ies":"y"}, but no training history. Add training history on Stage 1 to make calibration possible.`;
                     return "Bundle includes the current snapshot only. Loading training history on Stage 1 and running simulations on Stage 2 makes the bundle dramatically more useful.";
                   })()}
                 </div>
@@ -7036,8 +7195,16 @@ export default function App(){
         </div>
       )}
 
-      <div style={{marginTop:24,textAlign:"center",fontSize:_rem(12),color:C.txM}}>
-        Sokker Training Planner v37 · coupled engine K15.2 · unified 100/18 DB axis · desktop-parity chain estimator · auto current-week · Calibration corpus enabled
+      <div style={{marginTop:24,textAlign:"center",fontSize:FS.xs,color:C.txM}}>
+        <button type="button" aria-expanded={!!disc.about} onClick={()=>setDisc(o=>({...o,about:!o.about}))}
+          style={{background:"transparent",border:"none",color:C.txM,fontFamily:_fs,fontSize:FS.xs,cursor:"pointer",padding:"6px 8px"}}>
+          Sokker Training Planner v38 · {disc.about?"hide details":"about this version"}
+        </button>
+        {disc.about&&(
+          <div style={{marginTop:4,lineHeight:1.6}}>
+            Coupled training engine, K 15.2 · one 0–100 DB axis, 100/18 per level · chain talent estimator, the same as the desktop app · head-coach input · current week set automatically · calibration corpus enabled
+          </div>
+        )}
       </div>
 
       {/* Mobile responsiveness — collapse 2-col grids below 720px */}
