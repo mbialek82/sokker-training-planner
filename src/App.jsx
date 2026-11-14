@@ -1,7 +1,69 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOKKER TRAINING PLANNER v38 — one scale, plain words, light theme, progress
+// SOKKER TRAINING PLANNER v39 — pop landing, age step, expected intensity,
+// re-tracking
+//
+// v39, second part (13 Nov 2026, before upload).  Design §11–§13, decisions
+// 8–13.  UI and page state only: the engine block below this comment is the
+// one gated on 12 Nov, unchanged.
+//  5. RE-TRACKING.  The sub-skill tracker ran once, at the talent in the
+//     field when the history was loaded (YS 3.50 unless typed first), and
+//     never again.  The sub-levels in use are now simulateSubskills at the
+//     talent the plan runs at and the head coach, recomputed whenever the
+//     history, the talent or the coach changes.  A half-typed talent keeps
+//     the last complete one.  Sub-levels dragged or typed (or from a card or
+//     a bundle) stay; a line under the skill editor shows the tracked values
+//     with "Use tracked values".
+//  6. TALENT FOLLOWS THE ESTIMATE.  After a history load the talent field
+//     takes the estimate (Apply's rounding) whenever it has a verdict, and
+//     follows it.  A typed talent or a preset stays; Apply returns to
+//     following.  A load clears both hand-set states.  A bundle's stored
+//     talent and sub-levels come back as set by hand.
+//  7. WEEK-BY-WEEK LOG.  Open by default on the Projected card's strategy,
+//     follows that card, stays open across reruns; titled "Week by week —
+//     pops each week".  The CSV button downloads the schedule the log shows.
+//  8. BUNDLE COACH (decision 14, 14 Nov 2026).  A bundle load restores the
+//     head coach the bundle stores (coach_db, carried since v19, never read
+//     back before); the restored plans use it.  Without one the field keeps
+//     its value.
+//  9. CORPUS ROW (decision 15, 14 Nov 2026).  The row sent on a history load
+//     carries the talent the page uses right after the load (the followed
+//     estimate, else the field) and the sub-levels tracked there — no longer
+//     the field as it stood when Load was pressed, which for a second player
+//     was the first player's talent.  The estimate is computed once and
+//     shared with the page (one-entry cache).  Rest of the row unchanged.
+//
+// v39 (Nov 2026), base v38.  Design: PLANNER_HANDOFF_DESIGN_v1.md (seven
+// decisions, manager, 12 Nov 2026).  Measured with planner_backtest_v3.mjs on
+// the 12 Nov corpus.  The talent estimate is identical to v38 for every
+// cached history: nothing below touches the estimator.
+//
+//  1. POP LANDING (_updateStates).  At a confirmed pop the page's sub-skill
+//     tracker now carries the real surplus over the boundary, or
+//     _UNDER_POP_CARRY_FRAC (0.5) x the week's gain when the model was still
+//     short — the rule subskill.py v5.19 and _mkReplayNetFn already use.
+//     v38 landed at about zero and dropped the fractional buffer, so every
+//     skill started ~0.06 level short and the planner ran ~0.3 week late.
+//     The no-pop rule (park one unit below the boundary) is KEPT on purpose:
+//     with the desktop's 0.99 park as well, the planner ran 0.5–0.9 week
+//     early and predicted 7–14% more pops than happened.
+//  2. AGE STEP.  _scAgeBias (non-pace: +1% required XP from 25, +12% from
+//     27; the estimator has applied it since v32) now also prices the
+//     planner's thresholds (_dt, and the next-pops walk) and the tracker's
+//     weekly gain (_dbGainPerWeek).  Nothing changes under 25 or for pace.
+//  3. EXPECTED INTENSITY.  The standard week was fixed at intensity 96
+//     (89 / 13 XP at coach 93); real individual weeks have a median of 99.
+//     It is now a planner setting, 50–100, one value per plan:
+//     _setCoach(c) became _setRates(c,i) and every simulation entry point
+//     takes it.  On a history load it is prefilled with the median intensity
+//     of the player's last 10 individual-training weeks (_ownIntensity; 96
+//     without one).  Bundles carry expected_intensity.
+//  4. DROP-AGE NOTE.  The planner does not model decline.  When the horizon
+//     reaches age 28 the Plan stage says from which plan week pace, and from
+//     30 the other skills, are past their drop age.  Text only.
+//  Not re-measured: the next-pops card's own hit rates (its help text),
+//  which date from the fixed 96 and no age step.
 //
 // v38 (Nov 2026), base v37.  UI, plus one engine REFACTOR with no change of
 // result: optimizeBlockOrder is split into _blockOrderPrep / _blockOrderOne /
@@ -977,17 +1039,27 @@ const SN={pace:"PAC",technique:"TEC",passing:"PAS",defending:"DEF",playmaking:"P
 // v19 (recovered in v28): simulator XP constants are COACH-PARAMETRIZED.
 // _XD/_XG keep their historical values at the default coach 93 (89 / 13;
 // the baked-in I=96 standard week is unchanged) and are recomputed by
-// _setCoach(c), which every top-level sim entry point calls — the coach can
+// _setRates(c,i) (v39; _setCoach(c) before), which every top-level sim entry
+// point calls — the coach can
 // no longer leak between runs.  The ESTIMATOR path is parametrized
 // separately via options.coachDb → _weekXpContribution (per-record
 // intensities, exact).
 let _COACH_LIVE=_K1;
+// v39: the standard week's intensity is a setting.  _K2 (96, one 90-minute
+// official match) stays the default; _INT_LIVE is what the last simulation
+// ran at, as _COACH_LIVE is for the coach.
+let _INT_LIVE=_K2;
 let _XD=Math.round(_K2*_K1/100);
 let _XG=Math.round(_K2*_K1*15/10000);
-function _setCoach(c){
+function _clampIntensity(i){
+  const v=i==null?NaN:Math.round(Number(i));
+  return isFinite(v)?Math.max(50,Math.min(100,v)):_K2;
+}
+function _setRates(c,i){
   _COACH_LIVE=Math.max(30,Math.min(120,Math.round(c??_K1)));
-  _XD=Math.round(_K2*_COACH_LIVE/100);
-  _XG=Math.round(_K2*_COACH_LIVE*15/10000);
+  _INT_LIVE=_clampIntensity(i);
+  _XD=Math.round(_INT_LIVE*_COACH_LIVE/100);
+  _XG=Math.round(_INT_LIVE*_COACH_LIVE*15/10000);
 }
 
 // Coupled threshold constants (constants.py v8+: COUPLED_K_DEFAULT=16.0,
@@ -1072,7 +1144,11 @@ function _dtRaw(sk,lv,a){
   }
   return t*h/3;
 }
-function _dt(sk,lv,a,te){return _dtRaw(sk,lv,a)/te;}
+// v39: the planner's threshold carries the estimator's age correction
+// (_scAgeBias: non-pace, +1% from 25, +12% from 27).  The talent the planner
+// is fed was fitted with it; simulating without it under-priced those levels.
+// _dt is the SIMULATION's threshold only — the estimator reads _dtRaw.
+function _dt(sk,lv,a,te){return _dtRaw(sk,lv,a)*(1+_scAgeBias(a,sk))/te;}
 function _duc(sk,lv,a,te){return _dt(sk,lv,a,te)/_U;}
 function _mk(lv,du=0,xp=0){return{lv,du,xp};}
 function _mkSub(lv,sub,sk,a,te){
@@ -1455,8 +1531,8 @@ const STRATS={
 };
 
 // ─── Core Simulation ───────────────────────────────────────────────────────
-function runPlan(skills,td,age,ssw,pos,strat,weeks,subs,coachDb){
-  _setCoach(coachDb);
+function runPlan(skills,td,age,ssw,pos,strat,weeks,subs,coachDb,expI){
+  _setRates(coachDb,expI);
   const prof=POS[pos],fn=STRATS[strat].fn,te=_te(td);
   const st=_initSt(skills,age,te,subs);
   const startSk={};for(const sk of OS)startSk[sk]=st[sk].lv;
@@ -1485,8 +1561,8 @@ function runPlan(skills,td,age,ssw,pos,strat,weeks,subs,coachDb){
 }
 
 // v8.4: drive the same engine off an explicit schedule (Manual Schedule Builder)
-function runPlanFromSchedule(skills,td,age,ssw,pos,schedule,subs,coachDb){
-  _setCoach(coachDb);
+function runPlanFromSchedule(skills,td,age,ssw,pos,schedule,subs,coachDb,expI){
+  _setRates(coachDb,expI);
   const prof=POS[pos],te=_te(td);
   const st=_initSt(skills,age,te,subs);
   const startSk={};for(const sk of OS)startSk[sk]=st[sk].lv;
@@ -1555,8 +1631,8 @@ function _buildRR(n,prof){
   if(!cr.length)return OS.slice(0,n);return Array.from({length:n},(_,i)=>cr[i%cr.length]);
 }
 
-function runSaleOpt(skills,td,age,deadWeeks,pos,subs,ssw,maxExt=3,coachDb){
-  _setCoach(coachDb);
+function runSaleOpt(skills,td,age,deadWeeks,pos,subs,ssw,maxExt=3,coachDb,expI){
+  _setRates(coachDb,expI);
   const prof=POS[pos],te=_te(td);
   const wsk=OS.filter(sk=>(prof.w[sk]||0)>0);
   let best=_buildRR(deadWeeks,prof),extUsed=0,totSwaps=0;
@@ -1713,9 +1789,9 @@ function _blockOrderFinish(out){
   if(out.orders.length&&out.orders[0].weeks!=null)out.best=out.orders[0];
   return out;
 }
-function optimizeBlockOrder(skills,td,age,ssw,targets,subs,coachDb,gtAware){
+function optimizeBlockOrder(skills,td,age,ssw,targets,subs,coachDb,gtAware,expI){
   if(gtAware==null)gtAware=true;
-  _setCoach(coachDb);
+  _setRates(coachDb,expI);
   const{eff,keys,capWeeks}=_blockOrderPrep(skills,age,targets);
   const out={targets:eff,orders:[],best:null};
   if(!keys.length)return out;
@@ -2023,7 +2099,8 @@ function _canonThr(skill,level,age){
 function _dbGainPerWeek(td,skill,level,age,intensity,coachEff){
   if(skill==="stamina")return 0.0;
   if(level>=_LEVELS_STD)return 0.0;
-  const thr=_canonThr(skill,level,age)/(_talEffSenior(td)/100.0);
+  // v39: priced with the same age correction as the estimator and _dt
+  const thr=_canonThr(skill,level,age)*(1+_scAgeBias(age,skill))/(_talEffSenior(td)/100.0);
   if(!(thr>0)||!isFinite(thr))return 0.0;
   const xp=Math.round(intensity*coachEff*_COACH_DB/100.0);   // integer XP
   if(xp<=0)return 0.0;
@@ -2246,14 +2323,26 @@ function _updateStates(states,tw,td,coachEff,formationFallback,isGk){
     const popped=(tw.skillsChange[sk]||0)>0||newLevel>state.level;
     const gain=_weekGain(state,tw,td,coachEff,formSk,isGk);
     if(popped){
-      const earned=_stateAddGain(state,gain);
-      const totalAccum=state.dbAccum+earned;
-      const thresh=_stateThreshold(state);
-      const carry=Math.max(0,totalAccum-thresh);
+      // v39: POP LANDING, as subskill.py v5.19 and _mkReplayNetFn.  The level
+      // was crossed somewhere inside this week, so the new level starts at
+      // the real surplus over the old boundary — or, when the model was
+      // still short of it, at _UNDER_POP_CARRY_FRAC of this week's gain.
+      // v38 computed max(0, whole units − width) and then zeroed the
+      // fractional buffer: the new level started at about zero, every skill
+      // ~0.06 level short, the planner ~0.3 week late (planner_backtest_v3).
+      // The NO-POP branch below is unchanged on purpose: with the desktop's
+      // 0.99 park as well the planner ran 0.5–0.9 week early.
+      const thresh=_stateThreshold(state);            // the OLD level's width
+      const real=state.dbAccum+state.gainBuf+gain;
+      let carry=real>=thresh?real-thresh:_UNDER_POP_CARRY_FRAC*Math.max(0,gain);
       state.level=newLevel;
       const max=sk==="stamina"?_LEVELS_STAM:_LEVELS_STD;
-      state.dbAccum=newLevel>=max?0:carry;
-      state.gainBuf=0.0; // fractional XP doesn't carry across levels
+      if(newLevel>=max){state.dbAccum=0;state.gainBuf=0.0;}
+      else{
+        const tNew=_stateThreshold(state);
+        if(carry>=tNew)carry=tNew*0.999;              // multi-level pop: leftover only
+        state.dbAccum=Math.floor(carry);state.gainBuf=carry-state.dbAccum;
+      }
       state.popsSeen+=1;
       state.weeksAtLv=0;
     }else{
@@ -2317,7 +2406,7 @@ function simulateSubskills(reports,td,coachEff,isGk){
 
 // ─── Calibration Bundle Builder ───────────────────────────────────────────
 function buildBundle(ctx){
-  const{reports,rawText,playerMeta,skills,subs,age,ysTalent,td,pos,weeks,ssw,playerName,plans,prior}=ctx;
+  const{reports,rawText,playerMeta,skills,subs,age,ysTalent,td,pos,weeks,ssw,playerName,plans,prior,expIntensity}=ctx;
   const subsEst={};for(const sk of OS)subsEst[sk]=(subs[sk]??25)/100;
   const lastReport=reports&&reports.length?reports[reports.length-1]:null;
   return{
@@ -2349,6 +2438,7 @@ function buildBundle(ctx){
       engine:`coupled-K16-coach${_COACH_LIVE}`,   // v19: coach-parametrized
       talent_estimator:"chain-v1.1",                // v34 (was "fusion-v2" since v19)
       coach_db:_COACH_LIVE,
+      expected_intensity:expIntensity??_INT_LIVE,   // v39: the standard week's intensity
       external_prior:prior||null,               // v20: [loDb,hiDb] | null
       latest_report_week:lastReport?.week??null,
     },
@@ -2508,6 +2598,37 @@ function _dropEligible(skill,age){
   if(skill==="stamina")return false;
   const t=skill==="pace"?_DROP_AGE_PACE:_DROP_AGE_OTHER;
   return age>=t;
+}
+
+// v39: the player's own recent intensity — the median of the last 10
+// individual-training weeks that trained (the lower middle value for an even
+// count: the rule planner_backtest_v3 measured as "own").  null when the
+// history has no such week.
+function _ownIntensity(reports){
+  if(!reports||!reports.length)return null;
+  const v=[...reports].sort((a,b)=>(a.week||0)-(b.week||0))
+    .filter(r=>((r&&r.kind||{}).name||"")==="individual"&&(r.intensity||0)>0)
+    .slice(-10).map(r=>r.intensity).sort((x,y)=>x-y);
+  if(!v.length)return null;
+  return{value:_clampIntensity(v[Math.floor((v.length-1)/2)]),n:v.length};
+}
+function _intNoteFor(own){
+  return own?`from this player's last ${own.n} individual week${own.n===1?"":"s"} — edit to override`
+    :"no individual-training week in the history — 96 assumed";
+}
+
+// v39: the first plan week (1-based) at which pace, and the other skills, are
+// past their drop age inside a horizon; null when the horizon never gets
+// there.  Same season walk as runPlan (age rises after season week 13).
+function _dropAgeWeeks(age,ssw,weeks){
+  let sw=ssw,a=age,pace=null,rest=null;
+  for(let w=1;w<=weeks;w++){
+    if(pace==null&&_dropEligible("pace",a))pace={week:w,age:a};
+    if(rest==null&&_dropEligible("technique",a))rest={week:w,age:a};
+    if(pace&&rest)break;
+    sw++;if(sw>_SL){sw=1;a++;}
+  }
+  return{pace,rest};
 }
 
 // Per-skill GT XP for one week (training_week.py TrainingWeek.gt_xp).
@@ -4677,6 +4798,25 @@ function _scDisplay(e){
 const DEMO_HISTORY_JSON=JSON.stringify({"reports":[{"week":897,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":9,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":448868}},{"week":898,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":9,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":470480}},{"week":899,"age":20,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":9,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":489376}},{"week":900,"age":20,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":9,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":506352}},{"week":901,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":8,"technique":7,"passing":6,"defending":10,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":0,"striker":0},"playerValue":{"value":530020}},{"week":902,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":8,"technique":8,"passing":6,"defending":10,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":1,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":554944}},{"week":903,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":6,"defending":10,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":1,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":581395}},{"week":904,"age":20,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":6,"defending":10,"playmaking":7,"striker":4,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":600783}},{"week":905,"age":20,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":10,"playmaking":7,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":1,"defending":0,"playmaking":0,"striker":1},"playerValue":{"value":621569}},{"week":906,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":10,"playmaking":7,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":650154}},{"week":907,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":11,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":1,"striker":0},"playerValue":{"value":684292}},{"week":908,"age":20,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":11,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":721420}},{"week":909,"age":20,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":9,"technique":8,"passing":7,"defending":11,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":744264}},{"week":910,"age":21,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":9,"technique":9,"passing":7,"defending":11,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":1,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":757795}},{"week":911,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":9,"passing":7,"defending":11,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":794982}},{"week":912,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":9,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":0,"striker":0},"playerValue":{"value":831742}},{"week":913,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":9,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":866958}},{"week":914,"age":21,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":9,"technique":9,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":889557}},{"week":915,"age":21,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":9,"technique":9,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":912683}},{"week":916,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":9,"technique":9,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":950862}},{"week":917,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":1,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":991064}},{"week":918,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":12,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1033419}},{"week":919,"age":21,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":0,"striker":0},"playerValue":{"value":1058626}},{"week":920,"age":21,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1085864}},{"week":921,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1137789}},{"week":922,"age":21,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1192999}},{"week":923,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1226679}},{"week":924,"age":22,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":10,"technique":9,"passing":7,"defending":13,"playmaking":8,"striker":5,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1253437}},{"week":925,"age":22,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":7,"defending":13,"playmaking":8,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":1,"passing":0,"defending":0,"playmaking":0,"striker":1},"playerValue":{"value":1281447}},{"week":926,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":8,"defending":13,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":1,"defending":0,"playmaking":1,"striker":0},"playerValue":{"value":1338666}},{"week":927,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":0,"striker":0},"playerValue":{"value":1390838}},{"week":928,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1442946}},{"week":929,"age":22,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1471005}},{"week":930,"age":22,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1500475}},{"week":931,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1556068}},{"week":932,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1614130}},{"week":933,"age":22,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":10,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1674775}},{"week":934,"age":22,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":11,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":1,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1707382}},{"week":935,"age":22,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":11,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1740851}},{"week":936,"age":23,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":11,"technique":10,"passing":8,"defending":14,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1763542}},{"week":937,"age":23,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":11,"technique":10,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":1,"playmaking":0,"striker":0},"playerValue":{"value":1828954}},{"week":938,"age":23,"kind":{"name":"individual"},"type":{"name":"defending"},"intensity":100,"skills":{"pace":11,"technique":10,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1899997}},{"week":939,"age":23,"kind":{"name":"individual"},"type":{"name":"pace"},"intensity":100,"skills":{"pace":11,"technique":10,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1935339}},{"week":940,"age":23,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":11,"technique":11,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":1,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":1972010}},{"week":941,"age":23,"kind":{"name":"individual"},"type":{"name":"technique"},"intensity":100,"skills":{"pace":11,"technique":11,"passing":8,"defending":15,"playmaking":9,"striker":6,"stamina":7,"keeper":0,"form":8},"skillsChange":{"pace":0,"technique":0,"passing":0,"defending":0,"playmaking":0,"striker":0},"playerValue":{"value":2011324}}]});
 const _ft="'JetBrains Mono','Fira Code',monospace";
 const _fs="'DM Sans','Segoe UI',system-ui,sans-serif";
+// v39 (decision 8): a talent typed into the YS field counts only when it is a
+// complete number on the scale (3.00 or more); "", "3." or "1" (on the way to
+// "12") do not, and the page keeps the last complete one.
+function _ysParse(s){
+  const t=String(s??"").trim();
+  if(!/^\d+(\.\d+)?$/.test(t))return null;
+  const v=parseFloat(t);
+  return v>=3?v:null;
+}
+// v39 (decisions 10, 15): the YS talent the field follows — the estimate when
+// it has a verdict (the test that enables Apply: no data, no verdict and an
+// open band have none), else null.
+function _estFollowYs(e){
+  if(!e||e.confidence==="no_data"||!isFinite(e.td))return null;
+  const ys=_csYsFromTd(e.td);
+  if(ys==null||!isFinite(ys))return null;
+  const d=_scDisplay(e);
+  return (d.isScore&&(d.unpinned||d.noVerdict))?null:ys;
+}
 
 const YS_PRESETS=[
   {ys:3.00,l:"3.00 (max)"},{ys:3.11,l:"3.11"},{ys:3.30,l:"3.30"},
@@ -4896,7 +5036,7 @@ function SkillEditor({skills,setSkills,subs,setSubs,age,setAge,pos,name,warnings
         padding:"2px 8px",borderRadius:4,
         background:C.card,border:`${d.red?2:1}px solid ${cBd}`,
         fontSize:FS.xs,fontFamily:_ft,
-      }} title={`Talent estimate from training history (${src}): YS ${ivl} (${d.label}). ${d.explain}${flag} Apply on Stage 2.`}>
+      }} title={`Talent estimate from training history (${src}): YS ${ivl} (${d.label}). ${d.explain}${flag} The plan uses it unless a talent is set by hand on Stage 2.`}>
         <span style={{color:C.txM,letterSpacing:0.3,fontFamily:_fs,fontSize:FS.xs,fontWeight:600}}>EST.</span>
         <span style={{color:C.tx,fontWeight:700}}>{ivl}</span>
         <span style={{
@@ -4988,7 +5128,7 @@ function SkillEditor({skills,setSkills,subs,setSubs,age,setAge,pos,name,warnings
 // re-evaluated at the aged value each week).  Band from the talent band.
 // v28: (age0, ssw0) come from _deriveStartV2, so the walk starts on the
 // real calendar for any history (v21 used the boundary-only _deriveStart).
-function _forecastNextPops(reports,tdLo,tdHi,coachDb){
+function _forecastNextPops(reports,tdLo,tdHi,coachDb,expI){
   if(!reports||reports.length<2)return null;
   const hist=[...reports].sort((a,b)=>(a.week||0)-(b.week||0));
   const last=hist[hist.length-1];
@@ -5001,7 +5141,8 @@ function _forecastNextPops(reports,tdLo,tdHi,coachDb){
   const twLast=_parseRecord(last);
   const assumed=twLast.trainedSkill||twLast.formationSkill
     ||_inferFormationSkill(hist)||"pace";
-  const xd=Math.round(96*coachDb/100),xg=Math.round(96*coachDb*15/10000);
+  const _i=_clampIntensity(expI);   // v39: the plan's expected intensity (was a written-in 96)
+  const xd=Math.round(_i*coachDb/100),xg=Math.round(_i*coachDb*15/10000);
   const tws=hist.map(_parseRecord);
   const rows=[];
   const skillsList=isGk?[...OS,"keeper"]:OS;
@@ -5034,7 +5175,7 @@ function _forecastNextPops(reports,tdLo,tdHi,coachDb){
       for(let w=1;w<=156;w++){
         cum+=weekly;sw++;if(sw>_SL){sw=1;a++;}
         if(_dropEligible(sk,a))return null;
-        if(cum>=_dtRaw(sk,lv,a)/eff)return w;
+        if(cum>=_dt(sk,lv,a,eff))return w;   // v39: _dt carries the age step
       }
       return null;
     };
@@ -5051,13 +5192,13 @@ function _forecastNextPops(reports,tdLo,tdHi,coachDb){
   return{rows,assumed,age0,isGk};
 }
 
-function NextPopForecast({reports,tdLo,tdHi,coachDb}){
+function NextPopForecast({reports,tdLo,tdHi,coachDb,expI}){
   const[open,setOpen]=useState(false);   // v36: closed until asked for
   const[hb,ht]=useHelp();
   const fc=useMemo(()=>{
     if(!isFinite(tdLo)||!isFinite(tdHi))return null;
-    return _forecastNextPops(reports,Math.max(1,tdLo),Math.min(100,Math.max(tdLo,tdHi)),coachDb);
-  },[reports,tdLo,tdHi,coachDb]);
+    return _forecastNextPops(reports,Math.max(1,tdLo),Math.min(100,Math.max(tdLo,tdHi)),coachDb,expI);
+  },[reports,tdLo,tdHi,coachDb,expI]);
   if(!fc||!fc.rows.length)return null;
   const cell={padding:"4px 8px",fontFamily:_ft,fontSize:FS.xs};
   // v20 semantics (validated on the half-split corpus): the ASSUMED skill
@@ -5100,14 +5241,14 @@ function NextPopForecast({reports,tdLo,tdHi,coachDb}){
       <div style={{fontSize:FS.xs,color:C.txM,marginTop:6,lineHeight:1.4}}>
         assuming "{SN[fc.assumed]||fc.assumed}" stays the trained skill
       </div>
-      {ht("np",<>A pop is a level-up. Standard week, coach {coachDb}. The trained-skill range spans the talent band; the other skills are projected on general training alone, so theirs are upper bounds. Out of sample the model's pops fall within ±2 weeks 80% of the time (n=767); this card's ranges hold 94% and its bounds 93% of the time.</>)}
+      {ht("np",<>A pop is a level-up. Standard week at intensity {_clampIntensity(expI)}, coach {coachDb}. The trained-skill range spans the talent band; the other skills are projected on general training alone, so theirs are upper bounds. Out of sample the model's pops fall within ±2 weeks 80% of the time (n=767); this card's ranges hold 94% and its bounds 93% of the time.</>)}
       </>)}
     </div>
   );
 }
 
 // ─── Target Build Order card (v18) ─────────────────────────────────────────
-function TargetBuildOrder({skills,td,age,ssw,subsFloat,coachDb,onLoadSchedule,ask,note,onCancelAsk,onUndo}){
+function TargetBuildOrder({skills,td,age,ssw,subsFloat,coachDb,expI,onLoadSchedule,ask,note,onCancelAsk,onUndo}){
   const[tg,setTg]=useState({});
   const[res,setRes]=useState(null);
   const[hb,ht]=useHelp();   // v36
@@ -5138,13 +5279,13 @@ function TargetBuildOrder({skills,td,age,ssw,subsFloat,coachDb,onLoadSchedule,as
     setShowAll(false);
     const p=_blockOrderPrep(skills,age,eff);
     const perms=_permutations(p.keys);
-    if(perms.length<=24){setProg(null);setRes(optimizeBlockOrder(skills,td,age,ssw,eff,subsFloat,coachDb));return;}
+    if(perms.length<=24){setProg(null);setRes(optimizeBlockOrder(skills,td,age,ssw,eff,subsFloat,coachDb,null,expI));return;}
     const out={targets:p.eff,orders:[],best:null};
     let i=0;
     setRes(null);setProg({done:0,total:perms.length});
     const step=()=>{
       if(runId.current!==id)return;            // cancelled, superseded or unmounted
-      _setCoach(coachDb);                      // every slice: another computation may have run in between
+      _setRates(coachDb,expI);                 // every slice: another computation may have run in between
       const t0=Date.now();
       while(i<perms.length&&Date.now()-t0<50)out.orders.push(_blockOrderOne(perms[i++],p.eff,skills,td,age,ssw,subsFloat,p.capWeeks,true));
       if(i<perms.length){setProg({done:i,total:perms.length});setTimeout(step,0);}
@@ -5323,16 +5464,32 @@ export default function App(){
 
   // ─── Skill editor state ────────────────────────────────────────────────
   const[skills,setSkills]=useState({pace:10,technique:8,passing:6,defending:7,playmaking:9,striker:10});
-  const[subs,setSubs]=useState({...DEF_SUBS});
+  // v39 (decisions 8, 9): the page's own sub-levels — typed, dragged, from a
+  // card or a bundle.  `subs` (below the talent estimate) is what is in use:
+  // the tracker's values unless subsHand says the six were set another way.
+  const[subsRaw,setSubs]=useState({...DEF_SUBS});
+  const[subsHand,setSubsHand]=useState(false);   // false = follow the tracker | "hand" | "card" | "bundle"
   const[age,setAge]=useState(20);
   const[coachDb,setCoachDb]=useState(93);   // v19: head-coach DB (93 = unearthly assumption)
+  // v39: expected intensity of a standard week.  96 (one full official match)
+  // until a history is loaded; then the player's own recent median (decision 4).
+  const[expIntensity,setExpIntensity]=useState(96);
+  const[intNote,setIntNote]=useState("");     // where the value came from
+  const[intDraft,setIntDraft]=useState(null); // the field's text while typing; null = show the value in use
   // v20: external talent prior (SkTables / other tool)
   const[priorRaw,setPriorRaw]=useState("");
   const[priorScale,setPriorScale]=useState("senior");
   const[hasPlayerData,setHasPlayerData]=useState(false);
 
   // ─── Stage 2: simulation params + results ──────────────────────────────
-  const[ysTalent,setYsTalent]=useState("3.50");
+  // v39 (decision 10): the talent field's own text — typed, a preset, a
+  // bundle.  `ysTalent` (below the talent estimate) is what the field shows
+  // and the plan uses: the history estimate unless talentHand is set.  A
+  // half-typed talent ("", "3.", "1") keeps the last complete one (decision 8).
+  const[ysRaw,_setYsRaw]=useState("3.50");
+  const[ysLastOk,setYsLastOk]=useState(3.5);
+  const[talentHand,setTalentHand]=useState(false);   // false = follow the estimate | "hand" | "bundle"
+  const setYsTalent=useCallback(s=>{_setYsRaw(s);const v=_ysParse(s);if(v!=null)setYsLastOk(v);},[]);
   const[pos,setPos]=useState("ATT");
   const[weeks,setWeeks]=useState(52);
   // v27: even before any player loads, the season week defaults to TODAY'S
@@ -5343,7 +5500,10 @@ export default function App(){
   const[seasonNote,setSeasonNote]=useState("");
   const[selStrats,setSelStrats]=useState(["round_robin","closest_to_pop","sale_optimizer"]);
   const[results,setResults]=useState(null);
-  const[showLog,setShowLog]=useState(null);
+  // v39 (decision 12): the week-by-week log is open by default and shows the
+  // Projected card's strategy; logPick = a strategy clicked in the log itself.
+  const[logOpen,setLogOpen]=useState(true);
+  const[logPick,setLogPick]=useState(null);
   // v15: which strategy drives the Projected card. Set to best weighted
   // score on each run (initial state only — user overrides by clicking a
   // strategy column header in the comparison table).
@@ -5376,11 +5536,8 @@ export default function App(){
   const[manualSeedFrom,setManualSeedFrom]=useState("round_robin");
 
   // ─── Derived values (declared before callbacks for TDZ safety) ─────────
-  const ysNum=parseFloat(ysTalent)||3.5;
-  const td=_fromYS(Math.max(3.0,ysNum));
-  const subsFloat=useMemo(()=>{
-    const o={};for(const sk of OS)o[sk]=(subs[sk]??25)/100;return o;
-  },[subs]);
+  // v39: ysNum / td / subs / subsFloat moved below the talent estimate — the
+  // talent in use now depends on it (decision 10).
 
   // v12: gap-based talent estimate from training history. Memoised on
   // historyReports — recomputed whenever the user (re)loads history.
@@ -5400,21 +5557,69 @@ export default function App(){
     if(!isFinite(a)||!isFinite(b))return null;
     return[Math.max(0,Math.min(a,b)),Math.min(100,Math.max(a,b))];
   },[priorRaw,priorScale]);
+  // v39 (decision 15): one-entry cache, so the history load (which needs the
+  // estimate for the corpus row and the tracker's first run) and this memo
+  // compute it once.  Keyed on the reports array itself, the coach and the
+  // prior band object.
+  const estCacheRef=useRef(null);
+  const estFor=useCallback((reps,c,pr)=>{
+    const k=estCacheRef.current;
+    if(k&&k.reps===reps&&k.c===c&&k.pr===pr)return k.est;
+    const est=estimateTalentCombined(reps,{coachDb:c,prior:pr});
+    estCacheRef.current={reps,c,pr,est};
+    return est;
+  },[]);
   const talentEstimate=useMemo(()=>{
     if(!historyReports||!historyReports.length)return null;
-    return estimateTalentCombined(historyReports,{coachDb,prior:priorBand}); // v19/v20
-  },[historyReports,coachDb,priorBand]);
+    return estFor(historyReports,coachDb,priorBand); // v19/v20
+  },[historyReports,coachDb,priorBand,estFor]);
   // YS-standard scale value the Apply button writes to the input.
   // _csYsFromTd matches the inverse of _fromYS — round-trips cleanly.
   const estYs=talentEstimate&&isFinite(talentEstimate.td)
     ?_csYsFromTd(talentEstimate.td):null;
+  // v39 (decision 10): the talent field follows the estimate while it has a
+  // verdict and no talent was set by hand since the last load.  The verdict
+  // test is the one that enables Apply (no data, no verdict, open band: none).
+  const estCanApply=useMemo(()=>_estFollowYs(talentEstimate)!=null,[talentEstimate]);
+  const talentFollow=!!historyReports&&!talentHand&&estCanApply;
+  const ysTalent=talentFollow?estYs.toFixed(2):ysRaw;   // what the field shows (Apply's rounding)
+  const ysNum=talentFollow?parseFloat(ysTalent):ysLastOk;
+  const td=_fromYS(Math.max(3.0,ysNum));
+  // v39 (decisions 8, 9): the sub-skill tracker at the talent the plan runs at
+  // and the head coach — again whenever the history, the talent or the coach
+  // changes.  Same call and rounding as the history load.
+  const trackedSubs=useMemo(()=>{
+    if(!historyReports||!historyReports.length)return null;
+    const sim=simulateSubskills(historyReports,td,coachDb/93);
+    if(!sim||!sim.subskills)return null;
+    const o={};
+    for(const s of OS)o[s]=Math.max(0,Math.min(99,Math.round((sim.subskills[s]??0.25)*100)));
+    return o;
+  },[historyReports,td,coachDb]);
+  const subs=(!subsHand&&trackedSubs)?trackedSubs:subsRaw;
+  const subsFloat=useMemo(()=>{
+    const o={};for(const sk of OS)o[sk]=(subs[sk]??25)/100;return o;
+  },[subs]);
+  // Keep the field's own text and the page's own sub-levels equal to what is
+  // in use while following, so a later "no verdict" (or a card paste) starts
+  // from what was on screen, not from an older value.
+  useEffect(()=>{if(talentFollow&&ysRaw!==ysTalent)setYsTalent(ysTalent);},[talentFollow,ysTalent,ysRaw,setYsTalent]);
+  useEffect(()=>{
+    if(!subsHand&&trackedSubs&&OS.some(s=>subsRaw[s]!==trackedSubs[s]))setSubs(trackedSubs);
+  },[subsHand,trackedSubs,subsRaw]);
+  // The skill editor's setter: the first edit since a load starts from the
+  // values on screen and marks the six as set by hand (decision 9).
+  const editSubs=useCallback(fn=>{
+    setSubs(subsHand?fn:(typeof fn==="function"?fn(subs):fn));
+    setSubsHand("hand");
+  },[subsHand,subs]);
 
   // v8.4: Manual Schedule auto-resimulates whenever the schedule or player state changes.
   // Declared before any callback that references it (TDZ safety).
   const manualResult=useMemo(()=>{
     if(!manualEnabled||manualSchedule.length===0)return null;
-    return runPlanFromSchedule(skills,td,age,ssw,pos,manualSchedule,subsFloat,coachDb);
-  },[manualEnabled,manualSchedule,skills,td,age,ssw,pos,subsFloat,coachDb]); // v28: coachDb dep (v21 omission)
+    return runPlanFromSchedule(skills,td,age,ssw,pos,manualSchedule,subsFloat,coachDb,expIntensity);
+  },[manualEnabled,manualSchedule,skills,td,age,ssw,pos,subsFloat,coachDb,expIntensity]); // v28: coachDb dep (v21 omission)
 
   // Merged view that the comparison table iterates over: stored results + manual.
   const displayResults=useMemo(()=>{
@@ -5489,6 +5694,7 @@ export default function App(){
     }else{
       setSubs({...DEF_SUBS});
     }
+    setSubsHand("card");   // v39: the card's sub-levels stay, even with a history loaded earlier
     setPlayerName(p.name||"");setPlayerWarnings(p.warnings||[]);
     setHasPlayerData(true);
   },[paste]); // v27: ssw is now derived from the clock inside, not read from state
@@ -5506,6 +5712,13 @@ export default function App(){
     const meta=text.trim().startsWith("<")?detectPlayerMeta(text):{};
     setDemoMode(!!opts.demo);
     setHistoryReports(reports);setHistoryMeta(meta);
+    // v39 (decisions 9, 10): a load clears the hand-set state — the talent
+    // field follows this history's estimate and the sub-levels its tracker.
+    setTalentHand(false);setSubsHand(false);
+    // v39 (decision 4): the standard week runs at this player's own recent intensity
+    const ownInt=_ownIntensity(reports);
+    const expNow=ownInt?ownInt.value:96;
+    setExpIntensity(expNow);setIntDraft(null);setIntNote(_intNoteFor(ownInt));
     const last=reports[reports.length-1];
     if(last){
       // v27: absolute-week + clock derivation (see _deriveStartV2).  Demo
@@ -5536,7 +5749,12 @@ export default function App(){
       setSkills(sk);
       // v7.2: full forward simulation per skill (replaces the uniform estimate)
       // Falls back to the uniform estimate if sim returns null (no value, no anchor).
-      const tdNow=_fromYS(Math.max(3.0,parseFloat(ysTalent)||3.5));
+      // v39 (decision 15): the talent the page uses right after this load —
+      // the estimate when it has a verdict, else the field — for the tracker's
+      // first run and the corpus row.  estFor shares the estimate with the page.
+      const ysFollowL=_estFollowYs(estFor(reports,coachDb,priorBand));
+      const ysLoad=ysFollowL!=null?ysFollowL.toFixed(2):ysTalent;
+      const tdNow=_fromYS(Math.max(3.0,ysFollowL!=null?parseFloat(ysLoad):ysNum));
       const sim=simulateSubskills(reports,tdNow,coachDb/93 /*v19*/);
       if(sim&&sim.subskills){
         const newSubs={};
@@ -5586,7 +5804,7 @@ export default function App(){
           skills:sk,
           subs:subsForBundle,
           age:last.age||21,
-          ysTalent,td:tdNow,pos,weeks,ssw,
+          ysTalent:ysLoad,td:tdNow,pos,weeks,ssw,expIntensity:expNow,   // v39: the talent the page uses (decision 15)
           playerName:meta?.name||playerName,
           plans:corpusPlans,
         });
@@ -5597,7 +5815,7 @@ export default function App(){
         });
       }
     }
-  },[playerName,ysTalent,shareEnabled,pos,weeks,ssw,pid,results,coachDb,priorBand]); // v28: coachDb/priorBand deps (v21 omission)
+  },[playerName,ysTalent,ysNum,estFor,shareEnabled,pos,weeks,ssw,pid,results,coachDb,priorBand]); // v28: coachDb/priorBand deps (v21 omission); v39: ysNum, estFor
   const handleLoadHistory=useCallback(()=>applyHistoryText(historyText),[applyHistoryText,historyText]);
 
   // v16: demo player — one-click first experience. Loads the embedded
@@ -5612,8 +5830,8 @@ export default function App(){
 
   // v16: hybrid auto-run. The sim-parameter fingerprint the results were
   // computed against; any live mismatch renders the stale ribbon.
-  const paramKey=useMemo(()=>JSON.stringify([skills,subs,age,ssw,pos,weeks,ysTalent,coachDb,[...selStrats].sort()]),
-    [skills,subs,age,ssw,pos,weeks,ysTalent,coachDb,selStrats]); // v28: coachDb in the fingerprint (v21 omission)
+  const paramKey=useMemo(()=>JSON.stringify([skills,subs,age,ssw,pos,weeks,ysNum,coachDb,expIntensity,[...selStrats].sort()]),
+    [skills,subs,age,ssw,pos,weeks,ysNum,coachDb,expIntensity,selStrats]); // v28: coachDb in the fingerprint (v21 omission); v39: the talent in use, not the field's text
   const resultsStale=!!results&&lastRunKey!==null&&paramKey!==lastRunKey;
 
   // v8.1: load a previously-exported calibration bundle from disk.
@@ -5659,7 +5877,24 @@ export default function App(){
       if(snap.position_assumed)setPos(snap.position_assumed);
       if(snap.horizon_weeks)setWeeks(snap.horizon_weeks);
       if(snap.start_season_week)setSsw(snap.start_season_week);
-      if(snap.ys_talent_user)setYsTalent(String(snap.ys_talent_user));
+      // v39 (decision 11): a stored talent and stored sub-levels come back as
+      // set by hand (Apply / Use tracked values return to following); without
+      // them the page follows the estimate and the tracker, as after a load.
+      if(snap.ys_talent_user){setYsTalent(String(snap.ys_talent_user));setTalentHand("bundle");}
+      else setTalentHand(false);
+      setSubsHand(snap.subskills_estimate?"bundle":false);
+      // v39 (decision 14): the bundle's head coach (stored since v19), clamped as
+      // the field clamps it; the restored plans and the tracker below use it.
+      // A bundle without one leaves the field as it is.
+      const cB=snap.coach_db!=null?Number(snap.coach_db):NaN;
+      const coachRestore=isFinite(cB)?Math.max(30,Math.min(120,Math.round(cB))):coachDb;
+      setCoachDb(coachRestore);
+      // v39: expected intensity — the bundle's own value, else the prefill from its history
+      const ownIntB=_ownIntensity(reports);
+      const hasIntB=snap.expected_intensity!=null&&isFinite(Number(snap.expected_intensity));
+      const expRestore=hasIntB?_clampIntensity(snap.expected_intensity):(ownIntB?ownIntB.value:96);
+      setExpIntensity(expRestore);setIntDraft(null);
+      setIntNote(hasIntB?"from the loaded bundle — edit to override":_intNoteFor(ownIntB));
       // v27: the snapshot's age/ssw were correct at EXPORT time but go stale
       // with every passing week, not just across a season boundary.  The
       // absolute-week + clock derivation overrides them (see _deriveStartV2);
@@ -5689,7 +5924,7 @@ export default function App(){
         setSubs(newSubs);
       }else{
         const tdNow=_fromYS(Math.max(3.0,parseFloat(snap.ys_talent_user||ysTalent)||3.5));
-        const sim=simulateSubskills(reports,tdNow,coachDb/93 /*v19*/);
+        const sim=simulateSubskills(reports,tdNow,coachRestore/93 /*v19; v39: the bundle's coach*/);
         if(sim&&sim.subskills){
           const newSubs={};
           for(const s of OS){
@@ -5724,9 +5959,9 @@ export default function App(){
         const restored={};
         for(const k of planKeys){
           if(k==="sale_optimizer"){
-            restored[k]=runSaleOpt(sk,tdForSim,ageForSim,savedHorizon,savedPos,subFloats,savedSsw,3,coachDb);
+            restored[k]=runSaleOpt(sk,tdForSim,ageForSim,savedHorizon,savedPos,subFloats,savedSsw,3,coachRestore,expRestore);
           }else if(STRATS[k]){
-            restored[k]=runPlan(sk,tdForSim,ageForSim,savedSsw,savedPos,k,savedHorizon,subFloats,coachDb); // v28: coach here too (v21 passed it only to runSaleOpt)
+            restored[k]=runPlan(sk,tdForSim,ageForSim,savedSsw,savedPos,k,savedHorizon,subFloats,coachRestore,expRestore); // v28: coach here too (v21 passed it only to runSaleOpt)
           }
         }
         if(Object.keys(restored).length>0){
@@ -5769,20 +6004,20 @@ export default function App(){
       playerMeta:{...historyMeta,player_id:historyMeta?.player_id||(pid&&/^\d+$/.test(pid)?parseInt(pid,10):null)},
       skills,subs,age,
       ysTalent,td,pos,weeks,ssw,playerName,
-      plans,
+      plans,expIntensity,
     });
     const idPart=pid&&/^\d+$/.test(pid)?pid:(historyMeta?.player_id?`${historyMeta.player_id}`:(playerName||"player").replace(/[^a-zA-Z0-9]+/g,"_").slice(0,40)||"player");
     const ts=new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
     downloadBundle(bundle,`sokker_bundle_${idPart}_${ts}.json`);
-  },[historyReports,historyText,historyMeta,pid,skills,subs,age,ysTalent,td,pos,weeks,ssw,playerName,displayResults,planExportSel,priorBand]); // v28: priorBand dep
+  },[historyReports,historyText,historyMeta,pid,skills,subs,age,ysTalent,td,pos,weeks,ssw,playerName,displayResults,planExportSel,priorBand,expIntensity]); // v28: priorBand dep; v39: expIntensity
 
   const runSim=useCallback(()=>{
     const res={};
     for(const k of selStrats){
-      if(k==="sale_optimizer") res[k]=runSaleOpt(skills,td,age,weeks,pos,subsFloat,ssw,3,coachDb);
-      else res[k]=runPlan(skills,td,age,ssw,pos,k,weeks,subsFloat,coachDb);
+      if(k==="sale_optimizer") res[k]=runSaleOpt(skills,td,age,weeks,pos,subsFloat,ssw,3,coachDb,expIntensity);
+      else res[k]=runPlan(skills,td,age,ssw,pos,k,weeks,subsFloat,coachDb,expIntensity);
     }
-    setResults(res);setShowLog(null);
+    setResults(res);setLogPick(null);   // v39: the log stays open and follows the Projected card
     // v8.3: default-select all newly-computed plans for export
     const sel={};for(const k of Object.keys(res))sel[k]=true;
     setPlanExportSel(sel);
@@ -5791,7 +6026,7 @@ export default function App(){
     if(rk.length)setProjStrat(rk.reduce((a,b)=>wScore(res[a])>=wScore(res[b])?a:b));
     // v16: fingerprint the params these results answer (staleness ribbon)
     setLastRunKey(paramKey);
-  },[skills,td,age,ssw,pos,weeks,selStrats,subsFloat,paramKey,coachDb]); // v28: coachDb dep (v21 omission)
+  },[skills,td,age,ssw,pos,weeks,selStrats,subsFloat,paramKey,coachDb,expIntensity]); // v28: coachDb dep (v21 omission)
 
   // v16: hybrid auto-run — run once when a player first loads (kills the
   // empty results panel). Parameter edits afterwards only mark results
@@ -5852,10 +6087,10 @@ export default function App(){
     // Seed by running the chosen strategy and lifting its schedule
     let seedSched;
     if(manualSeedFrom==="sale_optimizer"){
-      const r=runSaleOpt(skills,td,age,weeks,pos,subsFloat,ssw,3,coachDb);
+      const r=runSaleOpt(skills,td,age,weeks,pos,subsFloat,ssw,3,coachDb,expIntensity);
       seedSched=r.log.map(w=>w.trained);
     }else if(STRATS[manualSeedFrom]){
-      const r=runPlan(skills,td,age,ssw,pos,manualSeedFrom,weeks,subsFloat,coachDb);
+      const r=runPlan(skills,td,age,ssw,pos,manualSeedFrom,weeks,subsFloat,coachDb,expIntensity);
       seedSched=r.log.map(w=>w.trained);
     }else return;
     const seedName=manualSeedFrom==="sale_optimizer"?"Sale Optimizer":(STRATS[manualSeedFrom]?.name||manualSeedFrom);
@@ -5864,7 +6099,7 @@ export default function App(){
     if(manualSchedule.length>0){
       setAskRow({where:"seed",text:`Replace the current schedule (${manualSchedule.length} weeks) with ${seedName} (${seedSched.length} weeks)?`,label:"Replace",run:go});
     }else go();
-  },[manualSeedFrom,skills,td,age,ssw,pos,weeks,subsFloat,manualSchedule.length,_replaceManual,coachDb]); // v28: coachDb dep (v21 omission)
+  },[manualSeedFrom,skills,td,age,ssw,pos,weeks,subsFloat,manualSchedule.length,_replaceManual,coachDb,expIntensity]); // v28: coachDb dep (v21 omission)
 
   const manualToggle=useCallback(()=>{
     setManualEnabled(e=>{
@@ -5959,7 +6194,7 @@ export default function App(){
       {/* v38: title, version, theme.  The engine facts are in the footer ("about this version"). */}
       <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:4,flexWrap:"wrap"}}>
         <span style={{fontSize:isMobile?FS.lg:FS.xl,fontWeight:700,color:C.acc,fontFamily:_ft}}>⚽ Sokker Training Planner</span>
-        <span style={{fontSize:FS.xs,color:C.txM}}>v38</span>
+        <span style={{fontSize:FS.xs,color:C.txM}}>v39</span>
         <label style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:6,fontSize:FS.xs,color:C.txM}}>
           Theme
           <select value={themePref} onChange={e=>pickTheme(e.target.value)}
@@ -6039,7 +6274,8 @@ export default function App(){
               <div style={{fontSize:FS.sm,color:C.txD,lineHeight:1.6}}>
                 Load the player's training history from Sokker. The planner reconstructs every
                 week, fits a talent estimate from the level-up record (point + confidence band),
-                and seeds the subskills via per-skill forward simulation. This is the highest-
+                and seeds the subskills via per-skill forward simulation at the talent the plan
+                runs at — again whenever the talent or the head coach changes. This is the highest-
                 fidelity path, and the only one where the talent number is inferred from data
                 rather than guessed. If you have never fetched a training history before, the
                 planner walks you through it — no technical knowledge required.
@@ -6074,6 +6310,8 @@ export default function App(){
                 ["DB","the planner's fine 0–100 scale. A skill's 18 levels are spread over it, about 5.6 DB per level. Talent is on it too (100 DB = YS 3.00), and so is the head coach (93 DB = unearthly)."],
                 ["General training","the smaller gain that the skills you are not training still get every week."],
                 ["Carry-in","progress toward the next level that has not yet become a level. At a sale it does not show on the card."],
+                ["Expected intensity","how hard a normal week trains, in percent, as the training history shows it. The planner uses one value for the whole plan; with a history loaded it starts at the player's own recent median, otherwise at 96."],
+                ["Drop age","28 for pace, 30 for the other skills. From then on players lose skill with age. The planner does not model that, so what it shows past the drop age is an upper bound that is rarely reached."],
                 ["95% band","the range the talent lies in, given the history, with 95% confidence. The narrower it is, the more reliable the estimate."],
               ].map(([w,d])=>(
                 <div key={w} style={{marginBottom:6}}><dt style={{display:"inline",fontWeight:600,color:C.tx}}>{w}</dt><dd style={{display:"inline",margin:0}}> — {d}</dd></div>
@@ -6092,7 +6330,10 @@ export default function App(){
               <li>the number of observations used, and how many are at odds with the verdict.</li>
             </ul>
             <div style={{fontSize:FS.sm,color:C.txD,lineHeight:1.6}}>
-              Click <b style={{color:C.tx}}>Apply</b> to write the estimate into the input. If the
+              The talent field takes the estimate by itself and follows it when the head coach or
+              the external talent changes; the sub-levels are tracked again at the new talent. Type
+              a talent or pick a preset to set your own — it then stays — and click <b style={{color:C.tx}}>Apply</b> to
+              return to the estimate. With no verdict the field keeps its value. If the
               estimate is flagged contradictory, the model residual exceeds the data — treat the
               number as indicative and check against an external source.
             </div>
@@ -6304,7 +6545,7 @@ export default function App(){
                     )}
                     <SkillEditor
                       skills={skills} setSkills={setSkills}
-                      subs={subs} setSubs={setSubs}
+                      subs={subs} setSubs={editSubs}
                       age={age} setAge={setAge}
                       pos={pos}
                       name={playerName||null}
@@ -6312,6 +6553,20 @@ export default function App(){
                       editable={true}
                       talentEstimate={talentEstimate}
                     />
+                    {/* v39 (decisions 8, 9): where the sub-levels come from, and the way back to the tracker */}
+                    {trackedSubs&&(!subsHand?(
+                      <div style={{fontSize:FS.xs,color:C.txM,marginTop:8,lineHeight:1.5}}>
+                        Sub-levels tracked from the history at talent YS {ysNum.toFixed(2)} and head coach {coachDb}. They follow the talent and the coach; drag a bar or type a number to set your own.
+                      </div>
+                    ):(
+                      <div style={{fontSize:FS.xs,color:C.txD,marginTop:8,lineHeight:1.5,display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                        <span>
+                          {subsHand==="bundle"?"Sub-levels from the loaded bundle.":subsHand==="card"?"Sub-levels from the pasted card.":"Sub-levels set by hand."}{" "}
+                          Tracked from the history at YS {ysNum.toFixed(2)} and coach {coachDb}: <span style={{fontFamily:_ft}}>{OS.map(s=>`${SN[s]} ${trackedSubs[s]}`).join(" · ")}</span>
+                        </span>
+                        <button onClick={()=>setSubsHand(false)} style={{...sBs,padding:"2px 8px",fontSize:FS.xs}}>Use tracked values</button>
+                      </div>
+                    ))}
                   </>
                 ):(
                   <div style={{textAlign:"center",padding:"64px 20px",color:C.txM}}>
@@ -6359,13 +6614,21 @@ export default function App(){
                 <div style={sL}>Talent</div>
                 <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:6}}>
                   <input type="text" aria-label="Talent on the YS scale: 3.00 is best, lower is better" value={ysTalent}
-                    onChange={e=>{const v=e.target.value;if(/^\d*\.?\d*$/.test(v))setYsTalent(v);}}
+                    onChange={e=>{const v=e.target.value;if(/^\d*\.?\d*$/.test(v)){setYsTalent(v);setTalentHand("hand");}}}
                     style={{...sI,width:80,textAlign:"center",fontSize:FS.md,fontWeight:700}}/>
                   <span style={{fontSize:FS.sm,color:C.txM}}>YS scale — 3.00 = best, lower is better</span>
                 </div>
+                {/* v39 (decision 10): where the talent in the field comes from */}
+                {historyReports&&(talentFollow||(talentHand&&estCanApply))&&(
+                  <div style={{fontSize:FS.xs,color:C.txM,marginBottom:6,lineHeight:1.4}}>
+                    {talentFollow
+                      ?"From the history estimate, and it follows it. Type a talent or pick a preset to set your own."
+                      :`${talentHand==="bundle"?"From the loaded bundle.":"Set by hand."} Apply (below) returns the field to the history estimate.`}
+                  </div>
+                )}
                 <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:12}}>
                   {YS_PRESETS.map(p=>(
-                    <button key={p.ys} aria-pressed={Math.abs(ysNum-p.ys)<0.005} onClick={()=>setYsTalent(p.ys.toFixed(2))} style={{
+                    <button key={p.ys} aria-pressed={Math.abs(ysNum-p.ys)<0.005} onClick={()=>{setYsTalent(p.ys.toFixed(2));setTalentHand("hand");}} style={{
                       ...sBs,padding:"4px 8px",fontSize:FS.xs,
                       ...(Math.abs(ysNum-p.ys)<0.005?{background:C.accFill,color:"#fff",border:`1px solid ${C.accFill}`}:{}),
                     }}>{p.l}</button>
@@ -6434,23 +6697,24 @@ export default function App(){
                               {e.isGk?" · GK":""}
                             </span>
                             {d.isScore&&hb("est","Estimate from history")}
-                            <button onClick={()=>setYsTalent(ysVal.toFixed(2))}
-                              disabled={!canApply||Math.abs(ysNum-ysVal)<0.005}
-                              title={canApply?"":d.noVerdict&&!d.unpinned?`no verdict — ${d.noVerdict}`:"the band is open at both ends — nothing to apply"}
+                            {/* v39 (decision 10): Apply returns the field to following the estimate */}
+                            <button onClick={()=>{setYsTalent(ysVal.toFixed(2));setTalentHand(false);}}
+                              disabled={!canApply||talentFollow}
+                              title={canApply?(talentFollow?"the field follows this estimate":"use the estimate and follow it again"):d.noVerdict&&!d.unpinned?`no verdict — ${d.noVerdict}`:"the band is open at both ends — nothing to apply"}
                               style={{
                                 ...sBs,padding:"2px 8px",fontSize:FS.xs,marginLeft:"auto",
-                                ...((!canApply||Math.abs(ysNum-ysVal)<0.005)
+                                ...((!canApply||talentFollow)
                                   ?{opacity:0.5,cursor:"default"}
                                   :{background:cBd,color:C.onFill,border:`1px solid ${cBd}`}),
                               }}>
-                              {!canApply?(d.noVerdict&&!d.unpinned?"no verdict":"open band"):Math.abs(ysNum-ysVal)<0.005?"applied":"Apply"}
+                              {!canApply?(d.noVerdict&&!d.unpinned?"no verdict":"open band"):talentFollow?"in use":"Apply"}
                             </button>
                           </>
                         )}
                       </div>
                       {!noData&&d.isScore&&!canApply&&(
                         <div style={{color:C.warn,fontSize:FS.xs,marginTop:4,lineHeight:1.5}}>
-                          {d.noVerdict&&!d.unpinned?`No verdict — ${d.noVerdict}.`:"The history does not limit the talent from either side (the band is open at both ends), so there is nothing to apply."} The talent you typed stays in force.
+                          {d.noVerdict&&!d.unpinned?`No verdict — ${d.noVerdict}.`:"The history does not limit the talent from either side (the band is open at both ends), so there is nothing to apply."} The talent in the field stays in force.
                         </div>
                       )}
                       {!noData&&d.isScore&&ht("est",<>95% band {d.dbBand} — {d.cenText}. DB is the planner's 0–100 talent scale (100 = YS 3.00, the best). The confidence label goes by the width of the band: 8 DB or less reads reliable, 60 DB or more unreliable.</>)}
@@ -6530,7 +6794,7 @@ export default function App(){
                     )}
                     <NextPopForecast reports={historyReports}
                       tdLo={talentEstimate.tdLo} tdHi={Math.min(100,talentEstimate.tdHi)}
-                      coachDb={coachDb}/>
+                      coachDb={coachDb} expI={expIntensity}/>
                   </div>
                 )}
                 <div>
@@ -6579,6 +6843,16 @@ export default function App(){
                       {seasonNote&&(
                         <div style={{fontSize:FS.xs,color:C.warn,marginTop:4,lineHeight:1.35}}>🗓 {seasonNote}</div>
                       )}
+                      {(()=>{
+                        // v39 (decision 6): the planner does not model decline — say so where the horizon reaches it
+                        const d=_dropAgeWeeks(age,ssw,weeks);
+                        if(!d.pace)return null;
+                        return(
+                          <div style={{fontSize:FS.xs,color:C.warn,marginTop:4,lineHeight:1.35}}>
+                            ⚠ From plan week {d.pace.week} (age {d.pace.age}) pace is past its drop age{d.rest?<>, and from week {d.rest.week} (age {d.rest.age}) the other skills are too</>:null}. The planner does not model decline, so the levels and pops it shows for {d.rest?"those skills":"pace"} from then on are upper bounds that are rarely reached.
+                          </div>
+                        );
+                      })()}
                     </>
                   );
                 })()}
@@ -6594,7 +6868,7 @@ export default function App(){
               {!advOpen&&(
                 <div style={{fontSize:FS.xs,color:C.txM,marginTop:6,lineHeight:1.4}}>
                   Comparing: {selStrats.map(k=>allStrats[k]?.name||k).join(", ")||"—"}
-                  {manualEnabled?" · manual schedule active":""} — change under Advanced.
+                  {manualEnabled?" · manual schedule active":""} · standard week at intensity {expIntensity} — change under Advanced.
                 </div>
               )}
 
@@ -6637,6 +6911,22 @@ export default function App(){
                           onChange={e=>setCoachDb(Math.max(30,Math.min(120,parseInt(e.target.value)||93)))}
                           style={{...sI,width:70}}/>
                         {ht("coach",<>DB is the planner's 0–100 scale; a head coach of 93 is unearthly, the assumption used so far. The value changes how much every week of training gives, in the simulation and in the talent estimate.</>)}
+                      </div>
+                      {/* v39: expected intensity of a standard week — replaces the fixed 96.
+                          The text typed is kept apart from the value in use, so a half-typed
+                          number never reaches the simulation. */}
+                      <div>
+                        <div style={{...sL,display:"flex",alignItems:"center",gap:8}}>Expected intensity (%) {hb("int","Expected intensity")}</div>
+                        <input type="number" aria-label="Expected training intensity, percent" min={50} max={100}
+                          value={intDraft??expIntensity}
+                          onChange={e=>{const t=e.target.value;setIntDraft(t);const v=parseInt(t,10);
+                            if(isFinite(v)&&v>=50&&v<=100){setExpIntensity(v);setIntNote("set by hand");}}}
+                          onBlur={()=>setIntDraft(null)}
+                          style={{...sI,width:70}}/>
+                        {intNote&&(
+                          <div style={{fontSize:FS.xs,color:C.txM,marginTop:4,lineHeight:1.3}}>{intNote}</div>
+                        )}
+                        {ht("int",<>How hard a normal week trains, in percent — the intensity the training history shows for each week. The planner gives every planned week this much: at {expIntensity} and coach {coachDb}, {Math.round(expIntensity*coachDb/100)} XP for the trained skill and {Math.round(expIntensity*coachDb*15/10000)} for general training. 96 is one full official match; most weeks in real histories run at 99–100. Allowed: 50–100. It does not change the talent estimate, which reads each week's real intensity.</>)}
                       </div>
                     </div>
                     <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:12}}>
@@ -6698,6 +6988,8 @@ export default function App(){
                 // v15: Projected card follows the user-selected strategy
                 // (clickable column headers); safe fallback to the first key.
                 const projKey=displayResults[projStrat]?projStrat:keys[0];
+                // v39 (decision 12): the log shows the Projected card's strategy unless another was clicked in it
+                const logKey=logOpen?(logPick&&displayResults[logPick]?logPick:projKey):null;
                 const proj=displayResults[projKey];
                 const projLast=proj.log.length?proj.log[proj.log.length-1]:null;
                 const deltas={};for(const sk of OS)deltas[sk]=proj.finalSkills[sk]-proj.startSkills[sk];
@@ -6755,7 +7047,7 @@ export default function App(){
                                   borderLeft:`1px solid ${C.bdr}`,color:cl,
                                   background:selP?cl+"1a":"transparent",
                                   borderBottom:selP?`2px solid ${cl}`:"2px solid transparent"}}>
-                                <button aria-pressed={selP} onClick={()=>setProjStrat(k)}
+                                <button aria-pressed={selP} onClick={()=>{setProjStrat(k);setLogPick(null);}}
                                   title="Show this strategy on the Projected card"
                                   style={{background:"transparent",border:"none",color:"inherit",font:"inherit",fontWeight:600,
                                     cursor:"pointer",padding:"6px 8px",width:"100%"}}>
@@ -6805,8 +7097,8 @@ export default function App(){
 
 
                   {(()=>{
-                    const logKey=showLog||keys[0];
-                    const logData=displayResults[logKey]?.log||[];
+                    const csvKey=logKey||projKey;   // v39: the schedule the log shows (was: the open log, else the first column)
+                    const logData=displayResults[csvKey]?.log||[];
                     const relCols=OS.filter(sk=>prof.w[sk]>0);
                     const header=["Wk","Age","SW","Trains","Pops",...relCols.map(sk=>SN[sk]),...relCols.map(sk=>SN[sk]+"_sub")].join(",");
                     const rows=logData.map(w=>{
@@ -6819,7 +7111,7 @@ export default function App(){
                     const blob=new Blob([csv],{type:"text/csv"});
                     const url=URL.createObjectURL(blob);
                     return(
-                      <a href={url} download={`schedule_${pos}_${logKey}.csv`}
+                      <a href={url} download={`schedule_${pos}_${csvKey}.csv`}
                         style={{display:"block",background:C.accFill,color:"#fff",border:"none",borderRadius:6,
                           padding:"12px 20px",fontFamily:_fs,fontWeight:600,fontSize:FS.md,cursor:"pointer",
                           textAlign:"center",marginBottom:12,textDecoration:"none",width:"100%",boxSizing:"border-box"}}>
@@ -6870,18 +7162,23 @@ export default function App(){
                   })}
 
                   <div style={sC}>
-                    <div style={sL}>Week-by-Week Log</div>
+                    <div style={sL}>Week by week — pops each week</div>
+                    <div style={{fontSize:FS.xs,color:C.txM,marginBottom:6}}>
+                      {logKey
+                        ?`${allStrats[logKey]?.name||logKey}${logKey===projKey?", the strategy on the Projected card":""}. Click another strategy to show it, or the highlighted one to close the table.`
+                        :"Closed — click a strategy to show its weeks."}
+                    </div>
                     <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:8}}>
                       {keys.map(k=>(
-                        <button key={k} aria-pressed={showLog===k} onClick={()=>setShowLog(showLog===k?null:k)} style={{
-                          ...sBs,...(showLog===k?{background:displayResults[k].isSale?C.warn:C.accFill,color:displayResults[k].isSale?C.onFill:"#fff",
+                        <button key={k} aria-pressed={logKey===k} onClick={()=>{if(logKey===k)setLogOpen(false);else{setLogPick(k);setLogOpen(true);}}} style={{
+                          ...sBs,...(logKey===k?{background:displayResults[k].isSale?C.warn:C.accFill,color:displayResults[k].isSale?C.onFill:"#fff",
                             border:`1px solid ${displayResults[k].isSale?C.warn:C.accFill}`}:{}),
                         }}>{allStrats[k]?.name||k}</button>
                       ))}
                     </div>
-                    {showLog&&displayResults[showLog]&&(
+                    {logKey&&displayResults[logKey]&&(
                       <div style={{maxHeight:420,overflow:"auto",borderRadius:6}}>
-                        {displayResults[showLog].log.some(w=>w.wasted)&&(
+                        {displayResults[logKey].log.some(w=>w.wasted)&&(
                           <div style={{fontSize:FS.xs,color:C.txM,padding:"4px 6px"}}>✗ = wasted week: the assigned skill was already at its maximum.</div>
                         )}
                         <table style={{width:"100%",borderCollapse:"collapse",fontFamily:_ft,fontSize:FS.xs}}>
@@ -6898,7 +7195,7 @@ export default function App(){
                             </tr>
                           </thead>
                           <tbody>
-                            {displayResults[showLog].log.map((w,i)=>(
+                            {displayResults[logKey].log.map((w,i)=>(
                               <tr key={i} style={{borderBottom:`1px solid ${C.bdr}22`,
                                 background:w.wasted?C.red+"14":w.pops.length?C.pop+"0d":"transparent"}}>
                                 <td style={{padding:"4px 6px",textAlign:"center"}}>{w.week}</td>
@@ -6935,7 +7232,7 @@ export default function App(){
                 </div>);
               })()}
               {/* v18: target-build block-order optimizer */}
-              <TargetBuildOrder skills={skills} td={td} age={age} ssw={ssw} subsFloat={subsFloat} coachDb={coachDb}
+              <TargetBuildOrder skills={skills} td={td} age={age} ssw={ssw} subsFloat={subsFloat} coachDb={coachDb} expI={expIntensity}
                 ask={askRow&&askRow.where==="tbo"?askRow:null} note={doneNote&&doneNote.where==="tbo"?doneNote:null}
                 onCancelAsk={()=>setAskRow(null)} onUndo={()=>{manualUndo();setDoneNote(null);}}
                 onLoadSchedule={sched=>{
@@ -7161,6 +7458,7 @@ export default function App(){
     engine:`coupled-K16-coach${coachDb}`,
     talent_estimator:"chain-v1.1",
     coach_db:coachDb,
+    expected_intensity:expIntensity,
     external_prior:priorBand?priorBand.map(x=>Math.round(x*10)/10):null,
     talent_db_estimate:Number(td.toFixed(2)),
     position_assumed:pos,
@@ -7198,11 +7496,11 @@ export default function App(){
       <div style={{marginTop:24,textAlign:"center",fontSize:FS.xs,color:C.txM}}>
         <button type="button" aria-expanded={!!disc.about} onClick={()=>setDisc(o=>({...o,about:!o.about}))}
           style={{background:"transparent",border:"none",color:C.txM,fontFamily:_fs,fontSize:FS.xs,cursor:"pointer",padding:"6px 8px"}}>
-          Sokker Training Planner v38 · {disc.about?"hide details":"about this version"}
+          Sokker Training Planner v39 · {disc.about?"hide details":"about this version"}
         </button>
         {disc.about&&(
           <div style={{marginTop:4,lineHeight:1.6}}>
-            Coupled training engine, K 15.2 · one 0–100 DB axis, 100/18 per level · chain talent estimator, the same as the desktop app · head-coach input · current week set automatically · calibration corpus enabled
+            Coupled training engine, K 15.2 · one 0–100 DB axis, 100/18 per level · chain talent estimator, the same as the desktop app · head-coach and expected-intensity inputs · current week set automatically · calibration corpus enabled
           </div>
         )}
       </div>
